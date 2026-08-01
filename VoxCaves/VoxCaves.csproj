@@ -1,0 +1,54 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>netstandard2.1</TargetFramework>
+    <AssemblyName>VoxCaves</AssemblyName>
+    <RootNamespace>VoxCaves</RootNamespace>
+    <Nullable>enable</Nullable>
+    <LangVersion>9.0</LangVersion>
+    <NoWarn>1591;0618</NoWarn>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <ValheimManaged>C:\Program Files (x86)\Steam\steamapps\common\Valheim\valheim_Data\Managed</ValheimManaged>
+    <BepInExPath>C:\Users\curti\AppData\Roaming\r2modmanPlus-local\Valheim\profiles\onepoint0\BepInEx</BepInExPath>
+    <VoxheimPath>$(BepInExPath)\plugins\Voxheim-Voxheim</VoxheimPath>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Reference Include="BepInEx">
+      <HintPath>$(BepInExPath)\core\BepInEx.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="0Harmony">
+      <HintPath>$(BepInExPath)\core\0Harmony.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine">
+      <HintPath>$(ValheimManaged)\UnityEngine.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine.CoreModule">
+      <HintPath>$(ValheimManaged)\UnityEngine.CoreModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="assembly_valheim">
+      <HintPath>$(ValheimManaged)\assembly_valheim.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="YamlDotNet">
+      <HintPath>$(BepInExPath)\plugins\ValheimModding-YamlDotNet\YamlDotNet.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <!-- Soft reference — only used via reflection at runtime -->
+    <Reference Include="Voxheim.Core">
+      <HintPath>$(VoxheimPath)\Voxheim.Core.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Voxheim">
+      <HintPath>$(VoxheimPath)\Voxheim.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+</Project>
