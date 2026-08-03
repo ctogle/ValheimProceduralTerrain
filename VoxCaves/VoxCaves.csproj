@@ -40,10 +40,6 @@
       <HintPath>$(ValheimManaged)\assembly_utils.dll</HintPath>
       <Private>false</Private>
     </Reference>
-    <Reference Include="YamlDotNet">
-      <HintPath>$(BepInExPath)\plugins\ValheimModding-YamlDotNet\YamlDotNet.dll</HintPath>
-      <Private>false</Private>
-    </Reference>
     <!-- Soft reference — only used via reflection at runtime -->
     <Reference Include="Voxheim.Core">
       <HintPath>$(VoxheimPath)\Voxheim.Core.dll</HintPath>
