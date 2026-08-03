@@ -36,6 +36,10 @@
       <HintPath>$(ValheimManaged)\assembly_valheim.dll</HintPath>
       <Private>false</Private>
     </Reference>
+    <Reference Include="assembly_utils">
+      <HintPath>$(ValheimManaged)\assembly_utils.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
     <Reference Include="YamlDotNet">
       <HintPath>$(BepInExPath)\plugins\ValheimModding-YamlDotNet\YamlDotNet.dll</HintPath>
       <Private>false</Private>
