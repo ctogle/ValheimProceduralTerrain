@@ -28,6 +28,15 @@ namespace VoxCaves
         // calls to VoxelizeColumns (player terrain edits) and zone re-activation.
         internal static readonly HashSet<string> _done = new();
 
+        // ── Density mode gate ─────────────────────────────────────────────────────
+        // false → no carving (no-op); true → real noise caves (default)
+        static bool _useNoiseCaves = true;
+
+        // Noise instances — created lazily on first Carve() so the world seed is ready.
+        internal static FastNoiseLite? _caveNoise;
+        internal static FastNoiseLite? _warpX;
+        internal static FastNoiseLite? _warpZ;
+
         // Seam fix: before VoxelZone.Complete() fires, we inject our carved brick
         // coordinates into _editedBricks so Voxheim's own PokeTransitionNeighbors
         // picks them up and tells already-loaded neighbours to re-mesh their boundary.
@@ -141,23 +150,71 @@ namespace VoxCaves
             return true;
         }
 
-        // ── Density function ──────────────────────────────────────────────────────
-        // Returns a value in [0, 1].
-        //   0   → leave voxel as-is
-        //   > 0 → carve to air; the value becomes the SDF magnitude written
-        //
-        // worldX/Y/Z are Valheim world-space coordinates (metres).
-        // This is the only function you need to change to alter cave shape.
-        //
-        // v1: horizontal sine bands — proves the hook is working and modifications
-        // are globally seamless (same value at any world position, no zone artefacts).
-        static float Density(float worldX, float worldY, float worldZ)
+        // ── Noise initialisation ──────────────────────────────────────────────────
+        static void InitNoise()
         {
-            const float period = 8f;
-            float vy = Mathf.Sin(worldY * (Mathf.PI * 2f / period));
-            float vx = Mathf.Sin(worldX * (Mathf.PI * 2f / period));
-            float v = vy * vx; // positive where both waves peak together → grid of pockets
-            return v > 0.2f ? v : 0f;
+            if (_caveNoise != null) return;
+            long uid = ZNet.instance?.GetWorldUID() ?? 0L;
+            int seed = uid != 0L ? (int)(uid * 2654435761L) : 12345;
+            Log.LogInfo($"[VoxCaves] noise seed={seed} (uid={uid})");
+
+            _caveNoise = new FastNoiseLite(seed);
+            _caveNoise.SetNoiseType(FastNoiseLite.NoiseType.OpenSimplex2);
+            _caveNoise.SetFrequency(0.015f);
+
+            _warpX = new FastNoiseLite(seed + 1);
+            _warpX.SetNoiseType(FastNoiseLite.NoiseType.OpenSimplex2);
+            _warpX.SetFrequency(0.04f);
+
+            _warpZ = new FastNoiseLite(seed + 2);
+            _warpZ.SetNoiseType(FastNoiseLite.NoiseType.OpenSimplex2);
+            _warpZ.SetFrequency(0.04f);
+        }
+
+        // ── Per-column analytic floor ─────────────────────────────────────────────
+        // Voxheim sizes each zone's VoxelField to floor(min_terrain - 8), so adjacent
+        // zones with different terrain minima get different yLo values, producing hard
+        // floor seams. We mirror that formula continuously: sample GetHeight in a small
+        // neighbourhood and subtract the same margin, so the floor blends at zone edges.
+        internal static float ComputeColumnFloor(float worldX, float worldZ)
+        {
+            var wg = WorldGenerator.instance;
+            if (wg == null) return 20f; // fallback: sea level - 10
+            const float r = 32f; // ~half a zone width — spans the boundary into both zones
+            float h = wg.GetHeight(worldX,     worldZ    );
+            h = Mathf.Min(h, wg.GetHeight(worldX + r, worldZ    ));
+            h = Mathf.Min(h, wg.GetHeight(worldX - r, worldZ    ));
+            h = Mathf.Min(h, wg.GetHeight(worldX,     worldZ + r));
+            h = Mathf.Min(h, wg.GetHeight(worldX,     worldZ - r));
+            return h - 8f;
+        }
+
+        // ── Density function ──────────────────────────────────────────────────────
+        // Returns [0, 1]: 0 = leave solid, > 0 = carve to air.
+        // worldX/Y/Z are Valheim world-space metres. floorY from ComputeColumnFloor().
+        static float Density(float worldX, float worldY, float worldZ, float floorY)
+        {
+            if (!_useNoiseCaves) return 0f;
+
+            const float fadeRange = 8f;
+            float depthFactor = Mathf.Clamp01((worldY - floorY) / fadeRange);
+            if (depthFactor <= 0f) return 0f;
+
+            InitNoise();
+
+            const float vscale      = 0.35f;
+            const float warpAmp     = 10f;
+            const float tunnelWidth = 0.18f;
+
+            float sy = worldY * vscale;
+            float wx = _warpX!.GetNoise(worldX, sy, worldZ) * warpAmp;
+            float wz = _warpZ!.GetNoise(worldX, sy, worldZ) * warpAmp;
+
+            float n    = _caveNoise!.GetNoise(worldX + wx, sy, worldZ + wz);
+            float absN = Mathf.Abs(n);
+
+            if (absN >= tunnelWidth) return 0f;
+            return (tunnelWidth - absN) / tunnelWidth * depthFactor;
         }
 
         // ── Carve pass ────────────────────────────────────────────────────────────
@@ -179,11 +236,12 @@ namespace VoxCaves
             for (int ri = 0; ri < width; ri++)
             {
                 int gx = ox + ci, gz = oz + ri;
+                float floorY = ComputeColumnFloor(gx * s, gz * s);
                 for (int gy = yLo; gy <= yHi; gy++)
                 {
                     if (_get!(field, gx, gy, gz) >= 0) continue; // already air — skip
 
-                    float d = Density(gx * s, gy * s, gz * s);
+                    float d = Density(gx * s, gy * s, gz * s, floorY);
                     if (d <= 0f) continue;
 
                     _set!(field, gx, gy, gz, (sbyte)Mathf.Clamp(d * 127f, 1f, 127f));
@@ -195,7 +253,7 @@ namespace VoxCaves
             if (carved > 0)
                 _pendingBricks[$"{ox},{oz}"] = brickSet;
 
-            Log.LogInfo($"[VoxCaves] zone ({ox},{oz}) carved={carved}");
+            Log.LogInfo($"[VoxCaves] zone ({ox},{oz}) yLo={yLo} yHi={yHi} s={s:F3} worldYLo={yLo*s:F1} worldYHi={yHi*s:F1} carved={carved}");
         }
 
         // ── Placement height ──────────────────────────────────────────────────────
@@ -210,9 +268,10 @@ namespace VoxCaves
             float s = _scale is { } v && v > 0f ? v
                     : _scaleField != null && _scaleField.GetValue(null) is float sf && sf > 0f ? sf
                     : 1f;
+            float floorY = ComputeColumnFloor(worldX, worldZ);
             float y = originalY;
             for (int i = 0; i < 256; i++, y -= s)
-                if (Density(worldX, y, worldZ) <= 0f) return y;
+                if (Density(worldX, y, worldZ, floorY) <= 0f) return y;
             return y;
         }
     }
@@ -292,6 +351,9 @@ namespace VoxCaves
         {
             Plugin._done.Clear();
             Plugin._pendingBricks.Clear();
+            Plugin._caveNoise = null;
+            Plugin._warpX     = null;
+            Plugin._warpZ     = null;
         }
     }
 
