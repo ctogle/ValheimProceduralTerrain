@@ -38,7 +38,9 @@ namespace VoxCaves
         public float modeC_warpAmp;        // XZ anchor warp (world units — keep small)
         public float modeC_warpFrequency;  // spatial frequency of XZ anchor warp
         public float modeC_vScale;         // Y scale before noise lookup (higher = more overhangs/cliffs)
-        public float modeC_twist;          // XZ rotation rate per world unit Y (radians/m)
+        public float modeC_twist;           // XZ rotation rate per world unit Y (radians/m)
+        public float modeC_twistVary;      // amplitude of per-XZ noise-modulated twist scale (0=uniform)
+        public float modeC_twistFrequency; // spatial frequency of twist variation noise
         public float modeC_ampVary;        // amplitude of spatial noise-amplitude modulation (0=uniform)
         public float modeC_ampFrequency;   // spatial frequency of amplitude modulation noise
 
@@ -56,7 +58,8 @@ namespace VoxCaves
             modeA_widthVary = 0f,     modeA_widthFrequency = 0.003f,
             modeC_strength     = 0f,     modeC_threshold     = 0f,     modeC_noiseAmp      = 10f,    modeC_frequency    = 0.015f,
             modeC_warpAmp      = 8f,     modeC_warpFrequency = 0.005f, modeC_vScale       = 0.4f,
-            modeC_twist        = 0f,     modeC_ampVary       = 0f,     modeC_ampFrequency = 0.003f,
+            modeC_twist        = 0f,     modeC_twistVary     = 0f,     modeC_twistFrequency = 0.003f,
+            modeC_ampVary      = 0f,     modeC_ampFrequency  = 0.003f,
             floorDepth      = 8f,     modeB_layers          = 1f,    modeB_layerSpacing  = 15f,
         };
     }
@@ -77,8 +80,11 @@ namespace VoxCaves
 
         // ── Debug flags ───────────────────────────────────────────────────────────
         internal static volatile bool _disableVegetation;
+        internal static volatile bool _pendingVegCleanup;
 
         // ── Biome profiles ────────────────────────────────────────────────────────
+        static volatile Dictionary<string, CaveProfile> _namedProfiles
+            = new Dictionary<string, CaveProfile>(StringComparer.OrdinalIgnoreCase);
         static volatile Dictionary<Heightmap.Biome, CaveProfile> _biomeProfiles
             = BuildDefaultProfiles();
         static volatile bool _hotReloadPending;
@@ -98,6 +104,7 @@ namespace VoxCaves
         internal static MethodInfo? _afterFieldEditMethod;
         internal static MethodInfo? _enqueueMeshMethod;
         internal static MethodInfo? _finishSkinNowMethod;
+        internal static MethodInfo? _pokeNeighborsMethod;
         internal static MethodInfo? _voxelizeColumnsMethod;
 
         // ── Noise ─────────────────────────────────────────────────────────────────
@@ -113,15 +120,22 @@ namespace VoxCaves
         internal static FastNoiseLite? _hmAddWarpZ;    // Mode C: anchor warp Z
         internal static FastNoiseLite? _addNoise;      // Mode C: 3D density field
         internal static FastNoiseLite? _addVaryNoise;  // Mode C: amplitude modulation
-        internal static FastNoiseLite? _widthNoise;    // Mode A: tunnel width modulation
+        internal static FastNoiseLite? _widthNoise;      // Mode A: tunnel width modulation
+        internal static FastNoiseLite? _twistVaryNoise;  // Mode C: twist scale modulation
 
         // ── Seam fix ──────────────────────────────────────────────────────────────
         internal static ConstructorInfo? _int3Ctor;
         internal static FieldInfo?       _zoneOriginX;
         internal static FieldInfo?       _zoneOriginZ;
         internal static FieldInfo?       _editedBricksField;
+        internal static FieldInfo?       _yScanHiField;
         internal static MethodInfo?      _editedBricksAdd;
         internal static readonly Dictionary<string, HashSet<(int, int, int)>> _pendingBricks = new();
+        internal static readonly Dictionary<string, int> _zoneMaxY = new();
+
+        // Reused across Carve() calls to avoid per-zone GC pressure.
+        internal static float[]? _bufA;
+        internal static float[]? _bufB;
 
         static FieldInfo? _locationInstancesField;
 
@@ -147,14 +161,59 @@ namespace VoxCaves
         }
 
         static int _pollFrame;
+        static int _vegCleanupDelay;
         void Update()
         {
+            if (_pendingVegCleanup && ZNetScene.instance != null && ZoneSystem.instance != null)
+            {
+                // Wait ~3 s after conditions are met so voxel meshes are built before the physics check
+                if (++_vegCleanupDelay > 90)
+                {
+                    _pendingVegCleanup = false;
+                    _vegCleanupDelay   = 0;
+                    CleanupVegetation();
+                }
+            }
+            else _vegCleanupDelay = 0;
+
             if (++_pollFrame % 300 != 0) return; // check ~once per 5 seconds
             var t = File.GetLastWriteTimeUtc(ConfigPath);
             if (t == _configLastWrite) return;
             _configLastWrite = t;
             LoadBiomeConfig();
             RecarveAll();
+            _pendingVegCleanup = true; // remove vegetation that may now be floating after terrain reset
+        }
+
+        static void CleanupVegetation()
+        {
+            var zns = ZNetScene.instance;
+            var zs  = ZoneSystem.instance;
+            if (zns == null || zs == null) return;
+            var vegNames = new HashSet<string>();
+            foreach (var veg in zs.m_vegetation)
+                if (veg.m_prefab != null) vegNames.Add(veg.m_prefab.name);
+            if (vegNames.Count == 0) return;
+            int count = 0;
+            foreach (var nv in UnityEngine.Object.FindObjectsOfType<ZNetView>())
+            {
+                if (nv == null) continue;
+                string nm = nv.gameObject.name;
+                if (nm.EndsWith("(Clone)")) nm = nm.Substring(0, nm.Length - 7).TrimEnd();
+                if (!vegNames.Contains(nm)) continue;
+
+                if (!_disableVegetation)
+                {
+                    // Keep vegetation that has solid ground within 1.5 m directly below —
+                    // removes trees on carved cliff faces where no horizontal surface exists.
+                    Vector3 pos = nv.transform.position;
+                    if (Physics.Raycast(pos + Vector3.up * 0.5f, Vector3.down, 2f))
+                        continue;
+                }
+
+                zns.Destroy(nv.gameObject); count++;
+            }
+            Log.LogInfo($"[VoxCaves] Removed {count} vegetation objects.");
         }
 
         // ── Type lookup ───────────────────────────────────────────────────────────
@@ -205,8 +264,13 @@ namespace VoxCaves
                 BindingFlags.NonPublic | BindingFlags.Instance);
             _finishSkinNowMethod = zoneT?.GetMethod("FinishSkinNow",
                 BindingFlags.NonPublic | BindingFlags.Instance);
+            _pokeNeighborsMethod = zoneT?.GetMethod("PokeTransitionNeighbors",
+                BindingFlags.NonPublic | BindingFlags.Public | BindingFlags.Instance)
+                ?? zoneT?.GetMethod("PokeNeighbors",
+                BindingFlags.NonPublic | BindingFlags.Public | BindingFlags.Instance);
             if (_enqueueMeshMethod   == null) Log.LogWarning("[VoxCaves] EnqueueMesh not found.");
             if (_finishSkinNowMethod == null) Log.LogWarning("[VoxCaves] FinishSkinNow not found.");
+            if (_pokeNeighborsMethod == null) Log.LogWarning("[VoxCaves] PokeTransitionNeighbors/PokeNeighbors not found — seam fix on hot-reload disabled.");
 
             _zoneOriginX       = zoneT?.GetField("_originX",
                 BindingFlags.NonPublic | BindingFlags.Instance);
@@ -214,10 +278,14 @@ namespace VoxCaves
                 BindingFlags.NonPublic | BindingFlags.Instance);
             _editedBricksField = zoneT?.GetField("_editedBricks",
                 BindingFlags.NonPublic | BindingFlags.Instance);
+            _yScanHiField      = zoneT?.GetField("_yScanHi",
+                BindingFlags.NonPublic | BindingFlags.Instance);
             _completeMethod    = zoneT?.GetMethod("Complete",
                 BindingFlags.NonPublic | BindingFlags.Instance);
             if (_zoneOriginX == null || _zoneOriginZ == null || _editedBricksField == null)
                 Log.LogWarning("[VoxCaves] Seam-fix fields missing.");
+            if (_yScanHiField == null)
+                Log.LogWarning("[VoxCaves] _yScanHi not found — Mode C ceiling extension disabled.");
 
             _locationInstancesField =
                 typeof(ZoneSystem).GetField("m_locationInstances",
@@ -263,7 +331,8 @@ namespace VoxCaves
             float twv = 0f, float twvf = 0.003f,
             float addS = 0f,  float addTh = 0f,     float addNa = 10f,    float addF  = 0.015f,
             float addWa = 8f, float addWf = 0.005f, float addVs = 0.4f,
-            float addTw = 0f, float addAv = 0f,     float addAf = 0.003f,
+            float addTw = 0f, float addTv = 0f,  float addTvf = 0.003f,
+            float addAv = 0f, float addAf = 0.003f,
             float fd = 8f, float bl = 1f, float bls = 15f) =>
             new CaveProfile
             {
@@ -274,7 +343,8 @@ namespace VoxCaves
                 modeA_widthVary = twv, modeA_widthFrequency = twvf,
                 modeC_strength = addS, modeC_threshold = addTh, modeC_noiseAmp = addNa, modeC_frequency = addF,
                 modeC_warpAmp = addWa, modeC_warpFrequency = addWf, modeC_vScale = addVs,
-                modeC_twist = addTw, modeC_ampVary = addAv, modeC_ampFrequency = addAf,
+                modeC_twist = addTw, modeC_twistVary = addTv, modeC_twistFrequency = addTvf,
+                modeC_ampVary = addAv, modeC_ampFrequency = addAf,
                 floorDepth = fd, modeB_layers = bl, modeB_layerSpacing = bls,
             };
 
@@ -298,6 +368,53 @@ namespace VoxCaves
         static string ConfigPath =>
             Path.Combine(BepInEx.Paths.ConfigPath, "voxcaves_biomes.cfg");
 
+        // Apply a flat key→value list on top of a base CaveProfile (struct copy).
+        // Unrecognised or non-numeric values are silently skipped so callers can
+        // pass raw section lines without pre-filtering (e.g. "profile = name").
+        static CaveProfile ApplyProfile(
+            IEnumerable<(string key, string val)> kvs, CaveProfile p)
+        {
+            var inv = System.Globalization.CultureInfo.InvariantCulture;
+            foreach (var (key, val) in kvs)
+            {
+                if (!float.TryParse(val, System.Globalization.NumberStyles.Float, inv, out float v))
+                    continue;
+                switch (key)
+                {
+                    case "modeb_strength":        p.modeB_strength        = v; break;
+                    case "modeb_radius":          p.modeB_radius          = v; break;
+                    case "modeb_warpamp":         p.modeB_warpAmp         = v; break;
+                    case "modeb_warpfrequency":   p.modeB_warpFrequency   = v; break;
+                    case "modeb_ditheramp":       p.modeB_ditherAmp       = v; break;
+                    case "modeb_ditherfrequency": p.modeB_ditherFrequency = v; break;
+                    case "modeb_layers":          p.modeB_layers          = v; break;
+                    case "modeb_layerspacing":    p.modeB_layerSpacing    = v; break;
+                    case "modea_strength":        p.modeA_strength        = v; break;
+                    case "modea_width":           p.modeA_width           = v; break;
+                    case "modea_frequency":       p.modeA_frequency       = v; break;
+                    case "modea_warpamp":         p.modeA_warpAmp         = v; break;
+                    case "modea_warpfrequency":   p.modeA_warpFrequency   = v; break;
+                    case "modea_vscale":          p.modeA_vScale          = v; break;
+                    case "modea_widthvary":       p.modeA_widthVary       = v; break;
+                    case "modea_widthfrequency":  p.modeA_widthFrequency  = v; break;
+                    case "modec_strength":        p.modeC_strength        = v; break;
+                    case "modec_threshold":       p.modeC_threshold       = v; break;
+                    case "modec_noiseamp":        p.modeC_noiseAmp        = v; break;
+                    case "modec_frequency":       p.modeC_frequency       = v; break;
+                    case "modec_warpamp":         p.modeC_warpAmp         = v; break;
+                    case "modec_warpfrequency":   p.modeC_warpFrequency   = v; break;
+                    case "modec_vscale":          p.modeC_vScale          = v; break;
+                    case "modec_twist":           p.modeC_twist           = v; break;
+                    case "modec_twistvary":       p.modeC_twistVary       = v; break;
+                    case "modec_twistfrequency":  p.modeC_twistFrequency  = v; break;
+                    case "modec_ampvary":         p.modeC_ampVary         = v; break;
+                    case "modec_ampfrequency":    p.modeC_ampFrequency    = v; break;
+                    case "floordepth":            p.floorDepth            = v; break;
+                }
+            }
+            return p;
+        }
+
         internal static void LoadBiomeConfig()
         {
             string path = ConfigPath;
@@ -307,75 +424,65 @@ namespace VoxCaves
                 _biomeProfiles = BuildDefaultProfiles();
                 return;
             }
-            var profiles = BuildDefaultProfiles();
-            string? section = null;
+
+            // Collect all sections into raw key-value lists for two-pass resolution.
+            var sections = new List<(string name, List<(string key, string val)> kvs)>();
+            List<(string, string)>? cur = null;
             foreach (string raw in File.ReadAllLines(path))
             {
                 string line = raw.Trim();
                 if (line.Length == 0 || line[0] == '#') continue;
                 if (line[0] == '[')
                 {
-                    section = line.Trim('[', ']').Trim();
+                    cur = new List<(string, string)>();
+                    sections.Add((line.Trim('[', ']').Trim(), cur));
                     continue;
                 }
-                if (section == null) continue;
-                if (section.Equals("Debug", StringComparison.OrdinalIgnoreCase))
-                {
-                    int eq2 = line.IndexOf('=');
-                    if (eq2 < 0) continue;
-                    string dkey = line.Substring(0, eq2).Trim().ToLowerInvariant();
-                    string dval = line.Substring(eq2 + 1).Trim().ToLowerInvariant();
-                    if (dkey == "disablevegetation")
-                        _disableVegetation = dval == "1" || dval == "true";
-                    continue;
-                }
-                if (!Enum.TryParse<Heightmap.Biome>(section, out var biome)) continue;
+                if (cur == null) continue;
                 int eq = line.IndexOf('=');
                 if (eq < 0) continue;
-                string key = line.Substring(0, eq).Trim().ToLowerInvariant();
-                string val = line.Substring(eq + 1).Trim();
-                if (!float.TryParse(val,
-                        System.Globalization.NumberStyles.Float,
-                        System.Globalization.CultureInfo.InvariantCulture, out float v)) continue;
-                if (!profiles.TryGetValue(biome, out var p)) p = CaveProfile.Default;
-                switch (key)
-                {
-                    // Mode B
-                    case "modeb_strength":        p.modeB_strength     = v; break;
-                    case "modeb_radius":          p.modeB_radius       = v; break;
-                    case "modeb_warpamp":         p.modeB_warpAmp      = v; break;
-                    case "modeb_warpfrequency":   p.modeB_warpFrequency= v; break;
-                    case "modeb_ditheramp":       p.modeB_ditherAmp    = v; break;
-                    case "modeb_ditherfrequency": p.modeB_ditherFrequency = v; break;
-                    case "modeb_layers":          p.modeB_layers       = v; break;
-                    case "modeb_layerspacing":    p.modeB_layerSpacing = v; break;
-                    // Mode A
-                    case "modea_strength":        p.modeA_strength     = v; break;
-                    case "modea_width":           p.modeA_width        = v; break;
-                    case "modea_frequency":       p.modeA_frequency    = v; break;
-                    case "modea_warpamp":         p.modeA_warpAmp      = v; break;
-                    case "modea_warpfrequency":   p.modeA_warpFrequency= v; break;
-                    case "modea_vscale":          p.modeA_vScale       = v; break;
-                    case "modea_widthvary":       p.modeA_widthVary    = v; break;
-                    case "modea_widthfrequency":  p.modeA_widthFrequency = v; break;
-                    // Mode C
-                    case "modec_strength":        p.modeC_strength     = v; break;
-                    case "modec_threshold":       p.modeC_threshold    = v; break;
-                    case "modec_noiseamp":        p.modeC_noiseAmp     = v; break;
-                    case "modec_frequency":       p.modeC_frequency    = v; break;
-                    case "modec_warpamp":         p.modeC_warpAmp      = v; break;
-                    case "modec_warpfrequency":   p.modeC_warpFrequency= v; break;
-                    case "modec_vscale":          p.modeC_vScale       = v; break;
-                    case "modec_twist":           p.modeC_twist        = v; break;
-                    case "modec_ampvary":         p.modeC_ampVary      = v; break;
-                    case "modec_ampfrequency":    p.modeC_ampFrequency = v; break;
-                    // Shared
-                    case "floordepth":            p.floorDepth         = v; break;
-                }
-                profiles[biome] = p;
+                cur.Add((line.Substring(0, eq).Trim().ToLowerInvariant(),
+                         line.Substring(eq + 1).Trim()));
             }
+
+            // Pass 1: named profiles  [Profile:name]
+            var named = new Dictionary<string, CaveProfile>(StringComparer.OrdinalIgnoreCase);
+            foreach (var (name, kvs) in sections)
+            {
+                if (!name.StartsWith("Profile:", StringComparison.OrdinalIgnoreCase)) continue;
+                string profName = name.Substring(8).Trim();
+                named[profName] = ApplyProfile(kvs, CaveProfile.Default);
+            }
+
+            // Pass 2: debug + biome assignments
+            var profiles = BuildDefaultProfiles();
+            foreach (var (name, kvs) in sections)
+            {
+                if (name.Equals("Debug", StringComparison.OrdinalIgnoreCase))
+                {
+                    foreach (var (k, v) in kvs)
+                    {
+                        if (k == "disablevegetation")
+                        {
+                            _disableVegetation = v == "1" || v == "true";
+                            if (_disableVegetation) _pendingVegCleanup = true;
+                        }
+                    }
+                    continue;
+                }
+                if (!Enum.TryParse<Heightmap.Biome>(name, out var biome)) continue;
+
+                // Resolve base: named profile if specified, else existing default.
+                CaveProfile baseProf = profiles.TryGetValue(biome, out var def) ? def : CaveProfile.Default;
+                foreach (var (k, v) in kvs)
+                    if (k == "profile" && named.TryGetValue(v, out var np)) { baseProf = np; break; }
+
+                profiles[biome] = ApplyProfile(kvs, baseProf);
+            }
+
+            _namedProfiles = named;
             _biomeProfiles = profiles;
-            Log.LogInfo("[VoxCaves] Biome profiles reloaded.");
+            Log.LogInfo($"[VoxCaves] Profiles reloaded: {named.Count} named, {profiles.Count} biomes.");
         }
 
         static void WriteDefaultBiomeConfig(string path)
@@ -384,45 +491,54 @@ namespace VoxCaves
             var inv = System.Globalization.CultureInfo.InvariantCulture;
             string F(float v) => v.ToString("0.######", inv);
 
-            sb.AppendLine("# VoxCaves biome profiles — edit and save to hot-reload in-game");
+            sb.AppendLine("# VoxCaves — edit and save to hot-reload in-game");
+            sb.AppendLine("#");
+            sb.AppendLine("# Profiles: define with [Profile:name], assign to biomes with  profile = name");
+            sb.AppendLine("# Params listed directly in a biome section override the assigned profile.");
             sb.AppendLine("#");
             sb.AppendLine("# Mode B (heightmap warp carve):");
-            sb.AppendLine("#   modeB_strength       0=off 1=full");
-            sb.AppendLine("#   modeB_radius     half-thickness of carved band (world units)");
-            sb.AppendLine("#   modeB_warpAmp        XZ warp displacement (world units)");
-            sb.AppendLine("#   modeB_warpFrequency  spatial frequency of XZ warp noise");
-            sb.AppendLine("#   modeB_ditherAmp      per-column surface noise amplitude (world units)");
+            sb.AppendLine("#   modeB_strength        0=off 1=full");
+            sb.AppendLine("#   modeB_radius          half-thickness of carved band (world units)");
+            sb.AppendLine("#   modeB_warpAmp         XZ warp displacement (world units)");
+            sb.AppendLine("#   modeB_warpFrequency   spatial frequency of XZ warp noise");
+            sb.AppendLine("#   modeB_ditherAmp       per-column surface noise amplitude (world units)");
             sb.AppendLine("#   modeB_ditherFrequency spatial frequency of dither noise");
+            sb.AppendLine("#   modeB_layers          number of stacked cave bands");
+            sb.AppendLine("#   modeB_layerSpacing    vertical distance between band centres (world units)");
             sb.AppendLine("#");
             sb.AppendLine("# Mode A (noise tunnel network):");
-            sb.AppendLine("#   modeA_strength      0=off 1=full");
-            sb.AppendLine("#   modeA_width         noise threshold for tunnel interior (0-1)");
-            sb.AppendLine("#   modeA_frequency     spatial frequency of 3D tunnel noise");
-            sb.AppendLine("#   modeA_warpAmp       3D domain-warp amplitude (world units)");
-            sb.AppendLine("#   modeA_warpFrequency spatial frequency of 3D warp noise");
-            sb.AppendLine("#   modeA_vScale        Y scale before noise lookup (low=horizontal, high=vertical)");
+            sb.AppendLine("#   modeA_strength        0=off 1=full");
+            sb.AppendLine("#   modeA_width           noise threshold for tunnel interior (0-1)");
+            sb.AppendLine("#   modeA_frequency       spatial frequency of 3D tunnel noise");
+            sb.AppendLine("#   modeA_warpAmp         3D domain-warp amplitude (world units)");
+            sb.AppendLine("#   modeA_warpFrequency   spatial frequency of 3D warp noise");
+            sb.AppendLine("#   modeA_vScale          Y scale before noise lookup (low=horizontal, high=vertical)");
+            sb.AppendLine("#   modeA_widthVary       amplitude of per-position width modulation (0=uniform)");
+            sb.AppendLine("#   modeA_widthFrequency  spatial frequency of width modulation noise");
             sb.AppendLine("#");
             sb.AppendLine("# Mode C (3D density field raised above heightmap):");
-            sb.AppendLine("#   modeC_strength      0=off 1=full");
-            sb.AppendLine("#   modeC_threshold     noise iso-surface threshold (-1..1, like modeA_width; 0=half-solid)");
-            sb.AppendLine("#   modeC_noiseAmp      SDF gradient scale — higher = stronger surface");
-            sb.AppendLine("#   modeC_frequency     spatial frequency of 3D density noise");
-            sb.AppendLine("#   modeC_warpAmp       XZ anchor warp — keep small (world units)");
-            sb.AppendLine("#   modeC_warpFrequency spatial frequency of XZ anchor warp");
-            sb.AppendLine("#   modeC_vScale        Y scale before noise lookup (higher = more overhangs/cliffs)");
-            sb.AppendLine("#   modeC_twist         XZ rotation per world unit Y (radians/m, 0=off)");
-            sb.AppendLine("#   modeC_ampVary       amplitude of noise-amplitude modulation (0=uniform)");
-            sb.AppendLine("#   modeC_ampFrequency  spatial frequency of amplitude modulation noise");
+            sb.AppendLine("#   modeC_strength        0=off 1=full");
+            sb.AppendLine("#   modeC_threshold       iso-surface offset (-1..1; 0=half-solid)");
+            sb.AppendLine("#   modeC_noiseAmp        SDF gradient scale — higher = taller surface");
+            sb.AppendLine("#   modeC_frequency       spatial frequency of 3D density noise");
+            sb.AppendLine("#   modeC_warpAmp         XZ anchor warp amplitude (world units)");
+            sb.AppendLine("#   modeC_warpFrequency   spatial frequency of anchor warp");
+            sb.AppendLine("#   modeC_vScale          Y scale before noise lookup (higher = more overhangs)");
+            sb.AppendLine("#   modeC_twist           XZ rotation per world-unit Y (radians/m, 0=off)");
+            sb.AppendLine("#   modeC_twistVary       per-XZ twist-scale modulation amplitude (0=uniform)");
+            sb.AppendLine("#   modeC_twistFrequency  spatial frequency of twist variation noise");
+            sb.AppendLine("#   modeC_ampVary         amplitude of noise-amplitude modulation (0=uniform)");
+            sb.AppendLine("#   modeC_ampFrequency    spatial frequency of amplitude modulation noise");
+            sb.AppendLine("#");
+            sb.AppendLine("# Shared:");
+            sb.AppendLine("#   floorDepth            depth below heightmap where caves floor out (world units)");
             sb.AppendLine();
             sb.AppendLine("[Debug]");
             sb.AppendLine("disableVegetation = false");
             sb.AppendLine();
 
-            var defs = BuildDefaultProfiles();
-            foreach (var (biome, p) in defs)
+            void WriteProfileBody(CaveProfile p)
             {
-                if (biome == Heightmap.Biome.None) continue;
-                sb.AppendLine($"[{biome}]");
                 sb.AppendLine($"# -- mode B --");
                 sb.AppendLine($"modeB_strength        = {F(p.modeB_strength)}");
                 sb.AppendLine($"modeB_radius          = {F(p.modeB_radius)}");
@@ -452,10 +568,30 @@ namespace VoxCaves
                 sb.AppendLine($"modeC_warpFrequency   = {F(p.modeC_warpFrequency)}");
                 sb.AppendLine($"modeC_vScale          = {F(p.modeC_vScale)}");
                 sb.AppendLine($"modeC_twist           = {F(p.modeC_twist)}");
+                sb.AppendLine($"modeC_twistVary       = {F(p.modeC_twistVary)}");
+                sb.AppendLine($"modeC_twistFrequency  = {F(p.modeC_twistFrequency)}");
                 sb.AppendLine($"modeC_ampVary         = {F(p.modeC_ampVary)}");
                 sb.AppendLine($"modeC_ampFrequency    = {F(p.modeC_ampFrequency)}");
+            }
+
+            // Write one named profile per biome, then biome assignments.
+            var defs = BuildDefaultProfiles();
+            foreach (var (biome, p) in defs)
+            {
+                if (biome == Heightmap.Biome.None) continue;
+                sb.AppendLine($"[Profile:{biome}]");
+                WriteProfileBody(p);
                 sb.AppendLine();
             }
+
+            foreach (var (biome, _) in defs)
+            {
+                if (biome == Heightmap.Biome.None) continue;
+                sb.AppendLine($"[{biome}]");
+                sb.AppendLine($"profile = {biome}");
+                sb.AppendLine();
+            }
+
             File.WriteAllText(path, sb.ToString());
             Log.LogInfo($"[VoxCaves] Wrote default biome config to {path}");
         }
@@ -492,8 +628,9 @@ namespace VoxCaves
             _hmAddWarpX  = MakeNoise(6); // Mode C anchor warp X
             _hmAddWarpZ  = MakeNoise(7); // Mode C anchor warp Z
             _widthNoise  = MakeNoise(8);  // Mode A width modulation
-            _addNoise    = MakeNoise(9);  // Mode C 3D density field
-            _addVaryNoise = MakeNoise(10); // Mode C amplitude modulation
+            _addNoise       = MakeNoise(9);  // Mode C 3D density field
+            _addVaryNoise   = MakeNoise(10); // Mode C amplitude modulation
+            _twistVaryNoise = MakeNoise(11); // Mode C twist scale modulation
         }
 
         // ── Per-column analytic floor ─────────────────────────────────────────────
@@ -587,6 +724,8 @@ namespace VoxCaves
                 modeC_warpFrequency    = (p0.modeC_warpFrequency    + p1.modeC_warpFrequency    + p2.modeC_warpFrequency    + p3.modeC_warpFrequency    + p4.modeC_warpFrequency    + p5.modeC_warpFrequency   ) * w,
                 modeC_vScale           = (p0.modeC_vScale           + p1.modeC_vScale           + p2.modeC_vScale           + p3.modeC_vScale           + p4.modeC_vScale           + p5.modeC_vScale          ) * w,
                 modeC_twist            = (p0.modeC_twist            + p1.modeC_twist            + p2.modeC_twist            + p3.modeC_twist            + p4.modeC_twist            + p5.modeC_twist           ) * w,
+                modeC_twistVary        = (p0.modeC_twistVary        + p1.modeC_twistVary        + p2.modeC_twistVary        + p3.modeC_twistVary        + p4.modeC_twistVary        + p5.modeC_twistVary       ) * w,
+                modeC_twistFrequency   = (p0.modeC_twistFrequency   + p1.modeC_twistFrequency   + p2.modeC_twistFrequency   + p3.modeC_twistFrequency   + p4.modeC_twistFrequency   + p5.modeC_twistFrequency  ) * w,
                 modeC_ampVary          = (p0.modeC_ampVary          + p1.modeC_ampVary          + p2.modeC_ampVary          + p3.modeC_ampVary          + p4.modeC_ampVary          + p5.modeC_ampVary         ) * w,
                 modeC_ampFrequency     = (p0.modeC_ampFrequency     + p1.modeC_ampFrequency     + p2.modeC_ampFrequency     + p3.modeC_ampFrequency     + p4.modeC_ampFrequency     + p5.modeC_ampFrequency    ) * w,
                 floorDepth          = (p0.floorDepth          + p1.floorDepth          + p2.floorDepth          + p3.floorDepth          + p4.floorDepth          + p5.floorDepth         ) * w,
@@ -601,7 +740,6 @@ namespace VoxCaves
             if (_locationsCached) return;
             var zs = ZoneSystem.instance;
             if (zs == null || _locationInstancesField == null) return;
-            _locationsCached = true;
             _locationPositions.Clear();
             var dict = _locationInstancesField.GetValue(zs);
             if (dict == null) return;
@@ -615,7 +753,12 @@ namespace VoxCaves
                 if (mPos.GetValue(inst) is Vector3 pos)
                     _locationPositions.Add(new Vector2(pos.x, pos.z));
             }
-            Log.LogInfo($"[VoxCaves] Location cache built: {_locationPositions.Count} positions.");
+            // Don't mark cached until we actually find locations — they may not be placed yet on first zone load.
+            if (_locationPositions.Count > 0)
+            {
+                _locationsCached = true;
+                Log.LogInfo($"[VoxCaves] Location cache built: {_locationPositions.Count} positions.");
+            }
         }
 
         static float LocationFactor(float worldX, float worldZ, List<Vector2> nearbyLocs)
@@ -633,6 +776,17 @@ namespace VoxCaves
         }
 
         // ── Carve pass ────────────────────────────────────────────────────────────
+        // Buffer-based 3D density pipeline:
+        //   Phase 1 — fill float buffer with combined SDF from all modes using
+        //             world-space density functions (continuous across boundaries).
+        //             A 4-voxel XZ overlap region provides valid neighbor values
+        //             so the blur can blend naturally across zone seams.
+        //   Phase 2 — separable 3D Gaussian blur [0.25, 0.5, 0.25] for surface
+        //             smoothing and floating-island fade.
+        //   Phase 3 — write changed voxels to VoxelField; track dirty bricks.
+        //
+        // Combination order: base → max(B) → min(C) → max(A).
+        // Mode A (tunnels) runs last so it punches through Mode C solid.
         internal static void Carve(object field, object grid, int ox, int oz, int width, int yLo, int yHi)
         {
             if (_scale == null)
@@ -640,7 +794,7 @@ namespace VoxCaves
                 _scale = _scaleField != null ? (float)_scaleField.GetValue(null)! : 1f;
                 Log.LogInfo($"[VoxCaves] s_scale resolved to {_scale}");
             }
-            float s = _scale.Value;
+            float s  = _scale.Value;
             var   wg = WorldGenerator.instance;
 
             BuildLocationCache();
@@ -659,154 +813,189 @@ namespace VoxCaves
             string zoneKey = $"{ox},{oz}";
             _zoneParams[zoneKey] = (field, grid, ox, oz, width, yLo, yHi);
 
-            int carved = 0;
-            var brickSet = new HashSet<(int, int, int)>();
+            const int overlap = 4;
+            int extLo   = yLo - 24, extHi = yHi + 24;
+            int bw      = width + 2 * overlap;   // buffer XZ width (same for X and Z)
+            int bh      = extHi - extLo + 1;     // buffer Y height
+            int bufSize = bw * bh * bw;
 
-            for (int ci = 0; ci < width; ci++)
-            for (int ri = 0; ri < width; ri++)
+            if (_bufA == null || _bufA.Length < bufSize) _bufA = new float[bufSize];
+            if (_bufB == null || _bufB.Length < bufSize) _bufB = new float[bufSize];
+            float[] buf = _bufA, tmp = _bufB;
+
+            InitNoise();
+
+            // ── Phase 1 ───────────────────────────────────────────────────────────
+            for (int cx = 0; cx < bw; cx++)
+            for (int cz = 0; cz < bw; cz++)
             {
-                int   gx     = ox + ci, gz = oz + ri;
-                float worldX = gx * s,  worldZ = gz * s;
-                var prof     = wg != null ? BlendProfile(worldX, worldZ, wg) : CaveProfile.Default;
+                int   gx     = ox - overlap + cx, gz = oz - overlap + cz;
+                float worldX = gx * s,            worldZ = gz * s;
+                var   prof   = wg != null ? BlendProfile(worldX, worldZ, wg) : CaveProfile.Default;
                 float locFac = LocationFactor(worldX, worldZ, nearbyLocs);
                 float floorY = ComputeColumnFloor(worldX, worldZ, wg, prof.floorDepth);
+                float h      = wg != null ? wg.GetHeight(worldX, worldZ) : 0f;
 
-                // ── Mode B: warped-heightmap carve ────────────────────────────────
+                // Mode B: per-column precompute (XZ-only quantities).
+                int     layerCount = 0;
+                float[] hmC = Array.Empty<float>(), hmF = Array.Empty<float>();
                 if (prof.modeB_strength > 0f && wg != null)
                 {
-                    InitNoise();
-                    float effectiveWarpAmp = prof.modeB_warpAmp * locFac;
-                    float wf  = prof.modeB_warpFrequency;
-                    float wx2 = _hmWarpX!.GetNoise(worldX * wf, worldZ * wf) * effectiveWarpAmp;
-                    float wz2 = _hmWarpZ!.GetNoise(worldX * wf, worldZ * wf) * effectiveWarpAmp;
-                    float df  = prof.modeB_ditherFrequency;
+                    float wf    = prof.modeB_warpFrequency;
+                    float ewAmp = prof.modeB_warpAmp * locFac;
+                    float wx2   = _hmWarpX!.GetNoise(worldX * wf, worldZ * wf) * ewAmp;
+                    float wz2   = _hmWarpZ!.GetNoise(worldX * wf, worldZ * wf) * ewAmp;
+                    float df    = prof.modeB_ditherFrequency;
                     float warpedH = wg.GetHeight(worldX + wx2, worldZ + wz2)
                                   + _ditherNoise!.GetNoise(worldX * df, worldZ * df) * prof.modeB_ditherAmp;
-                    // Precompute band extents for each layer; union via max of per-layer SDFs.
-                    int layerCount = Mathf.Max(1, Mathf.RoundToInt(prof.modeB_layers));
-                    float[] hmC = new float[layerCount], hmF = new float[layerCount];
+                    layerCount = Mathf.Max(1, Mathf.RoundToInt(prof.modeB_layers));
+                    hmC = new float[layerCount]; hmF = new float[layerCount];
                     for (int li = 0; li < layerCount; li++)
                     {
                         float lh = warpedH - li * prof.modeB_layerSpacing;
                         hmC[li] = lh + prof.modeB_radius;
                         hmF[li] = lh - prof.modeB_radius;
                     }
-
-                    for (int gy = yLo; gy <= yHi; gy++)
-                    {
-                        float worldY  = gy * s;
-                        float bandSDF = Mathf.Min(hmC[0] - worldY, worldY - hmF[0]);
-                        for (int li = 1; li < layerCount; li++)
-                            bandSDF = Mathf.Max(bandSDF,
-                                Mathf.Min(hmC[li] - worldY, worldY - hmF[li]));
-                        float sdf = Mathf.Min(bandSDF, worldY - floorY)
-                                  * prof.modeB_strength * locFac;
-                        sbyte sdfByte = ToSDFByte(sdf, s);
-
-                        sbyte cur = _get!(field, gx, gy, gz);
-                        if (sdfByte > 0 && cur < 0)
-                        {
-                            _set!(field, gx, gy, gz, sdfByte);
-                            brickSet.Add((gx >> 4, gy >> 4, gz >> 4));
-                            carved++;
-                        }
-                        else if (sdfByte < 0 && sdfByte > cur)
-                        {
-                            _set!(field, gx, gy, gz, sdfByte);
-                            brickSet.Add((gx >> 4, gy >> 4, gz >> 4));
-                        }
-                    }
                 }
 
-                // ── Mode A: noise tunnel network ──────────────────────────────────
-                // Bilateral SDF: smooth gradient on both sides of the tunnel wall so
-                // the mesher interpolates the surface accurately across zone boundaries.
-                if (prof.modeA_strength > 0f)
-                {
-                    InitNoise();
-                    float twf = prof.modeA_warpFrequency;
-                    float tf  = prof.modeA_frequency;
-                    for (int gy = yLo; gy <= yHi; gy++)
-                    {
-                        float worldY = gy * s;
-                        float sy = worldY * prof.modeA_vScale;
-                        float wx = _warpX!.GetNoise(worldX * twf, sy * twf, worldZ * twf) * prof.modeA_warpAmp;
-                        float wz = _warpZ!.GetNoise(worldX * twf, sy * twf, worldZ * twf) * prof.modeA_warpAmp;
-                        float n  = _caveNoise!.GetNoise((worldX + wx) * tf, sy * tf, (worldZ + wz) * tf);
-                        float wf2 = prof.modeA_widthFrequency;
-                        float localWidth = prof.modeA_width * (1f + prof.modeA_widthVary
-                            * _widthNoise!.GetNoise(worldX * wf2, sy * wf2, worldZ * wf2));
-                        localWidth = Mathf.Max(localWidth, 0.001f);
-                        // +1 at tunnel centre, 0 at wall, negative outside; scaled to ~4 voxels
-                        float tunnelSDF = (localWidth - Mathf.Abs(n)) / localWidth * 4f * s;
-                        float sdf = Mathf.Min(tunnelSDF, worldY - floorY) * prof.modeA_strength * locFac;
-                        sbyte sdfByte = ToSDFByte(sdf, s);
-                        sbyte cur = _get!(field, gx, gy, gz);
-                        if (sdfByte > 0 && cur < 0)
-                        {
-                            _set!(field, gx, gy, gz, sdfByte);
-                            brickSet.Add((gx >> 4, gy >> 4, gz >> 4));
-                            carved++;
-                        }
-                        else if (sdfByte < 0 && sdfByte > cur)
-                        {
-                            _set!(field, gx, gy, gz, sdfByte);
-                            brickSet.Add((gx >> 4, gy >> 4, gz >> 4));
-                        }
-                    }
-                }
-
-                // ── Mode C: 3D density field ─────────────────────────────────────
-                // A 3D noise field displaces the surface above the heightmap.
-                // relY - n*amp < 0 means "below the displaced surface" → solid.
-                // Mirror of Mode A write conditions: solid into air only; never
-                // touches existing solid so Mode B gradients are preserved.
+                // Mode C: per-column anchor height + amplitude.
+                float addH = 0f, localAmp = 0f;
                 if (prof.modeC_strength > 0f && wg != null)
                 {
-                    InitNoise();
-                    float awf  = prof.modeC_warpFrequency;
-                    float awx  = _hmAddWarpX!.GetNoise(worldX * awf, worldZ * awf) * prof.modeC_warpAmp;
-                    float awz  = _hmAddWarpZ!.GetNoise(worldX * awf, worldZ * awf) * prof.modeC_warpAmp;
-                    float addH = wg.GetHeight(worldX + awx, worldZ + awz);
-                    float af   = prof.modeC_frequency;
-                    // Spatially-varying amplitude (analog of modeA_widthVary)
-                    float avf  = prof.modeC_ampFrequency;
-                    float localAmp = prof.modeC_noiseAmp * (1f + prof.modeC_ampVary
-                        * _addVaryNoise!.GetNoise(worldX * avf, worldZ * avf));
-                    localAmp = Mathf.Max(localAmp, 0f);
+                    float awf = prof.modeC_warpFrequency;
+                    float awx = _hmAddWarpX!.GetNoise(worldX * awf, worldZ * awf) * prof.modeC_warpAmp;
+                    float awz = _hmAddWarpZ!.GetNoise(worldX * awf, worldZ * awf) * prof.modeC_warpAmp;
+                    addH      = wg.GetHeight(worldX + awx, worldZ + awz);
+                    float avf = prof.modeC_ampFrequency;
+                    localAmp  = Mathf.Max(prof.modeC_noiseAmp * (1f + prof.modeC_ampVary
+                        * _addVaryNoise!.GetNoise(worldX * avf, worldZ * avf)), 0f);
+                }
 
-                    for (int gy = yLo; gy <= yHi; gy++)
+                for (int cy = 0; cy < bh; cy++)
+                {
+                    float worldY  = (extLo + cy) * s;
+                    float baseSDF = worldY - h;    // base SDF: positive = air, negative = solid
+                    float combined = baseSDF;
+
+                    // Mode B: warped-heightmap band — air wins.
+                    if (layerCount > 0)
                     {
-                        float worldY = gy * s;
-                        float relY   = worldY - addH;
-                        float sy     = relY * prof.modeC_vScale;
-                        float angle  = worldY * prof.modeC_twist;
-                        float cos    = Mathf.Cos(angle), sin = Mathf.Sin(angle);
-                        float tx     = worldX * cos - worldZ * sin;
-                        float tz     = worldX * sin + worldZ * cos;
-                        float n      = _addNoise!.GetNoise(tx * af, sy * af, tz * af);
-                        float sdf    = (relY - (n - prof.modeC_threshold) * localAmp) * prof.modeC_strength * locFac;
-                        sbyte sdfByte = ToSDFByte(sdf, s);
-                        sbyte cur     = _get!(field, gx, gy, gz);
-                        if (sdfByte < 0 && cur > 0)
-                        {
-                            _set!(field, gx, gy, gz, sdfByte);
-                            brickSet.Add((gx >> 4, gy >> 4, gz >> 4));
-                            carved++;
-                        }
-                        else if (sdfByte > 0 && sdfByte < cur)
-                        {
-                            _set!(field, gx, gy, gz, sdfByte);
-                            brickSet.Add((gx >> 4, gy >> 4, gz >> 4));
-                        }
+                        float bandSDF = Mathf.Min(hmC[0] - worldY, worldY - hmF[0]);
+                        for (int li = 1; li < layerCount; li++)
+                            bandSDF = Mathf.Max(bandSDF, Mathf.Min(hmC[li] - worldY, worldY - hmF[li]));
+                        float sdf = Mathf.Min(bandSDF, worldY - floorY) * prof.modeB_strength;
+                        combined = Mathf.Max(combined, sdf);
                     }
+
+                    // Mode C: 3D density field above heightmap — solid wins.
+                    if (prof.modeC_strength > 0f && wg != null)
+                    {
+                        float relY  = worldY - addH;
+                        float sy    = relY * prof.modeC_vScale;
+                        float tvf   = prof.modeC_twistFrequency;
+                        float twistScale = 1f + prof.modeC_twistVary
+                            * _twistVaryNoise!.GetNoise(worldX * tvf, worldZ * tvf);
+                        float angle = worldY * prof.modeC_twist * twistScale;
+                        float cos   = Mathf.Cos(angle), sin = Mathf.Sin(angle);
+                        float tx    = worldX * cos - worldZ * sin;
+                        float tz    = worldX * sin + worldZ * cos;
+                        float af    = prof.modeC_frequency;
+                        float n     = _addNoise!.GetNoise(tx * af, sy * af, tz * af);
+                        float sdf   = (relY - (n - prof.modeC_threshold) * localAmp) * prof.modeC_strength;
+                        combined = Mathf.Min(combined, sdf);
+                    }
+
+                    // Mode A: noise tunnel network — air wins, punches through Mode C.
+                    if (prof.modeA_strength > 0f)
+                    {
+                        float twf = prof.modeA_warpFrequency;
+                        float tf  = prof.modeA_frequency;
+                        float sy  = worldY * prof.modeA_vScale;
+                        float wx  = _warpX!.GetNoise(worldX * twf, sy * twf, worldZ * twf) * prof.modeA_warpAmp;
+                        float wz  = _warpZ!.GetNoise(worldX * twf, sy * twf, worldZ * twf) * prof.modeA_warpAmp;
+                        float n   = _caveNoise!.GetNoise((worldX + wx) * tf, sy * tf, (worldZ + wz) * tf);
+                        float wf2 = prof.modeA_widthFrequency;
+                        float localWidth = Mathf.Max(prof.modeA_width * (1f + prof.modeA_widthVary
+                            * _widthNoise!.GetNoise(worldX * wf2, sy * wf2, worldZ * wf2)), 0.001f);
+                        float tunnelSDF = (localWidth - Mathf.Abs(n)) / localWidth * 4f * s;
+                        float sdf = Mathf.Min(tunnelSDF, worldY - floorY) * prof.modeA_strength;
+                        combined = Mathf.Max(combined, sdf);
+                    }
+
+                    // Fade all modifications to zero near protected locations.
+                    // Lerping combined → baseSDF ensures locFac=0 leaves terrain completely
+                    // unmodified, avoiding the max(baseSDF, 0) underground-carve bug that
+                    // scaling individual SDFs by locFac produces.
+                    buf[(cx * bh + cy) * bw + cz] = Mathf.Lerp(baseSDF, combined, locFac);
                 }
             }
 
-            if (carved > 0)
-                _pendingBricks[zoneKey] = brickSet;
+            // ── Phase 2: Separable 3D Gaussian blur ───────────────────────────────
+            // X pass: buf → tmp
+            for (int cx = 0; cx < bw; cx++)
+            for (int cy = 0; cy < bh; cy++)
+            for (int cz = 0; cz < bw; cz++)
+            {
+                int i = (cx * bh + cy) * bw + cz;
+                tmp[i] = (cx > 0 && cx < bw - 1)
+                    ? buf[((cx-1)*bh+cy)*bw+cz] * 0.25f + buf[i] * 0.5f + buf[((cx+1)*bh+cy)*bw+cz] * 0.25f
+                    : buf[i];
+            }
+            // Y pass: tmp → buf
+            for (int cx = 0; cx < bw; cx++)
+            for (int cy = 0; cy < bh; cy++)
+            for (int cz = 0; cz < bw; cz++)
+            {
+                int i = (cx * bh + cy) * bw + cz;
+                buf[i] = (cy > 0 && cy < bh - 1)
+                    ? tmp[(cx*bh+(cy-1))*bw+cz] * 0.25f + tmp[i] * 0.5f + tmp[(cx*bh+(cy+1))*bw+cz] * 0.25f
+                    : tmp[i];
+            }
+            // Z pass: buf → tmp  (final result lives in tmp)
+            for (int cx = 0; cx < bw; cx++)
+            for (int cy = 0; cy < bh; cy++)
+            for (int cz = 0; cz < bw; cz++)
+            {
+                int i = (cx * bh + cy) * bw + cz;
+                tmp[i] = (cz > 0 && cz < bw - 1)
+                    ? buf[(cx*bh+cy)*bw+(cz-1)] * 0.25f + buf[i] * 0.5f + buf[(cx*bh+cy)*bw+(cz+1)] * 0.25f
+                    : buf[i];
+            }
 
-            Log.LogInfo($"[VoxCaves] zone ({ox},{oz}) wg={wg != null} yLo={yLo} yHi={yHi} s={s:F3} carved={carved}");
+            // ── Phase 3: Write to VoxelField ──────────────────────────────────────
+            int carved  = 0;
+            int maxYC   = yHi;
+            var brickSet = new HashSet<(int, int, int)>();
+
+            for (int ci = 0; ci < width; ci++)
+            for (int ri = 0; ri < width; ri++)
+            {
+                int cx = ci + overlap, cz = ri + overlap;
+                int gx = ox + ci,       gz = oz + ri;
+
+                for (int gy = extLo; gy <= extHi; gy++)
+                {
+                    int   cy       = gy - extLo;
+                    float finalSDF = tmp[(cx * bh + cy) * bw + cz];
+                    sbyte newByte  = ToSDFByte(finalSDF, s);
+                    sbyte curByte  = _get!(field, gx, gy, gz);
+                    if (newByte == curByte) continue;
+                    _set!(field, gx, gy, gz, newByte);
+                    brickSet.Add((gx >> 4, gy >> 4, gz >> 4));
+                    if (newByte < 0 && gy > maxYC) maxYC = gy;
+                    carved++;
+                }
+            }
+
+            if (maxYC > yHi)
+            {
+                if (!_zoneMaxY.TryGetValue(zoneKey, out int prevMaxY) || maxYC > prevMaxY)
+                    _zoneMaxY[zoneKey] = maxYC;
+            }
+
+            _pendingBricks[zoneKey] = brickSet;
+
+            Log.LogInfo($"[VoxCaves] zone ({ox},{oz}) yLo={yLo} yHi={yHi} carved={carved} bricks={brickSet.Count}");
         }
 
         // ── Hot-reload: re-run the full voxel pipeline on every loaded zone ───────
@@ -824,10 +1013,15 @@ namespace VoxCaves
 
             foreach (var (key, zp) in snapshot)
             {
+                // Extend reset range to cover voxels our loops may have written outside [yLo, yHi]:
+                // Mode A can go ~floorDepth below yLo; Mode C can go ~noiseAmp above yHi.
+                // Use a fixed 24-voxel margin — covers any reasonable config value.
+                int extLo = zp.yLo - 24;
+                int extHi = zp.yHi + 24;
                 try
                 {
                     _voxelizeColumnsMethod.Invoke(null, new object[]
-                        { zp.field, zp.grid, zp.ox, zp.oz, 0, zp.w - 1, 0, zp.w - 1, zp.yLo, zp.yHi });
+                        { zp.field, zp.grid, zp.ox, zp.oz, 0, zp.w - 1, 0, zp.w - 1, extLo, extHi });
                 }
                 catch (Exception e) { Log.LogWarning($"[VoxCaves] Revoxelize {key}: {e.Message}"); continue; }
 
@@ -836,12 +1030,11 @@ namespace VoxCaves
                 if (zoneObj is UnityEngine.Object uObj && !uObj) continue;
                 if (!canRemesh) continue;
 
-                // Always enqueue every brick in the zone — VoxelizeColumns reset the entire
-                // field, so even voxels we didn't re-carve need their mesh rebuilt.
+                // Enqueue the full extended brick range so all modified voxels get remeshed.
                 _pendingBricks.Remove(key, out _);
                 int bx0 = zp.ox >> 4, bx1 = (zp.ox + zp.w - 1) >> 4;
                 int bz0 = zp.oz >> 4, bz1 = (zp.oz + zp.w - 1) >> 4;
-                int by0 = zp.yLo >> 4, by1 = zp.yHi >> 4;
+                int by0 = extLo >> 4, by1 = extHi >> 4;
                 int queued = 0;
                 for (int bx = bx0; bx <= bx1; bx++)
                 for (int by = by0; by <= by1; by++)
@@ -859,6 +1052,13 @@ namespace VoxCaves
 
                 try { _finishSkinNowMethod!.Invoke(zoneObj, null); }
                 catch (Exception e) { Log.LogWarning($"[VoxCaves] FinishSkinNow {key}: {e.Message}"); }
+
+                // Tell neighboring zones to update their boundary meshes so seams clear too.
+                if (_pokeNeighborsMethod != null)
+                {
+                    try { _pokeNeighborsMethod.Invoke(zoneObj, null); }
+                    catch (Exception e) { Log.LogWarning($"[VoxCaves] PokeNeighbors {key}: {e.Message}"); }
+                }
             }
         }
 
@@ -921,6 +1121,14 @@ namespace VoxCaves
 
             Plugin._zoneObjects[key] = __instance;
 
+            // Expand _yScanHi so SurfaceEnvelope finds Mode C solid written above the original yHi
+            if (Plugin._yScanHiField != null && Plugin._zoneMaxY.TryGetValue(key, out int maxY))
+            {
+                int cur = (int)Plugin._yScanHiField.GetValue(__instance)!;
+                if (maxY > cur) Plugin._yScanHiField.SetValue(__instance, maxY);
+                Plugin._zoneMaxY.Remove(key);
+            }
+
             if (!Plugin._pendingBricks.Remove(key, out var bricks)) return;
             var editedBricks = Plugin._editedBricksField.GetValue(__instance);
             if (editedBricks == null) return;
@@ -940,9 +1148,11 @@ namespace VoxCaves
         static void Postfix()
         {
             Plugin.LoadBiomeConfig();
+            Plugin._pendingVegCleanup = true; // run cliff + disableVegetation cleanup after world loads
             Plugin._pendingBricks.Clear();
             Plugin._zoneObjects.Clear();
             Plugin._zoneParams.Clear();
+            Plugin._zoneMaxY.Clear();
             Plugin._locationPositions.Clear();
             Plugin._locationsCached = false;
             Plugin._caveNoise    = null;
