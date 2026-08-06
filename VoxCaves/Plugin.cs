@@ -936,10 +936,10 @@ namespace VoxCaves
                 }
             }
 
-            // ── Phase 2: XZ-only Gaussian blur (Y never blurred — avoids terracing) ─
-            // Each pass: X buf→tmp, Z tmp→buf. Result always lands in buf.
+            // ── Phase 2: Separable 3D Gaussian blur [0.25, 0.5, 0.25] ──────────────
+            // Each pass: X buf→tmp, Z tmp→buf, Y buf→tmp→buf. Result always in buf.
             // blur_passes=0 skips entirely; Phase 3 reads buf directly.
-            // blurPasses sampled at zone centre before Phase 1
+            // blurPasses sampled at zone centre before Phase 1.
             for (int pass = 0; pass < blurPasses; pass++)
             {
                 // X pass: buf → tmp
@@ -961,6 +961,23 @@ namespace VoxCaves
                     buf[i] = (cz > 0 && cz < bw - 1)
                         ? tmp[(cx*bh+cy)*bw+(cz-1)] * 0.25f + tmp[i] * 0.5f + tmp[(cx*bh+cy)*bw+(cz+1)] * 0.25f
                         : tmp[i];
+                }
+                // Y pass: buf → tmp → buf
+                for (int cx = 0; cx < bw; cx++)
+                for (int cy = 0; cy < bh; cy++)
+                for (int cz = 0; cz < bw; cz++)
+                {
+                    int i = (cx * bh + cy) * bw + cz;
+                    tmp[i] = (cy > 0 && cy < bh - 1)
+                        ? buf[(cx*bh+(cy-1))*bw+cz] * 0.25f + buf[i] * 0.5f + buf[(cx*bh+(cy+1))*bw+cz] * 0.25f
+                        : buf[i];
+                }
+                for (int cx = 0; cx < bw; cx++)
+                for (int cy = 0; cy < bh; cy++)
+                for (int cz = 0; cz < bw; cz++)
+                {
+                    int i = (cx * bh + cy) * bw + cz;
+                    buf[i] = tmp[i];
                 }
             }
 
