@@ -138,6 +138,15 @@ namespace VoxCaves
         // Reused across Carve() calls to avoid per-zone GC pressure.
         internal static float[]? _bufA;
         internal static float[]? _bufB;
+        internal static float[]? _noiseBuf;  // coarse Mode C bake: [cx4*(cw4*bh) + cz4*bh + cy]
+        // 2D coarse bake (same XZ grid as _noiseBuf): [cx4*cw4 + cz4]
+        internal static float[]? _bk2dAddH;  // Mode C anchor height
+        internal static float[]? _bk2dLAmp;  // Mode C local amplitude
+        internal static float[]? _bk2dMcS;   // modeC_strength
+        internal static float[]? _bk2dMcT;   // modeC_threshold
+        internal static float[]? _bk2dFlD;   // floorDepth
+        internal static float[]? _bk2dMbS;   // modeB_strength
+        internal static float[]? _bk2dMaS;   // modeA_strength
 
         static FieldInfo? _locationInstancesField;
 
@@ -831,56 +840,169 @@ namespace VoxCaves
 
             InitNoise();
 
+            // ── Phase 0: Bake Mode C noise at 1/4 XZ, full Y ────────────────────────
+            // modeC_frequency = 0.008 → 1 cycle per 125 voxels; Nyquist allows a sample
+            // every 62 voxels, so 4-voxel coarse XZ is well within the faithful range.
+            // Layout: _noiseBuf[cx4 * (cw4*bh) + cz4 * bh + cy] — cy-major per (cx4,cz4)
+            // so the Y inner loop reads four sequential streams, prefetcher-friendly.
+            int   cw4     = (bw + 3) / 4;
+            bool  bakeC   = centerProf.modeC_strength > 0f && wg != null;
+            int   nb4Size = cw4 * cw4 * bh;
+            int   nb2Size = cw4 * cw4;
+            if (_noiseBuf  == null || _noiseBuf.Length  < nb4Size) _noiseBuf  = new float[nb4Size];
+            if (_bk2dAddH  == null || _bk2dAddH.Length  < nb2Size) _bk2dAddH  = new float[nb2Size];
+            if (_bk2dLAmp  == null || _bk2dLAmp.Length  < nb2Size) _bk2dLAmp  = new float[nb2Size];
+            if (_bk2dMcS   == null || _bk2dMcS.Length   < nb2Size) _bk2dMcS   = new float[nb2Size];
+            if (_bk2dMcT   == null || _bk2dMcT.Length   < nb2Size) _bk2dMcT   = new float[nb2Size];
+            if (_bk2dFlD   == null || _bk2dFlD.Length   < nb2Size) _bk2dFlD   = new float[nb2Size];
+            if (_bk2dMbS   == null || _bk2dMbS.Length   < nb2Size) _bk2dMbS   = new float[nb2Size];
+            if (_bk2dMaS   == null || _bk2dMaS.Length   < nb2Size) _bk2dMaS   = new float[nb2Size];
+            if (bakeC)
+            {
+                for (int cx4 = 0; cx4 < cw4; cx4++)
+                for (int cz4 = 0; cz4 < cw4; cz4++)
+                {
+                    int   cx4w  = Math.Min(cx4 * 4, bw - 1);
+                    int   cz4w  = Math.Min(cz4 * 4, bw - 1);
+                    int   gx4   = ox - overlap + cx4w, gz4 = oz - overlap + cz4w;
+                    float wx4   = gx4 * s, wz4 = gz4 * s;
+                    var   p4    = BlendProfile(wx4, wz4, wg!);
+                    int   idx2  = cx4 * cw4 + cz4;
+
+                    // Anchor quantities for ALL coarse points so bilinear interpolation at
+                    // biome edges doesn't pull from zeroed or uninitialized neighbours.
+                    float awf4   = p4.modeC_warpFrequency;
+                    float awx4   = _hmAddWarpX!.GetNoise(wx4 * awf4, wz4 * awf4) * p4.modeC_warpAmp;
+                    float awz4   = _hmAddWarpZ!.GetNoise(wx4 * awf4, wz4 * awf4) * p4.modeC_warpAmp;
+                    float addH4  = wg!.GetHeight(wx4 + awx4, wz4 + awz4);
+                    float avf4   = p4.modeC_ampFrequency;
+                    float lAmp4  = Mathf.Max(p4.modeC_noiseAmp * (1f + p4.modeC_ampVary
+                                       * _addVaryNoise!.GetNoise(wx4 * avf4, wz4 * avf4)), 0f);
+                    _bk2dAddH![idx2] = addH4;
+                    _bk2dLAmp![idx2] = lAmp4;
+                    _bk2dMcS! [idx2] = p4.modeC_strength;
+                    _bk2dMcT! [idx2] = p4.modeC_threshold;
+                    _bk2dFlD! [idx2] = p4.floorDepth;
+                    _bk2dMbS! [idx2] = p4.modeB_strength;
+                    _bk2dMaS! [idx2] = p4.modeA_strength;
+
+                    int baseIdx = cx4 * cw4 * bh + cz4 * bh;
+                    if (p4.modeC_strength <= 0f)
+                    {
+                        for (int cy = 0; cy < bh; cy++) _noiseBuf[baseIdx + cy] = 0f;
+                        continue;
+                    }
+                    float ts4 = 1f + p4.modeC_twistVary
+                        * _twistVaryNoise!.GetNoise(wx4 * p4.modeC_twistFrequency, wz4 * p4.modeC_twistFrequency);
+                    float af4 = p4.modeC_frequency, vs4 = p4.modeC_vScale, tw4 = p4.modeC_twist;
+                    for (int cy = 0; cy < bh; cy++)
+                    {
+                        float wy4  = (extLo + cy) * s;
+                        float sy4  = (wy4 - addH4) * vs4;
+                        float ang4 = wy4 * tw4 * ts4;
+                        float cos4 = Mathf.Cos(ang4), sin4 = Mathf.Sin(ang4);
+                        float tx4  = wx4 * cos4 - wz4 * sin4;
+                        float tz4  = wx4 * sin4 + wz4 * cos4;
+                        _noiseBuf[baseIdx + cy] = _addNoise!.GetNoise(tx4 * af4, sy4 * af4, tz4 * af4);
+                    }
+                }
+            }
+
             // ── Phase 1 ───────────────────────────────────────────────────────────
             for (int cx = 0; cx < bw; cx++)
             for (int cz = 0; cz < bw; cz++)
             {
                 int   gx     = ox - overlap + cx, gz = oz - overlap + cz;
                 float worldX = gx * s,            worldZ = gz * s;
-                var   prof   = wg != null ? BlendProfile(worldX, worldZ, wg) : CaveProfile.Default;
-                float locFac = LocationFactor(worldX, worldZ, nearbyLocs);
-                float floorY = ComputeColumnFloor(worldX, worldZ, wg, prof.floorDepth);
-                float h      = wg != null ? wg.GetHeight(worldX, worldZ) : 0f;
 
-                // Mode B: per-column precompute (XZ-only quantities).
-                int     layerCount = 0;
-                float[] hmC = Array.Empty<float>(), hmF = Array.Empty<float>();
-                if (prof.modeB_strength > 0f && wg != null)
+                // Bilinear bake indices — used for both 3D noise lookup and 2D scalar lookup.
+                int bb00 = 0, bb10 = 0, bb01 = 0, bb11 = 0;
+                int b200 = 0, b210 = 0, b201 = 0, b211 = 0;
+                float bfx = 0f, bfz = 0f;
+                if (bakeC)
                 {
-                    float wf    = prof.modeB_warpFrequency;
-                    float ewAmp = prof.modeB_warpAmp * locFac;
-                    float wx2   = _hmWarpX!.GetNoise(worldX * wf, worldZ * wf) * ewAmp;
-                    float wz2   = _hmWarpZ!.GetNoise(worldX * wf, worldZ * wf) * ewAmp;
-                    float df    = prof.modeB_ditherFrequency;
-                    float warpedH = wg.GetHeight(worldX + wx2, worldZ + wz2)
-                                  + _ditherNoise!.GetNoise(worldX * df, worldZ * df) * prof.modeB_ditherAmp;
-                    layerCount = Mathf.Max(1, Mathf.RoundToInt(prof.modeB_layers));
-                    hmC = new float[layerCount]; hmF = new float[layerCount];
-                    for (int li = 0; li < layerCount; li++)
+                    int cx4  = cx / 4, cz4  = cz / 4;
+                    int cx4b = Math.Min(cx4 + 1, cw4 - 1);
+                    int cz4b = Math.Min(cz4 + 1, cw4 - 1);
+                    bfx  = (cx & 3) * 0.25f;
+                    bfz  = (cz & 3) * 0.25f;
+                    bb00 = (cx4  * cw4 + cz4 ) * bh;  bb10 = (cx4b * cw4 + cz4 ) * bh;
+                    bb01 = (cx4  * cw4 + cz4b) * bh;  bb11 = (cx4b * cw4 + cz4b) * bh;
+                    b200 =  cx4  * cw4 + cz4;          b210 =  cx4b * cw4 + cz4;
+                    b201 =  cx4  * cw4 + cz4b;         b211 =  cx4b * cw4 + cz4b;
+                }
+
+                // Resolve per-column XZ scalars from bake or compute directly.
+                // bakeC path eliminates ~11 worldgen/noise calls per column (31K GetBiome
+                // + 3 GetHeight + 7 noise calls total across the zone) via 7 bilinear lerps.
+                float profMcS, profMcT, profFlD, profMbS, profMaS, addH, localAmp;
+                CaveProfile profFull = CaveProfile.Default; // only populated in non-bake path
+                if (bakeC)
+                {
+                    float BL(float[] a) =>
+                        Mathf.Lerp(Mathf.Lerp(a[b200], a[b210], bfx),
+                                   Mathf.Lerp(a[b201], a[b211], bfx), bfz);
+                    profMcS  = BL(_bk2dMcS!);
+                    profMcT  = BL(_bk2dMcT!);
+                    profFlD  = BL(_bk2dFlD!);
+                    profMbS  = BL(_bk2dMbS!);
+                    profMaS  = BL(_bk2dMaS!);
+                    addH     = BL(_bk2dAddH!);
+                    localAmp = BL(_bk2dLAmp!);
+                }
+                else
+                {
+                    profFull = wg != null ? BlendProfile(worldX, worldZ, wg) : CaveProfile.Default;
+                    profMcS  = profFull.modeC_strength;
+                    profMcT  = profFull.modeC_threshold;
+                    profFlD  = profFull.floorDepth;
+                    profMbS  = profFull.modeB_strength;
+                    profMaS  = profFull.modeA_strength;
+                    addH     = 0f; localAmp = 0f;
+                    if (profMcS > 0f && wg != null)
                     {
-                        float lh = warpedH - li * prof.modeB_layerSpacing;
-                        hmC[li] = lh + prof.modeB_radius;
-                        hmF[li] = lh - prof.modeB_radius;
+                        float awf = profFull.modeC_warpFrequency;
+                        float awx = _hmAddWarpX!.GetNoise(worldX * awf, worldZ * awf) * profFull.modeC_warpAmp;
+                        float awz = _hmAddWarpZ!.GetNoise(worldX * awf, worldZ * awf) * profFull.modeC_warpAmp;
+                        addH     = wg.GetHeight(worldX + awx, worldZ + awz);
+                        float avf = profFull.modeC_ampFrequency;
+                        localAmp = Mathf.Max(profFull.modeC_noiseAmp * (1f + profFull.modeC_ampVary
+                            * _addVaryNoise!.GetNoise(worldX * avf, worldZ * avf)), 0f);
                     }
                 }
 
-                // Mode C: per-column anchor height + amplitude.
-                float addH = 0f, localAmp = 0f;
-                if (prof.modeC_strength > 0f && wg != null)
+                float locFac = LocationFactor(worldX, worldZ, nearbyLocs);
+                float h      = wg != null ? wg.GetHeight(worldX, worldZ) : 0f;
+                float floorY = h - profFlD;   // avoids the duplicate GetHeight in ComputeColumnFloor
+
+                // Mode B: per-column precompute (XZ-only quantities).
+                // If bakeC but modeB is active, fall back to the full profile for its parameters.
+                int     layerCount = 0;
+                float[] hmC = Array.Empty<float>(), hmF = Array.Empty<float>();
+                if (profMbS > 0f && wg != null)
                 {
-                    float awf = prof.modeC_warpFrequency;
-                    float awx = _hmAddWarpX!.GetNoise(worldX * awf, worldZ * awf) * prof.modeC_warpAmp;
-                    float awz = _hmAddWarpZ!.GetNoise(worldX * awf, worldZ * awf) * prof.modeC_warpAmp;
-                    addH      = wg.GetHeight(worldX + awx, worldZ + awz);
-                    float avf = prof.modeC_ampFrequency;
-                    localAmp  = Mathf.Max(prof.modeC_noiseAmp * (1f + prof.modeC_ampVary
-                        * _addVaryNoise!.GetNoise(worldX * avf, worldZ * avf)), 0f);
+                    var pb   = bakeC ? BlendProfile(worldX, worldZ, wg) : profFull;
+                    float wf    = pb.modeB_warpFrequency;
+                    float ewAmp = pb.modeB_warpAmp * locFac;
+                    float wx2   = _hmWarpX!.GetNoise(worldX * wf, worldZ * wf) * ewAmp;
+                    float wz2   = _hmWarpZ!.GetNoise(worldX * wf, worldZ * wf) * ewAmp;
+                    float df    = pb.modeB_ditherFrequency;
+                    float warpedH = wg.GetHeight(worldX + wx2, worldZ + wz2)
+                                  + _ditherNoise!.GetNoise(worldX * df, worldZ * df) * pb.modeB_ditherAmp;
+                    layerCount = Mathf.Max(1, Mathf.RoundToInt(pb.modeB_layers));
+                    hmC = new float[layerCount]; hmF = new float[layerCount];
+                    for (int li = 0; li < layerCount; li++)
+                    {
+                        float lh = warpedH - li * pb.modeB_layerSpacing;
+                        hmC[li] = lh + pb.modeB_radius;
+                        hmF[li] = lh - pb.modeB_radius;
+                    }
                 }
 
                 for (int cy = 0; cy < bh; cy++)
                 {
-                    float worldY  = (extLo + cy) * s;
-                    float baseSDF = worldY - h;    // base SDF: positive = air, negative = solid
+                    float worldY   = (extLo + cy) * s;
+                    float baseSDF  = worldY - h;
                     float combined = baseSDF;
 
                     // Mode B: warped-heightmap band — air wins.
@@ -889,49 +1011,55 @@ namespace VoxCaves
                         float bandSDF = Mathf.Min(hmC[0] - worldY, worldY - hmF[0]);
                         for (int li = 1; li < layerCount; li++)
                             bandSDF = Mathf.Max(bandSDF, Mathf.Min(hmC[li] - worldY, worldY - hmF[li]));
-                        float sdf = Mathf.Min(bandSDF, worldY - floorY) * prof.modeB_strength;
+                        float sdf = Mathf.Min(bandSDF, worldY - floorY) * profMbS;
                         combined = Mathf.Max(combined, sdf);
                     }
 
                     // Mode C: 3D density field above heightmap — solid wins.
-                    if (prof.modeC_strength > 0f && wg != null)
+                    if (profMcS > 0f && wg != null)
                     {
-                        float relY  = worldY - addH;
-                        float sy    = relY * prof.modeC_vScale;
-                        float tvf   = prof.modeC_twistFrequency;
-                        float twistScale = 1f + prof.modeC_twistVary
-                            * _twistVaryNoise!.GetNoise(worldX * tvf, worldZ * tvf);
-                        float angle = worldY * prof.modeC_twist * twistScale;
-                        float cos   = Mathf.Cos(angle), sin = Mathf.Sin(angle);
-                        float tx    = worldX * cos - worldZ * sin;
-                        float tz    = worldX * sin + worldZ * cos;
-                        float af    = prof.modeC_frequency;
-                        float n     = _addNoise!.GetNoise(tx * af, sy * af, tz * af);
-                        float sdf   = (relY - (n - prof.modeC_threshold) * localAmp) * prof.modeC_strength;
+                        float relY = worldY - addH;
+                        float n;
+                        if (bakeC)
+                        {
+                            float n0 = Mathf.Lerp(_noiseBuf![bb00 + cy], _noiseBuf[bb10 + cy], bfx);
+                            float n1 = Mathf.Lerp(_noiseBuf![bb01 + cy], _noiseBuf[bb11 + cy], bfx);
+                            n = Mathf.Lerp(n0, n1, bfz);
+                        }
+                        else
+                        {
+                            float sy   = relY * profFull.modeC_vScale;
+                            float tvf  = profFull.modeC_twistFrequency;
+                            float twistScale = 1f + profFull.modeC_twistVary
+                                * _twistVaryNoise!.GetNoise(worldX * tvf, worldZ * tvf);
+                            float angle = worldY * profFull.modeC_twist * twistScale;
+                            float cosA  = Mathf.Cos(angle), sinA = Mathf.Sin(angle);
+                            float tx    = worldX * cosA - worldZ * sinA;
+                            float tz    = worldX * sinA + worldZ * cosA;
+                            n = _addNoise!.GetNoise(tx * profFull.modeC_frequency, sy * profFull.modeC_frequency, tz * profFull.modeC_frequency);
+                        }
+                        float sdf = (relY - (n - profMcT) * localAmp) * profMcS;
                         combined = Mathf.Min(combined, sdf);
                     }
 
                     // Mode A: noise tunnel network — air wins, punches through Mode C.
-                    if (prof.modeA_strength > 0f)
+                    if (profMaS > 0f)
                     {
-                        float twf = prof.modeA_warpFrequency;
-                        float tf  = prof.modeA_frequency;
-                        float sy  = worldY * prof.modeA_vScale;
-                        float wx  = _warpX!.GetNoise(worldX * twf, sy * twf, worldZ * twf) * prof.modeA_warpAmp;
-                        float wz  = _warpZ!.GetNoise(worldX * twf, sy * twf, worldZ * twf) * prof.modeA_warpAmp;
+                        var pa   = bakeC ? BlendProfile(worldX, worldZ, wg!) : profFull;
+                        float twf = pa.modeA_warpFrequency;
+                        float tf  = pa.modeA_frequency;
+                        float sy  = worldY * pa.modeA_vScale;
+                        float wx  = _warpX!.GetNoise(worldX * twf, sy * twf, worldZ * twf) * pa.modeA_warpAmp;
+                        float wz  = _warpZ!.GetNoise(worldX * twf, sy * twf, worldZ * twf) * pa.modeA_warpAmp;
                         float n   = _caveNoise!.GetNoise((worldX + wx) * tf, sy * tf, (worldZ + wz) * tf);
-                        float wf2 = prof.modeA_widthFrequency;
-                        float localWidth = Mathf.Max(prof.modeA_width * (1f + prof.modeA_widthVary
+                        float wf2 = pa.modeA_widthFrequency;
+                        float localWidth = Mathf.Max(pa.modeA_width * (1f + pa.modeA_widthVary
                             * _widthNoise!.GetNoise(worldX * wf2, sy * wf2, worldZ * wf2)), 0.001f);
                         float tunnelSDF = (localWidth - Mathf.Abs(n)) / localWidth * 4f * s;
-                        float sdf = Mathf.Min(tunnelSDF, worldY - floorY) * prof.modeA_strength;
+                        float sdf = Mathf.Min(tunnelSDF, worldY - floorY) * profMaS;
                         combined = Mathf.Max(combined, sdf);
                     }
 
-                    // Fade all modifications to zero near protected locations.
-                    // Lerping combined → baseSDF ensures locFac=0 leaves terrain completely
-                    // unmodified, avoiding the max(baseSDF, 0) underground-carve bug that
-                    // scaling individual SDFs by locFac produces.
                     buf[(cx * bh + cy) * bw + cz] = Mathf.Lerp(baseSDF, combined, locFac);
                 }
             }
@@ -1172,6 +1300,30 @@ namespace VoxCaves
             if (gx0 != 0 || gz0 != 0) return;
             try { Plugin.Carve(field, grid, originX, originZ, gx1 + 1, yLo, yHi); }
             catch (Exception e) { Plugin.Log.LogError($"[VoxCaves] Carve: {e.Message}"); }
+        }
+    }
+
+    // Force synchronous meshing immediately after a zone activates and is carved.
+    // Without this, Voxheim queues the mesh work async and the zone shows vanilla
+    // terrain for several frames while jobs complete.  _locationsCached guards so we
+    // only do this when Carve() actually ran (not when we returned early).
+    [HarmonyPatch]
+    static class ActivatePatch
+    {
+        static MethodBase? TargetMethod()
+        {
+            var t = Plugin.FindType("Voxheim.Unity.VoxelZone", "Voxheim");
+            var m = t?.GetMethod("Activate",
+                BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+            if (m == null) Plugin.Log.LogWarning("[VoxCaves] VoxelZone.Activate not found — instant mesh disabled.");
+            return m;
+        }
+
+        static void Postfix(object __instance)
+        {
+            if (Plugin._finishSkinNowMethod == null || !Plugin._locationsCached) return;
+            try { Plugin._finishSkinNowMethod.Invoke(__instance, null); }
+            catch (Exception e) { Plugin.Log.LogWarning($"[VoxCaves] FinishSkinNow@Activate: {e.Message}"); }
         }
     }
 
