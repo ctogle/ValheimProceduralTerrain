@@ -139,6 +139,18 @@ namespace VoxCaves
         internal static readonly Dictionary<string, int> _zoneMaxY  = new();
         internal static readonly Dictionary<string, int> _zoneExtHi = new(); // highest voxel Y ever written; used to size the reset range in hot-reload
 
+        // BlendProfile memoization: keyed by (gx4 << 32 | (uint)gz4) — coarse voxel coords.
+        // Cleared on world load and config reload; persists through RecarveAll (config unchanged).
+        internal static readonly Dictionary<long, CaveProfile> _profileCache = new();
+
+        // Scratch buffers for floating-island BFS (Phase 1.5). Pre-allocated, resized on demand.
+        static bool[]? _visitedBuf;
+        static int[]?  _islandQueue;
+
+        // wg.GetHeight is a pure function of (worldX, worldZ) for a given world seed.
+        // Cache it keyed by integer coarse voxel coords — cleared on world load only.
+        internal static readonly Dictionary<long, float> _heightCache = new();
+
         // Per-zone SDF cache: filled by Phase 3, queried by FallbackDensityPatch.
         // Layout: data[(ci * bh + cy) * width + ri]  (ci=zoneX, ri=zoneZ, cy=Y-extLo)
         internal static readonly Dictionary<string, (int extLo, int bh, int width, sbyte[] data)> _sdfCache = new();
@@ -464,6 +476,7 @@ namespace VoxCaves
 
         internal static void LoadBiomeConfig()
         {
+            _profileCache.Clear();
             string path = ConfigPath;
             if (!File.Exists(path))
             {
@@ -923,7 +936,12 @@ namespace VoxCaves
                 int   cz4w  = Math.Min(cz4 * 4, bw - 1);
                 int   gx4   = ox - overlap + cx4w, gz4 = oz - overlap + cz4w;
                 float wx4   = gx4 * s, wz4 = gz4 * s;
-                var   p4    = wg != null ? BlendProfile(wx4, wz4, wg) : CaveProfile.Default;
+                long  pKey  = (long)gx4 << 32 | (uint)gz4;
+                if (!Plugin._profileCache.TryGetValue(pKey, out var p4))
+                {
+                    p4 = wg != null ? BlendProfile(wx4, wz4, wg) : CaveProfile.Default;
+                    if (wg != null) Plugin._profileCache[pKey] = p4;
+                }
                 int   idx2  = cx4 * cw4 + cz4;
 
                 _bk2dMcS! [idx2] = p4.modeC_strength;
@@ -1042,6 +1060,53 @@ namespace VoxCaves
             FillPhase1(buf, bw, bh, extLo, s, ox, oz, overlap, bakeC, bakeA, wg, cw4, nearbyLocs);
             long _t1 = _sw.ElapsedMilliseconds;
 
+            // ── Phase 1.5: Floating-island removal ───────────────────────────────────
+            // BFS from all solid voxels at cy=0 (always below terrain). Any solid
+            // voxel not reachable is a floating island; set it to air before blur so
+            // the blur pass feathers the newly-exposed edges.
+            if (bakeC)
+            {
+                int islandBufSize = bw * bh * bw;
+                int stride_x      = bh * bw;
+                if (_visitedBuf  == null || _visitedBuf.Length  < islandBufSize) _visitedBuf  = new bool[islandBufSize];
+                if (_islandQueue == null || _islandQueue.Length < islandBufSize) _islandQueue = new int[islandBufSize];
+                Array.Clear(_visitedBuf, 0, islandBufSize);
+
+                int qHead = 0, qTail = 0;
+
+                for (int cx = 0; cx < bw; cx++)
+                for (int cz = 0; cz < bw; cz++)
+                {
+                    int idx = cx * stride_x + cz; // cy=0: (cx*bh+0)*bw+cz
+                    if (buf[idx] < 0f && !_visitedBuf[idx])
+                    { _visitedBuf[idx] = true; _islandQueue[qTail++] = idx; }
+                }
+
+                while (qHead < qTail)
+                {
+                    int idx = _islandQueue[qHead++];
+                    int cx  = idx / stride_x;
+                    int rem = idx % stride_x;
+                    int cy  = rem / bw;
+                    int cz  = rem % bw;
+                    int ni;
+                    if (cx > 0)    { ni = idx - stride_x; if (!_visitedBuf[ni] && buf[ni] < 0f) { _visitedBuf[ni] = true; _islandQueue[qTail++] = ni; } }
+                    if (cx < bw-1) { ni = idx + stride_x; if (!_visitedBuf[ni] && buf[ni] < 0f) { _visitedBuf[ni] = true; _islandQueue[qTail++] = ni; } }
+                    if (cy > 0)    { ni = idx - bw;        if (!_visitedBuf[ni] && buf[ni] < 0f) { _visitedBuf[ni] = true; _islandQueue[qTail++] = ni; } }
+                    if (cy < bh-1) { ni = idx + bw;        if (!_visitedBuf[ni] && buf[ni] < 0f) { _visitedBuf[ni] = true; _islandQueue[qTail++] = ni; } }
+                    if (cz > 0)    { ni = idx - 1;         if (!_visitedBuf[ni] && buf[ni] < 0f) { _visitedBuf[ni] = true; _islandQueue[qTail++] = ni; } }
+                    if (cz < bw-1) { ni = idx + 1;         if (!_visitedBuf[ni] && buf[ni] < 0f) { _visitedBuf[ni] = true; _islandQueue[qTail++] = ni; } }
+                }
+
+                int removed = 0;
+                for (int i = 0; i < islandBufSize; i++)
+                    if (!_visitedBuf[i] && buf[i] < 0f) { buf[i] = s; removed++; }
+
+                if (removed > 0)
+                    Log.LogDebug($"[VoxCaves] island-fill removed {removed} voxels in zone ({ox},{oz})");
+            }
+            long _t1b = _sw.ElapsedMilliseconds;
+
             // ── Phase 2: Separable 3D Gaussian blur [0.25, 0.5, 0.25] ──────────────
             // Each pass: X buf→tmp, Z tmp→buf, Y buf→tmp→buf. Result always in buf.
             // blur_passes=0 skips entirely; Phase 3 reads buf directly.
@@ -1154,7 +1219,7 @@ namespace VoxCaves
             if (_disableVegetation) _pendingVegCleanup = true;
 
             long _t3 = _sw.ElapsedMilliseconds;
-            Log.LogInfo($"[VoxCaves] zone ({ox},{oz}) bakeC={bakeC} bw={bw} bh={bh} Ph0={_t0}ms Ph1={_t1-_t0}ms Ph2={_t2-_t1}ms Ph3={_t3-_t2}ms total={_t3}ms carved={carved}");
+            Log.LogInfo($"[VoxCaves] zone ({ox},{oz}) bakeC={bakeC} bw={bw} bh={bh} Ph0={_t0}ms Ph1={_t1-_t0}ms Ph1b={_t1b-_t1}ms Ph2={_t2-_t1b}ms Ph3={_t3-_t2}ms total={_t3}ms carved={carved}");
         }
 
         // ── Hot-reload: re-run the full voxel pipeline on every loaded zone ───────
@@ -1518,7 +1583,14 @@ namespace VoxCaves
                 float profMaS  = BL(_bk2dMaS!, b200, b210, b201, b211, bfx, bfz);
                 float addH     = bakeC ? BL(_bk2dAddH!, b200, b210, b201, b211, bfx, bfz) : 0f;
                 float localAmp = bakeC ? BL(_bk2dLAmp!, b200, b210, b201, b211, bfx, bfz) : 0f;
-                float h        = wg != null ? wg.GetHeight(worldX, worldZ) : 0f;
+                float h;
+                if (wg == null) { h = 0f; }
+                else
+                {
+                    long hKey = (long)gx << 32 | (uint)gz;
+                    if (!_heightCache.TryGetValue(hKey, out h))
+                        _heightCache[hKey] = h = wg.GetHeight(worldX, worldZ);
+                }
                 float floorY   = h - profFlD;
                 float locFac   = LocationFactor(worldX, worldZ, nearbyLocs);
 
@@ -1664,6 +1736,8 @@ namespace VoxCaves
             Plugin._zoneMaxY.Clear();
             Plugin._zoneExtHi.Clear();
             Plugin._sdfCache.Clear();
+            Plugin._profileCache.Clear();
+            Plugin._heightCache.Clear();
             Plugin._locationPositions.Clear();
             Plugin._locationsCached = false;
             Plugin._caveNoise    = null;
