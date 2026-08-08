@@ -129,7 +129,6 @@ namespace VoxCaves
         internal static FieldInfo?       _zoneOriginX;
         internal static FieldInfo?       _zoneOriginZ;
         internal static FieldInfo?       _yScanHiField;
-        internal static FieldInfo?       _yScanLoField;
         internal static FieldInfo?       _voxelZoneFieldField;  // VoxelZone._field → VoxelField
 
         // VoxelBounds fields — used to construct the changed-bounds arg for PokeNeighbors
@@ -344,8 +343,6 @@ namespace VoxCaves
             _voxelZoneFieldField = zoneT?.GetField("_field",
                 BindingFlags.NonPublic | BindingFlags.Instance);
             _yScanHiField        = zoneT?.GetField("_yScanHi",
-                BindingFlags.NonPublic | BindingFlags.Instance);
-            _yScanLoField        = zoneT?.GetField("_yScanLo",
                 BindingFlags.NonPublic | BindingFlags.Instance);
             if (_zoneOriginX == null || _zoneOriginZ == null)
                 Log.LogWarning("[VoxCaves] Zone origin fields missing — per-brick SDF disabled.");
@@ -691,44 +688,58 @@ namespace VoxCaves
             CaveProfile Get(Heightmap.Biome b) =>
                 profs.TryGetValue(b, out var p) ? p : CaveProfile.Default;
 
-            var p0 = Get(wg.GetBiome(worldX,          worldZ         ));
-            var p1 = Get(wg.GetBiome(worldX + blendR, worldZ         ));
-            var p2 = Get(wg.GetBiome(worldX - blendR, worldZ         ));
-            var p3 = Get(wg.GetBiome(worldX,          worldZ + blendR));
-            var p4 = Get(wg.GetBiome(worldX,          worldZ - blendR));
-            const float w = 1f / 5f;
+            // 3×3 Gaussian kernel (σ = blendR).
+            // Cardinals at distance blendR  → weight exp(-1) ≈ 0.368.
+            // Diagonals at distance blendR√2 → weight exp(-2) ≈ 0.135.
+            // Normalized so all 9 weights sum to 1.
+            const float wC = 0.33191f, wK = 0.12212f, wD = 0.04491f;
+
+            var p0  = Get(wg.GetBiome(worldX,          worldZ         ));
+            var pE  = Get(wg.GetBiome(worldX + blendR, worldZ         ));
+            var pW  = Get(wg.GetBiome(worldX - blendR, worldZ         ));
+            var pN  = Get(wg.GetBiome(worldX,          worldZ + blendR));
+            var pS  = Get(wg.GetBiome(worldX,          worldZ - blendR));
+            var pNE = Get(wg.GetBiome(worldX + blendR, worldZ + blendR));
+            var pNW = Get(wg.GetBiome(worldX - blendR, worldZ + blendR));
+            var pSE = Get(wg.GetBiome(worldX + blendR, worldZ - blendR));
+            var pSW = Get(wg.GetBiome(worldX - blendR, worldZ - blendR));
+
+            float K(float c, float e, float w, float n, float s,
+                    float ne, float nw, float se, float sw) =>
+                c*wC + (e+w+n+s)*wK + (ne+nw+se+sw)*wD;
+
             return new CaveProfile
             {
-                modeB_strength            = (p0.modeB_strength            + p1.modeB_strength            + p2.modeB_strength            + p3.modeB_strength            + p4.modeB_strength           ) * w,
-                modeB_radius          = (p0.modeB_radius          + p1.modeB_radius          + p2.modeB_radius          + p3.modeB_radius          + p4.modeB_radius         ) * w,
-                modeB_warpAmp             = (p0.modeB_warpAmp             + p1.modeB_warpAmp             + p2.modeB_warpAmp             + p3.modeB_warpAmp             + p4.modeB_warpAmp            ) * w,
-                modeB_warpFrequency       = (p0.modeB_warpFrequency       + p1.modeB_warpFrequency       + p2.modeB_warpFrequency       + p3.modeB_warpFrequency       + p4.modeB_warpFrequency      ) * w,
-                modeB_ditherAmp           = (p0.modeB_ditherAmp           + p1.modeB_ditherAmp           + p2.modeB_ditherAmp           + p3.modeB_ditherAmp           + p4.modeB_ditherAmp          ) * w,
-                modeB_ditherFrequency     = (p0.modeB_ditherFrequency     + p1.modeB_ditherFrequency     + p2.modeB_ditherFrequency     + p3.modeB_ditherFrequency     + p4.modeB_ditherFrequency    ) * w,
-                modeA_strength      = (p0.modeA_strength      + p1.modeA_strength      + p2.modeA_strength      + p3.modeA_strength      + p4.modeA_strength     ) * w,
-                modeA_width         = (p0.modeA_width         + p1.modeA_width         + p2.modeA_width         + p3.modeA_width         + p4.modeA_width        ) * w,
-                modeA_frequency     = (p0.modeA_frequency     + p1.modeA_frequency     + p2.modeA_frequency     + p3.modeA_frequency     + p4.modeA_frequency    ) * w,
-                modeA_warpAmp       = (p0.modeA_warpAmp       + p1.modeA_warpAmp       + p2.modeA_warpAmp       + p3.modeA_warpAmp       + p4.modeA_warpAmp      ) * w,
-                modeA_warpFrequency = (p0.modeA_warpFrequency + p1.modeA_warpFrequency + p2.modeA_warpFrequency + p3.modeA_warpFrequency + p4.modeA_warpFrequency) * w,
-                modeA_vScale        = (p0.modeA_vScale        + p1.modeA_vScale        + p2.modeA_vScale        + p3.modeA_vScale        + p4.modeA_vScale       ) * w,
-                modeA_widthVary     = (p0.modeA_widthVary     + p1.modeA_widthVary     + p2.modeA_widthVary     + p3.modeA_widthVary     + p4.modeA_widthVary    ) * w,
-                modeA_widthFrequency= (p0.modeA_widthFrequency+ p1.modeA_widthFrequency+ p2.modeA_widthFrequency+ p3.modeA_widthFrequency+ p4.modeA_widthFrequency) * w,
-                modeC_strength         = (p0.modeC_strength         + p1.modeC_strength         + p2.modeC_strength         + p3.modeC_strength         + p4.modeC_strength        ) * w,
-                modeC_threshold        = (p0.modeC_threshold        + p1.modeC_threshold        + p2.modeC_threshold        + p3.modeC_threshold        + p4.modeC_threshold       ) * w,
-                modeC_noiseAmp         = (p0.modeC_noiseAmp         + p1.modeC_noiseAmp         + p2.modeC_noiseAmp         + p3.modeC_noiseAmp         + p4.modeC_noiseAmp        ) * w,
-                modeC_frequency        = (p0.modeC_frequency        + p1.modeC_frequency        + p2.modeC_frequency        + p3.modeC_frequency        + p4.modeC_frequency       ) * w,
-                modeC_warpAmp          = (p0.modeC_warpAmp          + p1.modeC_warpAmp          + p2.modeC_warpAmp          + p3.modeC_warpAmp          + p4.modeC_warpAmp         ) * w,
-                modeC_warpFrequency    = (p0.modeC_warpFrequency    + p1.modeC_warpFrequency    + p2.modeC_warpFrequency    + p3.modeC_warpFrequency    + p4.modeC_warpFrequency   ) * w,
-                modeC_vScale           = (p0.modeC_vScale           + p1.modeC_vScale           + p2.modeC_vScale           + p3.modeC_vScale           + p4.modeC_vScale          ) * w,
-                modeC_twist            = (p0.modeC_twist            + p1.modeC_twist            + p2.modeC_twist            + p3.modeC_twist            + p4.modeC_twist           ) * w,
-                modeC_twistVary        = (p0.modeC_twistVary        + p1.modeC_twistVary        + p2.modeC_twistVary        + p3.modeC_twistVary        + p4.modeC_twistVary       ) * w,
-                modeC_twistFrequency   = (p0.modeC_twistFrequency   + p1.modeC_twistFrequency   + p2.modeC_twistFrequency   + p3.modeC_twistFrequency   + p4.modeC_twistFrequency  ) * w,
-                modeC_ampVary          = (p0.modeC_ampVary          + p1.modeC_ampVary          + p2.modeC_ampVary          + p3.modeC_ampVary          + p4.modeC_ampVary         ) * w,
-                modeC_ampFrequency     = (p0.modeC_ampFrequency     + p1.modeC_ampFrequency     + p2.modeC_ampFrequency     + p3.modeC_ampFrequency     + p4.modeC_ampFrequency    ) * w,
-                blur_passes         = (p0.blur_passes         + p1.blur_passes         + p2.blur_passes         + p3.blur_passes         + p4.blur_passes        ) * w,
-                floorDepth          = (p0.floorDepth          + p1.floorDepth          + p2.floorDepth          + p3.floorDepth          + p4.floorDepth         ) * w,
-                modeB_layers          = (p0.modeB_layers          + p1.modeB_layers          + p2.modeB_layers          + p3.modeB_layers          + p4.modeB_layers         ) * w,
-                modeB_layerSpacing    = (p0.modeB_layerSpacing    + p1.modeB_layerSpacing    + p2.modeB_layerSpacing    + p3.modeB_layerSpacing    + p4.modeB_layerSpacing   ) * w,
+                modeB_strength       = K(p0.modeB_strength,       pE.modeB_strength,       pW.modeB_strength,       pN.modeB_strength,       pS.modeB_strength,       pNE.modeB_strength,       pNW.modeB_strength,       pSE.modeB_strength,       pSW.modeB_strength      ),
+                modeB_radius         = K(p0.modeB_radius,         pE.modeB_radius,         pW.modeB_radius,         pN.modeB_radius,         pS.modeB_radius,         pNE.modeB_radius,         pNW.modeB_radius,         pSE.modeB_radius,         pSW.modeB_radius        ),
+                modeB_warpAmp        = K(p0.modeB_warpAmp,        pE.modeB_warpAmp,        pW.modeB_warpAmp,        pN.modeB_warpAmp,        pS.modeB_warpAmp,        pNE.modeB_warpAmp,        pNW.modeB_warpAmp,        pSE.modeB_warpAmp,        pSW.modeB_warpAmp       ),
+                modeB_warpFrequency  = K(p0.modeB_warpFrequency,  pE.modeB_warpFrequency,  pW.modeB_warpFrequency,  pN.modeB_warpFrequency,  pS.modeB_warpFrequency,  pNE.modeB_warpFrequency,  pNW.modeB_warpFrequency,  pSE.modeB_warpFrequency,  pSW.modeB_warpFrequency ),
+                modeB_ditherAmp      = K(p0.modeB_ditherAmp,      pE.modeB_ditherAmp,      pW.modeB_ditherAmp,      pN.modeB_ditherAmp,      pS.modeB_ditherAmp,      pNE.modeB_ditherAmp,      pNW.modeB_ditherAmp,      pSE.modeB_ditherAmp,      pSW.modeB_ditherAmp     ),
+                modeB_ditherFrequency= K(p0.modeB_ditherFrequency,pE.modeB_ditherFrequency,pW.modeB_ditherFrequency,pN.modeB_ditherFrequency,pS.modeB_ditherFrequency,pNE.modeB_ditherFrequency,pNW.modeB_ditherFrequency,pSE.modeB_ditherFrequency,pSW.modeB_ditherFrequency),
+                modeB_layers         = K(p0.modeB_layers,         pE.modeB_layers,         pW.modeB_layers,         pN.modeB_layers,         pS.modeB_layers,         pNE.modeB_layers,         pNW.modeB_layers,         pSE.modeB_layers,         pSW.modeB_layers        ),
+                modeB_layerSpacing   = K(p0.modeB_layerSpacing,   pE.modeB_layerSpacing,   pW.modeB_layerSpacing,   pN.modeB_layerSpacing,   pS.modeB_layerSpacing,   pNE.modeB_layerSpacing,   pNW.modeB_layerSpacing,   pSE.modeB_layerSpacing,   pSW.modeB_layerSpacing  ),
+                modeA_strength       = K(p0.modeA_strength,       pE.modeA_strength,       pW.modeA_strength,       pN.modeA_strength,       pS.modeA_strength,       pNE.modeA_strength,       pNW.modeA_strength,       pSE.modeA_strength,       pSW.modeA_strength      ),
+                modeA_width          = K(p0.modeA_width,          pE.modeA_width,          pW.modeA_width,          pN.modeA_width,          pS.modeA_width,          pNE.modeA_width,          pNW.modeA_width,          pSE.modeA_width,          pSW.modeA_width         ),
+                modeA_frequency      = K(p0.modeA_frequency,      pE.modeA_frequency,      pW.modeA_frequency,      pN.modeA_frequency,      pS.modeA_frequency,      pNE.modeA_frequency,      pNW.modeA_frequency,      pSE.modeA_frequency,      pSW.modeA_frequency     ),
+                modeA_warpAmp        = K(p0.modeA_warpAmp,        pE.modeA_warpAmp,        pW.modeA_warpAmp,        pN.modeA_warpAmp,        pS.modeA_warpAmp,        pNE.modeA_warpAmp,        pNW.modeA_warpAmp,        pSE.modeA_warpAmp,        pSW.modeA_warpAmp       ),
+                modeA_warpFrequency  = K(p0.modeA_warpFrequency,  pE.modeA_warpFrequency,  pW.modeA_warpFrequency,  pN.modeA_warpFrequency,  pS.modeA_warpFrequency,  pNE.modeA_warpFrequency,  pNW.modeA_warpFrequency,  pSE.modeA_warpFrequency,  pSW.modeA_warpFrequency ),
+                modeA_vScale         = K(p0.modeA_vScale,         pE.modeA_vScale,         pW.modeA_vScale,         pN.modeA_vScale,         pS.modeA_vScale,         pNE.modeA_vScale,         pNW.modeA_vScale,         pSE.modeA_vScale,         pSW.modeA_vScale        ),
+                modeA_widthVary      = K(p0.modeA_widthVary,      pE.modeA_widthVary,      pW.modeA_widthVary,      pN.modeA_widthVary,      pS.modeA_widthVary,      pNE.modeA_widthVary,      pNW.modeA_widthVary,      pSE.modeA_widthVary,      pSW.modeA_widthVary     ),
+                modeA_widthFrequency = K(p0.modeA_widthFrequency, pE.modeA_widthFrequency, pW.modeA_widthFrequency, pN.modeA_widthFrequency, pS.modeA_widthFrequency, pNE.modeA_widthFrequency, pNW.modeA_widthFrequency, pSE.modeA_widthFrequency, pSW.modeA_widthFrequency),
+                modeC_strength       = K(p0.modeC_strength,       pE.modeC_strength,       pW.modeC_strength,       pN.modeC_strength,       pS.modeC_strength,       pNE.modeC_strength,       pNW.modeC_strength,       pSE.modeC_strength,       pSW.modeC_strength      ),
+                modeC_threshold      = K(p0.modeC_threshold,      pE.modeC_threshold,      pW.modeC_threshold,      pN.modeC_threshold,      pS.modeC_threshold,      pNE.modeC_threshold,      pNW.modeC_threshold,      pSE.modeC_threshold,      pSW.modeC_threshold     ),
+                modeC_noiseAmp       = K(p0.modeC_noiseAmp,       pE.modeC_noiseAmp,       pW.modeC_noiseAmp,       pN.modeC_noiseAmp,       pS.modeC_noiseAmp,       pNE.modeC_noiseAmp,       pNW.modeC_noiseAmp,       pSE.modeC_noiseAmp,       pSW.modeC_noiseAmp      ),
+                modeC_frequency      = K(p0.modeC_frequency,      pE.modeC_frequency,      pW.modeC_frequency,      pN.modeC_frequency,      pS.modeC_frequency,      pNE.modeC_frequency,      pNW.modeC_frequency,      pSE.modeC_frequency,      pSW.modeC_frequency     ),
+                modeC_warpAmp        = K(p0.modeC_warpAmp,        pE.modeC_warpAmp,        pW.modeC_warpAmp,        pN.modeC_warpAmp,        pS.modeC_warpAmp,        pNE.modeC_warpAmp,        pNW.modeC_warpAmp,        pSE.modeC_warpAmp,        pSW.modeC_warpAmp       ),
+                modeC_warpFrequency  = K(p0.modeC_warpFrequency,  pE.modeC_warpFrequency,  pW.modeC_warpFrequency,  pN.modeC_warpFrequency,  pS.modeC_warpFrequency,  pNE.modeC_warpFrequency,  pNW.modeC_warpFrequency,  pSE.modeC_warpFrequency,  pSW.modeC_warpFrequency ),
+                modeC_vScale         = K(p0.modeC_vScale,         pE.modeC_vScale,         pW.modeC_vScale,         pN.modeC_vScale,         pS.modeC_vScale,         pNE.modeC_vScale,         pNW.modeC_vScale,         pSE.modeC_vScale,         pSW.modeC_vScale        ),
+                modeC_twist          = K(p0.modeC_twist,          pE.modeC_twist,          pW.modeC_twist,          pN.modeC_twist,          pS.modeC_twist,          pNE.modeC_twist,          pNW.modeC_twist,          pSE.modeC_twist,          pSW.modeC_twist         ),
+                modeC_twistVary      = K(p0.modeC_twistVary,      pE.modeC_twistVary,      pW.modeC_twistVary,      pN.modeC_twistVary,      pS.modeC_twistVary,      pNE.modeC_twistVary,      pNW.modeC_twistVary,      pSE.modeC_twistVary,      pSW.modeC_twistVary     ),
+                modeC_twistFrequency = K(p0.modeC_twistFrequency, pE.modeC_twistFrequency, pW.modeC_twistFrequency, pN.modeC_twistFrequency, pS.modeC_twistFrequency, pNE.modeC_twistFrequency, pNW.modeC_twistFrequency, pSE.modeC_twistFrequency, pSW.modeC_twistFrequency),
+                modeC_ampVary        = K(p0.modeC_ampVary,        pE.modeC_ampVary,        pW.modeC_ampVary,        pN.modeC_ampVary,        pS.modeC_ampVary,        pNE.modeC_ampVary,        pNW.modeC_ampVary,        pSE.modeC_ampVary,        pSW.modeC_ampVary       ),
+                modeC_ampFrequency   = K(p0.modeC_ampFrequency,   pE.modeC_ampFrequency,   pW.modeC_ampFrequency,   pN.modeC_ampFrequency,   pS.modeC_ampFrequency,   pNE.modeC_ampFrequency,   pNW.modeC_ampFrequency,   pSE.modeC_ampFrequency,   pSW.modeC_ampFrequency  ),
+                blur_passes          = K(p0.blur_passes,          pE.blur_passes,          pW.blur_passes,          pN.blur_passes,          pS.blur_passes,          pNE.blur_passes,          pNW.blur_passes,          pSE.blur_passes,          pSW.blur_passes         ),
+                floorDepth           = K(p0.floorDepth,           pE.floorDepth,           pW.floorDepth,           pN.floorDepth,           pS.floorDepth,           pNE.floorDepth,           pNW.floorDepth,           pSE.floorDepth,           pSW.floorDepth          ),
             };
         }
 
