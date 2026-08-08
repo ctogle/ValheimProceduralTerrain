@@ -99,8 +99,8 @@ namespace VoxCaves
         // ── Location protection ───────────────────────────────────────────────────
         internal static readonly List<Vector2> _locationPositions = new();
         internal static bool _locationsCached;
-        internal static bool _protectLocations = true;
-        internal static bool _forceRecarve = false;
+        internal static bool  _protectLocations  = true;
+        internal static float _biomeBlendRadius  = 192f;
         const float LocProtectR = 30f;
         const float LocFadeR    = 40f;
 
@@ -537,6 +537,8 @@ namespace VoxCaves
                         }
                         if (k == "protectlocations")
                             _protectLocations = !(v == "0" || v == "false");
+                        if (k == "biomeblendradius" && float.TryParse(v, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float bbr))
+                            _biomeBlendRadius = Mathf.Max(1f, bbr);
                     }
                     continue;
                 }
@@ -610,6 +612,7 @@ namespace VoxCaves
             sb.AppendLine("[Debug]");
             sb.AppendLine("disableVegetation = false");
             sb.AppendLine("protectLocations  = true   # false = carve through location areas (use with SpawnLocation Y-snap patch)");
+            sb.AppendLine("biomeBlendRadius  = 192    # world units over which biome profiles blend at boundaries");
             sb.AppendLine();
 
             sb.AppendLine("[Profile:vanilla_heightmap]");
@@ -702,77 +705,73 @@ namespace VoxCaves
             return (prof.modeA_width - absN) / prof.modeA_width * prof.modeA_strength;
         }
 
-        // ── Biome profile blending ────────────────────────────────────────────────
+        // ── Biome profile blending ────────────────────────────────────────────────────
+        // 5×5 Gaussian kernel, step = blendRadius/2, σ = blendRadius/2.
+        // 25 samples give smooth symmetric blending across biome boundaries.
+        // No centre-biome gate — vanilla and active zones blend freely.
         static CaveProfile BlendProfile(float worldX, float worldZ, WorldGenerator wg)
         {
-            const float blendR = 48f;
-            var profs = _biomeProfiles;
+            float step  = _biomeBlendRadius * 0.5f;
+            float sigma = step;
+            var   profs = _biomeProfiles;
 
             CaveProfile Get(Heightmap.Biome b) =>
                 profs.TryGetValue(b, out var p) ? p : CaveProfile.Default;
 
-            // 3×3 Gaussian kernel (σ = blendR).
-            // Cardinals at distance blendR  → weight exp(-1) ≈ 0.368.
-            // Diagonals at distance blendR√2 → weight exp(-2) ≈ 0.135.
-            // Normalized so all 9 weights sum to 1.
-            const float wC = 0.33191f, wK = 0.12212f, wD = 0.04491f;
+            float totalW = 0f;
+            float
+                fMbStr=0,fMbR=0,fMbWA=0,fMbWF=0,fMbVS=0,fMbNA=0,fMbYO=0,fMbTw=0,
+                fMaStr=0,fMaW=0,fMaF=0,fMaWA=0,fMaWF=0,fMaVS=0,fMaWv=0,fMaWvF=0,
+                fMcStr=0,fMcTh=0,fMcNA=0,fMcF=0,fMcWA=0,fMcWF=0,fMcVS=0,
+                fMcTw=0,fMcTwV=0,fMcTwF=0,fMcAV=0,fMcAF=0,
+                fBlur=0,fPK=0,fPL=0,fFlD=0;
 
-            var p0  = Get(wg.GetBiome(worldX,          worldZ         ));
-            var pE  = Get(wg.GetBiome(worldX + blendR, worldZ         ));
-            var pW  = Get(wg.GetBiome(worldX - blendR, worldZ         ));
-            var pN  = Get(wg.GetBiome(worldX,          worldZ + blendR));
-            var pS  = Get(wg.GetBiome(worldX,          worldZ - blendR));
-            var pNE = Get(wg.GetBiome(worldX + blendR, worldZ + blendR));
-            var pNW = Get(wg.GetBiome(worldX - blendR, worldZ + blendR));
-            var pSE = Get(wg.GetBiome(worldX + blendR, worldZ - blendR));
-            var pSW = Get(wg.GetBiome(worldX - blendR, worldZ - blendR));
-
-            float K(float c, float e, float w, float n, float s,
-                    float ne, float nw, float se, float sw) =>
-                c*wC + (e+w+n+s)*wK + (ne+nw+se+sw)*wD;
-
-            // Gate mode strengths by the centre biome: if the centre has a mode disabled
-            // (strength=0) it must stay 0 regardless of what neighbours contribute.
-            // Prevents active biomes from bleeding their modes into vanilla neighbours.
-            var r = new CaveProfile
+            float inv2s2 = 1f / (2f * sigma * sigma);
+            for (int ix = -2; ix <= 2; ix++)
+            for (int iz = -2; iz <= 2; iz++)
             {
-                modeB_strength       = K(p0.modeB_strength,       pE.modeB_strength,       pW.modeB_strength,       pN.modeB_strength,       pS.modeB_strength,       pNE.modeB_strength,       pNW.modeB_strength,       pSE.modeB_strength,       pSW.modeB_strength      ),
-                modeB_radius         = K(p0.modeB_radius,         pE.modeB_radius,         pW.modeB_radius,         pN.modeB_radius,         pS.modeB_radius,         pNE.modeB_radius,         pNW.modeB_radius,         pSE.modeB_radius,         pSW.modeB_radius        ),
-                modeB_warpAmp        = K(p0.modeB_warpAmp,        pE.modeB_warpAmp,        pW.modeB_warpAmp,        pN.modeB_warpAmp,        pS.modeB_warpAmp,        pNE.modeB_warpAmp,        pNW.modeB_warpAmp,        pSE.modeB_warpAmp,        pSW.modeB_warpAmp       ),
-                modeB_warpFrequency  = K(p0.modeB_warpFrequency,  pE.modeB_warpFrequency,  pW.modeB_warpFrequency,  pN.modeB_warpFrequency,  pS.modeB_warpFrequency,  pNE.modeB_warpFrequency,  pNW.modeB_warpFrequency,  pSE.modeB_warpFrequency,  pSW.modeB_warpFrequency ),
-                modeB_vScale         = K(p0.modeB_vScale,         pE.modeB_vScale,         pW.modeB_vScale,         pN.modeB_vScale,         pS.modeB_vScale,         pNE.modeB_vScale,         pNW.modeB_vScale,         pSE.modeB_vScale,         pSW.modeB_vScale        ),
-                modeB_noiseAmp       = K(p0.modeB_noiseAmp,       pE.modeB_noiseAmp,       pW.modeB_noiseAmp,       pN.modeB_noiseAmp,       pS.modeB_noiseAmp,       pNE.modeB_noiseAmp,       pNW.modeB_noiseAmp,       pSE.modeB_noiseAmp,       pSW.modeB_noiseAmp      ),
-                modeB_yOffset        = K(p0.modeB_yOffset,        pE.modeB_yOffset,        pW.modeB_yOffset,        pN.modeB_yOffset,        pS.modeB_yOffset,        pNE.modeB_yOffset,        pNW.modeB_yOffset,        pSE.modeB_yOffset,        pSW.modeB_yOffset       ),
-                modeB_twist          = K(p0.modeB_twist,          pE.modeB_twist,          pW.modeB_twist,          pN.modeB_twist,          pS.modeB_twist,          pNE.modeB_twist,          pNW.modeB_twist,          pSE.modeB_twist,          pSW.modeB_twist         ),
-                modeA_strength       = K(p0.modeA_strength,       pE.modeA_strength,       pW.modeA_strength,       pN.modeA_strength,       pS.modeA_strength,       pNE.modeA_strength,       pNW.modeA_strength,       pSE.modeA_strength,       pSW.modeA_strength      ),
-                modeA_width          = K(p0.modeA_width,          pE.modeA_width,          pW.modeA_width,          pN.modeA_width,          pS.modeA_width,          pNE.modeA_width,          pNW.modeA_width,          pSE.modeA_width,          pSW.modeA_width         ),
-                modeA_frequency      = K(p0.modeA_frequency,      pE.modeA_frequency,      pW.modeA_frequency,      pN.modeA_frequency,      pS.modeA_frequency,      pNE.modeA_frequency,      pNW.modeA_frequency,      pSE.modeA_frequency,      pSW.modeA_frequency     ),
-                modeA_warpAmp        = K(p0.modeA_warpAmp,        pE.modeA_warpAmp,        pW.modeA_warpAmp,        pN.modeA_warpAmp,        pS.modeA_warpAmp,        pNE.modeA_warpAmp,        pNW.modeA_warpAmp,        pSE.modeA_warpAmp,        pSW.modeA_warpAmp       ),
-                modeA_warpFrequency  = K(p0.modeA_warpFrequency,  pE.modeA_warpFrequency,  pW.modeA_warpFrequency,  pN.modeA_warpFrequency,  pS.modeA_warpFrequency,  pNE.modeA_warpFrequency,  pNW.modeA_warpFrequency,  pSE.modeA_warpFrequency,  pSW.modeA_warpFrequency ),
-                modeA_vScale         = K(p0.modeA_vScale,         pE.modeA_vScale,         pW.modeA_vScale,         pN.modeA_vScale,         pS.modeA_vScale,         pNE.modeA_vScale,         pNW.modeA_vScale,         pSE.modeA_vScale,         pSW.modeA_vScale        ),
-                modeA_widthVary      = K(p0.modeA_widthVary,      pE.modeA_widthVary,      pW.modeA_widthVary,      pN.modeA_widthVary,      pS.modeA_widthVary,      pNE.modeA_widthVary,      pNW.modeA_widthVary,      pSE.modeA_widthVary,      pSW.modeA_widthVary     ),
-                modeA_widthFrequency = K(p0.modeA_widthFrequency, pE.modeA_widthFrequency, pW.modeA_widthFrequency, pN.modeA_widthFrequency, pS.modeA_widthFrequency, pNE.modeA_widthFrequency, pNW.modeA_widthFrequency, pSE.modeA_widthFrequency, pSW.modeA_widthFrequency),
-                modeC_strength       = K(p0.modeC_strength,       pE.modeC_strength,       pW.modeC_strength,       pN.modeC_strength,       pS.modeC_strength,       pNE.modeC_strength,       pNW.modeC_strength,       pSE.modeC_strength,       pSW.modeC_strength      ),
-                modeC_threshold      = K(p0.modeC_threshold,      pE.modeC_threshold,      pW.modeC_threshold,      pN.modeC_threshold,      pS.modeC_threshold,      pNE.modeC_threshold,      pNW.modeC_threshold,      pSE.modeC_threshold,      pSW.modeC_threshold     ),
-                modeC_noiseAmp       = K(p0.modeC_noiseAmp,       pE.modeC_noiseAmp,       pW.modeC_noiseAmp,       pN.modeC_noiseAmp,       pS.modeC_noiseAmp,       pNE.modeC_noiseAmp,       pNW.modeC_noiseAmp,       pSE.modeC_noiseAmp,       pSW.modeC_noiseAmp      ),
-                modeC_frequency      = K(p0.modeC_frequency,      pE.modeC_frequency,      pW.modeC_frequency,      pN.modeC_frequency,      pS.modeC_frequency,      pNE.modeC_frequency,      pNW.modeC_frequency,      pSE.modeC_frequency,      pSW.modeC_frequency     ),
-                modeC_warpAmp        = K(p0.modeC_warpAmp,        pE.modeC_warpAmp,        pW.modeC_warpAmp,        pN.modeC_warpAmp,        pS.modeC_warpAmp,        pNE.modeC_warpAmp,        pNW.modeC_warpAmp,        pSE.modeC_warpAmp,        pSW.modeC_warpAmp       ),
-                modeC_warpFrequency  = K(p0.modeC_warpFrequency,  pE.modeC_warpFrequency,  pW.modeC_warpFrequency,  pN.modeC_warpFrequency,  pS.modeC_warpFrequency,  pNE.modeC_warpFrequency,  pNW.modeC_warpFrequency,  pSE.modeC_warpFrequency,  pSW.modeC_warpFrequency ),
-                modeC_vScale         = K(p0.modeC_vScale,         pE.modeC_vScale,         pW.modeC_vScale,         pN.modeC_vScale,         pS.modeC_vScale,         pNE.modeC_vScale,         pNW.modeC_vScale,         pSE.modeC_vScale,         pSW.modeC_vScale        ),
-                modeC_twist          = K(p0.modeC_twist,          pE.modeC_twist,          pW.modeC_twist,          pN.modeC_twist,          pS.modeC_twist,          pNE.modeC_twist,          pNW.modeC_twist,          pSE.modeC_twist,          pSW.modeC_twist         ),
-                modeC_twistVary      = K(p0.modeC_twistVary,      pE.modeC_twistVary,      pW.modeC_twistVary,      pN.modeC_twistVary,      pS.modeC_twistVary,      pNE.modeC_twistVary,      pNW.modeC_twistVary,      pSE.modeC_twistVary,      pSW.modeC_twistVary     ),
-                modeC_twistFrequency = K(p0.modeC_twistFrequency, pE.modeC_twistFrequency, pW.modeC_twistFrequency, pN.modeC_twistFrequency, pS.modeC_twistFrequency, pNE.modeC_twistFrequency, pNW.modeC_twistFrequency, pSE.modeC_twistFrequency, pSW.modeC_twistFrequency),
-                modeC_ampVary        = K(p0.modeC_ampVary,        pE.modeC_ampVary,        pW.modeC_ampVary,        pN.modeC_ampVary,        pS.modeC_ampVary,        pNE.modeC_ampVary,        pNW.modeC_ampVary,        pSE.modeC_ampVary,        pSW.modeC_ampVary       ),
-                modeC_ampFrequency   = K(p0.modeC_ampFrequency,   pE.modeC_ampFrequency,   pW.modeC_ampFrequency,   pN.modeC_ampFrequency,   pS.modeC_ampFrequency,   pNE.modeC_ampFrequency,   pNW.modeC_ampFrequency,   pSE.modeC_ampFrequency,   pSW.modeC_ampFrequency  ),
-                blur_passes          = K(p0.blur_passes,          pE.blur_passes,          pW.blur_passes,          pN.blur_passes,          pS.blur_passes,          pNE.blur_passes,          pNW.blur_passes,          pSE.blur_passes,          pSW.blur_passes         ),
-                perona_k             = K(p0.perona_k,             pE.perona_k,             pW.perona_k,             pN.perona_k,             pS.perona_k,             pNE.perona_k,             pNW.perona_k,             pSE.perona_k,             pSW.perona_k            ),
-                perona_lambda        = K(p0.perona_lambda,        pE.perona_lambda,        pW.perona_lambda,        pN.perona_lambda,        pS.perona_lambda,        pNE.perona_lambda,        pNW.perona_lambda,        pSE.perona_lambda,        pSW.perona_lambda       ),
-                floorDepth           = K(p0.floorDepth,           pE.floorDepth,           pW.floorDepth,           pN.floorDepth,           pS.floorDepth,           pNE.floorDepth,           pNW.floorDepth,           pSE.floorDepth,           pSW.floorDepth          ),
+                float dx = ix * step, dz = iz * step;
+                float w  = Mathf.Exp(-(dx*dx + dz*dz) * inv2s2);
+                var   p  = Get(wg.GetBiome(worldX + dx, worldZ + dz));
+                totalW   += w;
+                fMbStr+=w*p.modeB_strength;      fMbR  +=w*p.modeB_radius;
+                fMbWA +=w*p.modeB_warpAmp;       fMbWF +=w*p.modeB_warpFrequency;
+                fMbVS +=w*p.modeB_vScale;        fMbNA +=w*p.modeB_noiseAmp;
+                fMbYO +=w*p.modeB_yOffset;       fMbTw +=w*p.modeB_twist;
+                fMaStr+=w*p.modeA_strength;      fMaW  +=w*p.modeA_width;
+                fMaF  +=w*p.modeA_frequency;     fMaWA +=w*p.modeA_warpAmp;
+                fMaWF +=w*p.modeA_warpFrequency; fMaVS +=w*p.modeA_vScale;
+                fMaWv +=w*p.modeA_widthVary;     fMaWvF+=w*p.modeA_widthFrequency;
+                fMcStr+=w*p.modeC_strength;      fMcTh +=w*p.modeC_threshold;
+                fMcNA +=w*p.modeC_noiseAmp;      fMcF  +=w*p.modeC_frequency;
+                fMcWA +=w*p.modeC_warpAmp;       fMcWF +=w*p.modeC_warpFrequency;
+                fMcVS +=w*p.modeC_vScale;        fMcTw +=w*p.modeC_twist;
+                fMcTwV+=w*p.modeC_twistVary;     fMcTwF+=w*p.modeC_twistFrequency;
+                fMcAV +=w*p.modeC_ampVary;       fMcAF +=w*p.modeC_ampFrequency;
+                fBlur +=w*p.blur_passes;         fPK   +=w*p.perona_k;
+                fPL   +=w*p.perona_lambda;       fFlD  +=w*p.floorDepth;
+            }
+
+            float rcp = 1f / totalW;
+            return new CaveProfile
+            {
+                modeB_strength       = fMbStr*rcp, modeB_radius         = fMbR  *rcp,
+                modeB_warpAmp        = fMbWA *rcp, modeB_warpFrequency  = fMbWF *rcp,
+                modeB_vScale         = fMbVS *rcp, modeB_noiseAmp       = fMbNA *rcp,
+                modeB_yOffset        = fMbYO *rcp, modeB_twist          = fMbTw *rcp,
+                modeA_strength       = fMaStr*rcp, modeA_width          = fMaW  *rcp,
+                modeA_frequency      = fMaF  *rcp, modeA_warpAmp        = fMaWA *rcp,
+                modeA_warpFrequency  = fMaWF *rcp, modeA_vScale         = fMaVS *rcp,
+                modeA_widthVary      = fMaWv *rcp, modeA_widthFrequency = fMaWvF*rcp,
+                modeC_strength       = fMcStr*rcp, modeC_threshold      = fMcTh *rcp,
+                modeC_noiseAmp       = fMcNA *rcp, modeC_frequency      = fMcF  *rcp,
+                modeC_warpAmp        = fMcWA *rcp, modeC_warpFrequency  = fMcWF *rcp,
+                modeC_vScale         = fMcVS *rcp, modeC_twist          = fMcTw *rcp,
+                modeC_twistVary      = fMcTwV*rcp, modeC_twistFrequency = fMcTwF*rcp,
+                modeC_ampVary        = fMcAV *rcp, modeC_ampFrequency   = fMcAF *rcp,
+                blur_passes          = fBlur *rcp, perona_k             = fPK   *rcp,
+                perona_lambda        = fPL   *rcp, floorDepth           = fFlD  *rcp,
             };
-            if (p0.modeA_strength <= 0f) r.modeA_strength = 0f;
-            if (p0.modeB_strength <= 0f) r.modeB_strength = 0f;
-            if (p0.modeC_strength <= 0f) r.modeC_strength = 0f;
-            return r;
         }
 
         // ── Location cache ────────────────────────────────────────────────────────
@@ -862,20 +861,6 @@ namespace VoxCaves
 
             var centerBiome = wg?.GetBiome(zoneX, zoneZ) ?? Heightmap.Biome.None;
 
-            bool allModesOff = centerProf.modeA_strength <= 0f && centerProf.modeB_strength <= 0f && centerProf.modeC_strength <= 0f;
-            if (allModesOff)
-            {
-                if (!_forceRecarve && !_sdfCache.ContainsKey(zoneKey))
-                {
-                    // Never carved — VoxelField is Voxheim's vanilla, nothing to do.
-                    Log.LogInfo($"[VoxCaves] zone ({ox},{oz}) skip=all-off biome={centerBiome}");
-                    return;
-                }
-                // Previously carved but modes now disabled — fall through so Phase 1+3
-                // write baseSDF (worldY-h) everywhere, restoring vanilla terrain.
-                Log.LogInfo($"[VoxCaves] zone ({ox},{oz}) restore=vanilla biome={centerBiome}");
-            }
-
             Log.LogInfo($"[VoxCaves] zone ({ox},{oz}) biome={centerBiome} mB={centerProf.modeB_strength:F2} mA={centerProf.modeA_strength:F2} mC={centerProf.modeC_strength:F2}");
 
             const int overlap = 4;
@@ -896,13 +881,27 @@ namespace VoxCaves
             // writes the full solid column and the mesher gets a real gradient at the surface.
             // Without this, voxels above extHi stay as vanilla air (+127), causing a hard
             // -127→+127 cliff at the cutoff that forces the surface to snap to extHi + 0.5.
+            // Use the zone-wide max Mode C params for buffer headroom — the centre
+            // may be vanilla while corners have active Mode C from biome blending.
             int hiMargin = 24;
-            if (centerProf.modeC_strength > 0f)
             {
                 float maxAmp  = centerProf.modeC_noiseAmp * Mathf.Max(1f, 1f + centerProf.modeC_ampVary);
                 float maxExtM = Mathf.Max(0f, 1f - centerProf.modeC_threshold) * maxAmp
-                              + centerProf.modeC_warpAmp; // warp shifts addH up by at most warpAmp
-                hiMargin = Mathf.Max(24, (int)Mathf.Ceil(maxExtM / s) + 8);
+                              + centerProf.modeC_warpAmp;
+                // Also sample corners in case centre is vanilla but corners are active.
+                void CheckCorner(float cx, float cz) {
+                    if (wg == null) return;
+                    var cp = BlendProfile(cx, cz, wg);
+                    if (cp.modeC_strength <= 0f) return;
+                    float a = cp.modeC_noiseAmp * Mathf.Max(1f, 1f + cp.modeC_ampVary);
+                    float e = Mathf.Max(0f, 1f - cp.modeC_threshold) * a + cp.modeC_warpAmp;
+                    if (e > maxExtM) maxExtM = e;
+                }
+                float zh = width * 0.5f * s;
+                CheckCorner(zoneX - zh, zoneZ - zh); CheckCorner(zoneX + zh, zoneZ - zh);
+                CheckCorner(zoneX - zh, zoneZ + zh); CheckCorner(zoneX + zh, zoneZ + zh);
+                if (maxExtM > 0f)
+                    hiMargin = Mathf.Max(24, (int)Mathf.Ceil(maxExtM / s) + 8);
             }
 
             int extLo   = yLo - 24, extHi = yHi + hiMargin;
@@ -924,8 +923,11 @@ namespace VoxCaves
             // Layout: _noiseBuf[cx4 * (cw4*bh) + cz4 * bh + cy] — cy-major per (cx4,cz4)
             // so the Y inner loop reads four sequential streams, prefetcher-friendly.
             int   cw4     = (bw + 3) / 4;
-            bool  bakeC   = centerProf.modeC_strength > 0f && wg != null;
-            bool  bakeA   = centerProf.modeA_strength > 0f && wg != null;
+            // Bake flags must reflect any column in the zone, not just the centre.
+            // A transition zone with a vanilla centre may still have active columns.
+            // We determine these after the Phase 0 loop below; pre-set false here.
+            bool  bakeC   = false;
+            bool  bakeA   = false;
             int   nb4Size = cw4 * cw4 * bh;
             int   nb2Size = cw4 * cw4;
             if (_noiseBuf  == null || _noiseBuf.Length  < nb4Size) _noiseBuf  = new float[nb4Size];
@@ -990,6 +992,8 @@ namespace VoxCaves
                 _bk2dMawv![idx2] = p4.modeA_widthVary;
                 _bk2dMawvf![idx2]= p4.modeA_widthFrequency;
                 if (p4.modeB_strength > 0f) anyMbActive = true;
+                if (p4.modeC_strength > 0f) bakeC = true;
+                if (p4.modeA_strength > 0f) bakeA = true;
 
 
                 // Mode C anchor quantities — only needed when modeC is active.
@@ -1088,51 +1092,6 @@ namespace VoxCaves
             FillPhase1(buf, bw, bh, extLo, s, ox, oz, overlap, bakeC, bakeA, wg, cw4, nearbyLocs);
             long _t1 = _sw.ElapsedMilliseconds;
 
-            // ── Phase 1.5: Floating-island removal ───────────────────────────────────
-            // BFS from all solid voxels at cy=0 (always below terrain). Any solid
-            // voxel not reachable is a floating island; set it to air before blur so
-            // the blur pass feathers the newly-exposed edges.
-            if (!allModesOff)
-            {
-                int islandBufSize = bw * bh * bw;
-                int stride_x      = bh * bw;
-                if (_visitedBuf  == null || _visitedBuf.Length  < islandBufSize) _visitedBuf  = new bool[islandBufSize];
-                if (_islandQueue == null || _islandQueue.Length < islandBufSize) _islandQueue = new int[islandBufSize];
-                Array.Clear(_visitedBuf, 0, islandBufSize);
-
-                int qHead = 0, qTail = 0;
-
-                for (int cx = 0; cx < bw; cx++)
-                for (int cz = 0; cz < bw; cz++)
-                {
-                    int idx = cx * stride_x + cz; // cy=0: (cx*bh+0)*bw+cz
-                    if (buf[idx] < 0f && !_visitedBuf[idx])
-                    { _visitedBuf[idx] = true; _islandQueue[qTail++] = idx; }
-                }
-
-                while (qHead < qTail)
-                {
-                    int idx = _islandQueue[qHead++];
-                    int cx  = idx / stride_x;
-                    int rem = idx % stride_x;
-                    int cy  = rem / bw;
-                    int cz  = rem % bw;
-                    int ni;
-                    if (cx > 0)    { ni = idx - stride_x; if (!_visitedBuf[ni] && buf[ni] < 0f) { _visitedBuf[ni] = true; _islandQueue[qTail++] = ni; } }
-                    if (cx < bw-1) { ni = idx + stride_x; if (!_visitedBuf[ni] && buf[ni] < 0f) { _visitedBuf[ni] = true; _islandQueue[qTail++] = ni; } }
-                    if (cy > 0)    { ni = idx - bw;        if (!_visitedBuf[ni] && buf[ni] < 0f) { _visitedBuf[ni] = true; _islandQueue[qTail++] = ni; } }
-                    if (cy < bh-1) { ni = idx + bw;        if (!_visitedBuf[ni] && buf[ni] < 0f) { _visitedBuf[ni] = true; _islandQueue[qTail++] = ni; } }
-                    if (cz > 0)    { ni = idx - 1;         if (!_visitedBuf[ni] && buf[ni] < 0f) { _visitedBuf[ni] = true; _islandQueue[qTail++] = ni; } }
-                    if (cz < bw-1) { ni = idx + 1;         if (!_visitedBuf[ni] && buf[ni] < 0f) { _visitedBuf[ni] = true; _islandQueue[qTail++] = ni; } }
-                }
-
-                int removed = 0;
-                for (int i = 0; i < islandBufSize; i++)
-                    if (!_visitedBuf[i] && buf[i] < 0f) { buf[i] = s; removed++; }
-
-                if (removed > 0)
-                    Log.LogDebug($"[VoxCaves] island-fill removed {removed} voxels in zone ({ox},{oz})");
-            }
             long _t1b = _sw.ElapsedMilliseconds;
 
             // ── Phase 2: Blur / smooth the SDF buffer ────────────────────────────────
@@ -1218,6 +1177,50 @@ namespace VoxCaves
 
             long _t2 = _sw.ElapsedMilliseconds;
 
+            // ── Phase 2.5: Floating-island removal (after blur) ───────────────────────
+            // Runs after blur so that blur can't sever thin solid necks and leave
+            // bulbs disconnected. BFS from cy=0 (always solid ground); any solid voxel
+            // unreachable from the bottom is a post-blur floating island.
+            {
+                int islandBufSize = bw * bh * bw;
+                int stride_x      = bh * bw;
+                if (_visitedBuf  == null || _visitedBuf.Length  < islandBufSize) _visitedBuf  = new bool[islandBufSize];
+                if (_islandQueue == null || _islandQueue.Length < islandBufSize) _islandQueue = new int[islandBufSize];
+                Array.Clear(_visitedBuf, 0, islandBufSize);
+
+                int qHead = 0, qTail = 0;
+
+                for (int cx = 0; cx < bw; cx++)
+                for (int cz = 0; cz < bw; cz++)
+                {
+                    int idx = cx * stride_x + cz; // cy=0: (cx*bh+0)*bw+cz
+                    if (buf[idx] < 0f && !_visitedBuf[idx])
+                    { _visitedBuf[idx] = true; _islandQueue[qTail++] = idx; }
+                }
+
+                while (qHead < qTail)
+                {
+                    int idx = _islandQueue[qHead++];
+                    int cx  = idx / stride_x;
+                    int rem = idx % stride_x;
+                    int cy  = rem / bw;
+                    int cz  = rem % bw;
+                    int ni;
+                    if (cx > 0)    { ni = idx - stride_x; if (!_visitedBuf[ni] && buf[ni] < 0f) { _visitedBuf[ni] = true; _islandQueue[qTail++] = ni; } }
+                    if (cx < bw-1) { ni = idx + stride_x; if (!_visitedBuf[ni] && buf[ni] < 0f) { _visitedBuf[ni] = true; _islandQueue[qTail++] = ni; } }
+                    if (cy > 0)    { ni = idx - bw;        if (!_visitedBuf[ni] && buf[ni] < 0f) { _visitedBuf[ni] = true; _islandQueue[qTail++] = ni; } }
+                    if (cy < bh-1) { ni = idx + bw;        if (!_visitedBuf[ni] && buf[ni] < 0f) { _visitedBuf[ni] = true; _islandQueue[qTail++] = ni; } }
+                    if (cz > 0)    { ni = idx - 1;         if (!_visitedBuf[ni] && buf[ni] < 0f) { _visitedBuf[ni] = true; _islandQueue[qTail++] = ni; } }
+                    if (cz < bw-1) { ni = idx + 1;         if (!_visitedBuf[ni] && buf[ni] < 0f) { _visitedBuf[ni] = true; _islandQueue[qTail++] = ni; } }
+                }
+
+                int removed = 0;
+                for (int i = 0; i < islandBufSize; i++)
+                    if (!_visitedBuf[i] && buf[i] < 0f) { buf[i] = s; removed++; }
+
+                Log.LogInfo($"[VoxCaves] island-fill zone ({ox},{oz}): seeds={qTail} removed={removed}");
+            }
+
             // ── Phase 3: Write SDF directly to VoxelField via the 'field' parameter ────
             // Writing to the same object VoxelizeColumns used (not _voxelZoneFieldField)
             // ensures RebuildBrick reads the correct SDF regardless of Voxheim's internal
@@ -1283,7 +1286,7 @@ namespace VoxCaves
             if (_disableVegetation) _pendingVegCleanup = true;
 
             long _t3 = _sw.ElapsedMilliseconds;
-            if (allModesOff) _sdfCache.Remove(zoneKey);
+
             Log.LogInfo($"[VoxCaves] zone ({ox},{oz}) bakeC={bakeC} bw={bw} bh={bh} Ph0={_t0}ms Ph1={_t1-_t0}ms Ph1b={_t1b-_t1}ms Ph2={_t2-_t1b}ms Ph3={_t3-_t2}ms total={_t3}ms carved={carved}");
         }
 
@@ -1292,7 +1295,6 @@ namespace VoxCaves
         {
             Log.LogInfo($"[VoxCaves] Hot-reload: re-voxelizing {_zoneParams.Count} zone(s).");
             _sdfCache.Clear();
-            _forceRecarve = true;
             if (_voxelizeColumnsMethod == null) return;
             bool canRemesh = _enqueueMeshMethod != null && _finishSkinNowMethod != null && _int3Ctor != null;
             if (!canRemesh)
@@ -1334,7 +1336,6 @@ namespace VoxCaves
                 }
                 catch (Exception e) { Log.LogWarning($"[VoxCaves] Revoxelize {key}: {e.Message}"); }
             }
-            _forceRecarve = false;
 
             // ── Between passes: extend _yScanHi for zones where Mode C raised terrain ──
             // CompletePatch only runs on fresh zone load, so hot-reload must do this itself.
