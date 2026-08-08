@@ -4,6 +4,7 @@ using HarmonyLib;
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Reflection;
 using System.Reflection.Emit;
 using UnityEngine;
@@ -102,8 +103,6 @@ namespace VoxCaves
         internal static readonly Dictionary<string, (object field, object grid, int ox, int oz, int w, int yLo, int yHi)>
             _zoneParams = new();
         internal static readonly Dictionary<string, object> _zoneObjects = new();
-        internal static MethodInfo? _completeMethod;
-        internal static MethodInfo? _afterFieldEditMethod;
         internal static MethodInfo? _enqueueMeshMethod;
         internal static MethodInfo? _finishSkinNowMethod;
         internal static MethodInfo? _pokeNeighborsMethod;
@@ -132,36 +131,29 @@ namespace VoxCaves
         internal static FieldInfo?       _yScanHiField;
         internal static FieldInfo?       _yScanLoField;
         internal static FieldInfo?       _voxelZoneFieldField;  // VoxelZone._field → VoxelField
-        internal static FieldInfo?       _isActiveField;        // VoxelZone._isActive
-        internal static readonly Dictionary<string, int> _zoneMaxY = new();
 
-        // Boundary-brick seam repair queue: bricks from complete neighbor zones that
-        // were built with FallbackDensity (before this zone existed) and need remesh.
-        internal static MethodInfo? _rebuildBrickMethod;
-        internal static readonly Queue<(object zone, object coord)> _seamRepairQueue = new();
+        // VoxelBounds fields — used to construct the changed-bounds arg for PokeNeighbors
+        internal static Type?       _voxelBoundsType;
+        internal static FieldInfo?  _vbMinField;
+        internal static FieldInfo?  _vbMaxField;
+        internal static FieldInfo?  _vbAnyField;
+        internal static readonly Dictionary<string, int> _zoneMaxY  = new();
+        internal static readonly Dictionary<string, int> _zoneExtHi = new(); // highest voxel Y ever written; used to size the reset range in hot-reload
 
-        // Set by ActivatePatch.Postfix; consumed by SkinPatch.Postfix one call later.
-        // Safe because zone activations are sequential on Unity's main thread.
-        internal static object? _lastActivatedZone;
+        // Per-zone SDF cache: filled by Phase 3, queried by FallbackDensityPatch.
+        // Layout: data[(ci * bh + cy) * width + ri]  (ci=zoneX, ri=zoneZ, cy=Y-extLo)
+        internal static readonly Dictionary<string, (int extLo, int bh, int width, sbyte[] data)> _sdfCache = new();
 
-        // Phases 0/1/2 float buf cached after Carve(), written lazily to VoxelField
-        // in RebuildBrickPatch.Prefix (first brick rebuild for each zone).
-        internal sealed class ZoneSdfCache
-        {
-            public readonly float[] Buf;
-            public readonly int Bw, Bh, ExtLo, Ox, Oz, Width;
-            public readonly float S;
-            public ZoneSdfCache(float[] buf, int bw, int bh, int extLo, int ox, int oz, int width, float s)
-            { Buf = buf; Bw = bw; Bh = bh; ExtLo = extLo; Ox = ox; Oz = oz; Width = width; S = s; }
-        }
-        internal static readonly Dictionary<string, ZoneSdfCache> _zoneSdfs    = new();
-        internal static readonly HashSet<string>                  _sdfsApplied = new();
+        // Int3 field accessors — used by FallbackDensityPatch to extract X/Y/Z from boxed struct.
+        internal static FieldInfo? _int3FieldX, _int3FieldY, _int3FieldZ;
 
         // Reused across Carve() calls to avoid per-zone GC pressure.
         internal static float[]? _bufA;
         internal static float[]? _bufB;
 
         internal static float[]? _noiseBuf;  // coarse Mode C bake: [cx4*(cw4*bh) + cz4*bh + cy]
+        internal static float[]? _tunBuf;   // coarse Mode A: tunnel noise (after warp)
+        internal static float[]? _tunWBuf;  // coarse Mode A: width modulation noise
         // 2D coarse bake (same XZ grid as _noiseBuf): [cx4*cw4 + cz4]
         internal static float[]? _bk2dAddH;  // Mode C anchor height
         internal static float[]? _bk2dLAmp;  // Mode C local amplitude
@@ -214,32 +206,8 @@ namespace VoxCaves
 
         static int _pollFrame;
         static int _vegCleanupDelay;
-        static long _repairTimestamp;
         void Update()
         {
-            // Drain boundary-brick seam repair queue within a 3 ms budget per frame.
-            // These are bricks from already-complete neighbor zones that were originally
-            // meshed with FallbackDensity (before the new zone existed) and need a remesh
-            // now that the new zone's _field is populated and it is in s_zones.
-            if (_seamRepairQueue.Count > 0 && _rebuildBrickMethod != null)
-            {
-                _repairTimestamp = System.Diagnostics.Stopwatch.GetTimestamp();
-                const double BudgetMs = 3.0;
-                while (_seamRepairQueue.Count > 0)
-                {
-                    var (zone, coord) = _seamRepairQueue.Dequeue();
-                    try
-                    {
-                        if ((zone as UnityEngine.Object) != null)
-                            _rebuildBrickMethod.Invoke(zone, new object[] { coord });
-                    }
-                    catch { /* zone destroyed mid-flight */ }
-                    double ms = (System.Diagnostics.Stopwatch.GetTimestamp() - _repairTimestamp)
-                                * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
-                    if (ms >= BudgetMs) break;
-                }
-            }
-
             if (_pendingVegCleanup && ZNetScene.instance != null && ZoneSystem.instance != null)
             {
                 // Wait ~3 s after conditions are met so voxel meshes are built before the physics check
@@ -347,20 +315,27 @@ namespace VoxCaves
                 BindingFlags.NonPublic | BindingFlags.Static);
             if (_scaleField == null) Log.LogWarning("[VoxCaves] s_scale not found, will assume 1.");
 
-            _afterFieldEditMethod = zoneT?.GetMethod("AfterFieldEdit",
-                BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-
             _enqueueMeshMethod   = zoneT?.GetMethod("EnqueueMesh",
                 BindingFlags.NonPublic | BindingFlags.Instance);
             _finishSkinNowMethod = zoneT?.GetMethod("FinishSkinNow",
                 BindingFlags.NonPublic | BindingFlags.Instance);
-            _pokeNeighborsMethod = zoneT?.GetMethod("PokeTransitionNeighbors",
-                BindingFlags.NonPublic | BindingFlags.Public | BindingFlags.Instance)
-                ?? zoneT?.GetMethod("PokeNeighbors",
-                BindingFlags.NonPublic | BindingFlags.Public | BindingFlags.Instance);
+            // PokeNeighbors(in VoxelBounds, bool) — tells adjacent active zones to remesh boundary bricks.
+            // PokeTransitionNeighbors only iterates _editedBricks (player edits), so we call PokeNeighbors directly.
+            _pokeNeighborsMethod = zoneT?.GetMethods(BindingFlags.NonPublic | BindingFlags.Instance)
+                .FirstOrDefault(m => m.Name == "PokeNeighbors" && m.GetParameters().Length == 2
+                                     && m.GetParameters()[1].ParameterType == typeof(bool));
             if (_enqueueMeshMethod   == null) Log.LogWarning("[VoxCaves] EnqueueMesh not found.");
             if (_finishSkinNowMethod == null) Log.LogWarning("[VoxCaves] FinishSkinNow not found.");
-            if (_pokeNeighborsMethod == null) Log.LogWarning("[VoxCaves] PokeTransitionNeighbors/PokeNeighbors not found — seam fix on hot-reload disabled.");
+            if (_pokeNeighborsMethod == null) Log.LogWarning("[VoxCaves] PokeNeighbors not found — neighbor seam repair disabled.");
+
+            var boundsT = AppDomain.CurrentDomain.GetAssemblies()
+                .SelectMany(a => { try { return a.GetTypes(); } catch { return Array.Empty<Type>(); } })
+                .FirstOrDefault(t => t.FullName == "Voxheim.Core.VoxelBounds");
+            _voxelBoundsType = boundsT;
+            _vbMinField = boundsT?.GetField("Min", BindingFlags.Public | BindingFlags.Instance);
+            _vbMaxField = boundsT?.GetField("Max", BindingFlags.Public | BindingFlags.Instance);
+            _vbAnyField = boundsT?.GetField("Any", BindingFlags.Public | BindingFlags.Instance);
+            if (_voxelBoundsType == null) Log.LogWarning("[VoxCaves] VoxelBounds type not found — neighbor seam repair disabled.");
 
             _zoneOriginX         = zoneT?.GetField("_originX",
                 BindingFlags.NonPublic | BindingFlags.Instance);
@@ -368,17 +343,9 @@ namespace VoxCaves
                 BindingFlags.NonPublic | BindingFlags.Instance);
             _voxelZoneFieldField = zoneT?.GetField("_field",
                 BindingFlags.NonPublic | BindingFlags.Instance);
-            _isActiveField       = zoneT?.GetField("_isActive",
-                BindingFlags.NonPublic | BindingFlags.Instance);
             _yScanHiField        = zoneT?.GetField("_yScanHi",
                 BindingFlags.NonPublic | BindingFlags.Instance);
             _yScanLoField        = zoneT?.GetField("_yScanLo",
-                BindingFlags.NonPublic | BindingFlags.Instance);
-            _rebuildBrickMethod  = zoneT?.GetMethod("RebuildBrick",
-                BindingFlags.NonPublic | BindingFlags.Instance);
-            if (_rebuildBrickMethod == null)
-                Log.LogWarning("[VoxCaves] RebuildBrick not found — seam repair disabled.");
-            _completeMethod      = zoneT?.GetMethod("Complete",
                 BindingFlags.NonPublic | BindingFlags.Instance);
             if (_zoneOriginX == null || _zoneOriginZ == null)
                 Log.LogWarning("[VoxCaves] Zone origin fields missing — per-brick SDF disabled.");
@@ -394,6 +361,15 @@ namespace VoxCaves
                     BindingFlags.Public    | BindingFlags.Instance);
             if (_locationInstancesField == null)
                 Log.LogWarning("[VoxCaves] m_locationInstances not found — location protection off.");
+
+            _int3FieldX = int3T.GetField("X", BindingFlags.Public | BindingFlags.Instance)
+                          ?? int3T.GetField("x", BindingFlags.Public | BindingFlags.Instance);
+            _int3FieldY = int3T.GetField("Y", BindingFlags.Public | BindingFlags.Instance)
+                          ?? int3T.GetField("y", BindingFlags.Public | BindingFlags.Instance);
+            _int3FieldZ = int3T.GetField("Z", BindingFlags.Public | BindingFlags.Instance)
+                          ?? int3T.GetField("z", BindingFlags.Public | BindingFlags.Instance);
+            if (_int3FieldX == null || _int3FieldY == null || _int3FieldZ == null)
+                Log.LogWarning("[VoxCaves] Int3 X/Y/Z fields not found — FallbackDensity patch will use vanilla.");
 
             var gDm = new DynamicMethod("VC_Get", typeof(sbyte),
                 new[] { typeof(object), typeof(int), typeof(int), typeof(int) },
@@ -424,30 +400,6 @@ namespace VoxCaves
         }
 
         // ── Biome profile defaults ────────────────────────────────────────────────
-        static CaveProfile P(
-            float s, float r, float wa, float wf, float da, float df,
-            float ts = 0f, float tw = 0.18f, float tf = 0.015f,
-            float twa = 10f, float twf = 0.04f, float tvs = 0.35f,
-            float twv = 0f, float twvf = 0.003f,
-            float addS = 0f,  float addTh = 0f,     float addNa = 10f,    float addF  = 0.015f,
-            float addWa = 8f, float addWf = 0.005f, float addVs = 0.4f,
-            float addTw = 0f, float addTv = 0f,  float addTvf = 0.003f,
-            float addAv = 0f, float addAf = 0.003f,
-            float fd = 8f, float bl = 1f, float bls = 15f) =>
-            new CaveProfile
-            {
-                modeB_strength = s, modeB_radius = r, modeB_warpAmp = wa, modeB_warpFrequency = wf,
-                modeB_ditherAmp = da, modeB_ditherFrequency = df,
-                modeA_strength = ts, modeA_width = tw, modeA_frequency = tf,
-                modeA_warpAmp = twa, modeA_warpFrequency = twf, modeA_vScale = tvs,
-                modeA_widthVary = twv, modeA_widthFrequency = twvf,
-                modeC_strength = addS, modeC_threshold = addTh, modeC_noiseAmp = addNa, modeC_frequency = addF,
-                modeC_warpAmp = addWa, modeC_warpFrequency = addWf, modeC_vScale = addVs,
-                modeC_twist = addTw, modeC_twistVary = addTv, modeC_twistFrequency = addTvf,
-                modeC_ampVary = addAv, modeC_ampFrequency = addAf,
-                floorDepth = fd, modeB_layers = bl, modeB_layerSpacing = bls,
-            };
-
         static Dictionary<Heightmap.Biome, CaveProfile> BuildDefaultProfiles() =>
             new Dictionary<Heightmap.Biome, CaveProfile>
             {
@@ -468,8 +420,6 @@ namespace VoxCaves
             Path.Combine(BepInEx.Paths.ConfigPath, "voxcaves_biomes.cfg");
 
         // Apply a flat key→value list on top of a base CaveProfile (struct copy).
-        // Unrecognised or non-numeric values are silently skipped so callers can
-        // pass raw section lines without pre-filtering (e.g. "profile = name").
         static CaveProfile ApplyProfile(
             IEnumerable<(string key, string val)> kvs, CaveProfile p)
         {
@@ -583,6 +533,12 @@ namespace VoxCaves
             _namedProfiles = named;
             _biomeProfiles = profiles;
             Log.LogInfo($"[VoxCaves] Profiles reloaded: {named.Count} named, {profiles.Count} biomes.");
+            foreach (var kv in profiles)
+            {
+                var p = kv.Value;
+                if (p.modeA_strength > 0f || p.modeB_strength > 0f || p.modeC_strength > 0f)
+                    Log.LogInfo($"[VoxCaves]   {kv.Key}: mB={p.modeB_strength:F2} mA={p.modeA_strength:F2} mC={p.modeC_strength:F2}");
+            }
         }
 
         static void WriteDefaultBiomeConfig(string path)
@@ -726,26 +682,6 @@ namespace VoxCaves
             return (prof.modeA_width - absN) / prof.modeA_width * prof.modeA_strength;
         }
 
-        // ── Mode C density sample (used for blend previews / future gizmos) ─────
-        static float AddDensity(float worldX, float worldY, float worldZ,
-                                WorldGenerator? wg, in CaveProfile prof)
-        {
-            if (prof.modeC_strength <= 0f || wg == null) return 0f;
-            float wf  = prof.modeB_warpFrequency;
-            float wx  = _hmAddWarpX!.GetNoise(worldX * wf, worldZ * wf) * prof.modeC_warpAmp;
-            float wz  = _hmAddWarpZ!.GetNoise(worldX * wf, worldZ * wf) * prof.modeC_warpAmp;
-            float addH = wg.GetHeight(worldX + wx, worldZ + wz);
-            float relY = worldY - addH;
-            float sy   = relY * prof.modeC_vScale;
-            float angle = worldY * prof.modeC_twist;
-            float cos = Mathf.Cos(angle), sin = Mathf.Sin(angle);
-            float tx = worldX * cos - worldZ * sin, tz = worldX * sin + worldZ * cos;
-            float n  = _addNoise!.GetNoise(tx * prof.modeC_frequency, sy * prof.modeC_frequency,
-                                           tz * prof.modeC_frequency);
-            float sdf = relY - (n - prof.modeC_threshold) * prof.modeC_noiseAmp;
-            return sdf < 0f ? -sdf * prof.modeC_strength : 0f;
-        }
-
         // ── Biome profile blending ────────────────────────────────────────────────
         static CaveProfile BlendProfile(float worldX, float worldZ, WorldGenerator wg)
         {
@@ -871,15 +807,26 @@ namespace VoxCaves
             _zoneParams[zoneKey] = (field, grid, ox, oz, width, yLo, yHi);
 
             // If location data isn't ready yet, leave the zone vanilla.
-            if (!_locationsCached) return;
+            if (!_locationsCached)
+            {
+                Log.LogInfo($"[VoxCaves] zone ({ox},{oz}) skip=no-locations");
+                return;
+            }
 
             // Sample centre profile once for structural params (blur, Mode C margin).
             var centerProf = wg != null ? BlendProfile(zoneX, zoneZ, wg) : CaveProfile.Default;
             int blurPasses = (int)centerProf.blur_passes;
 
+            var centerBiome = wg?.GetBiome(zoneX, zoneZ) ?? Heightmap.Biome.None;
+
             // All modes off: leave Voxheim's VoxelField untouched — vanilla terrain is already correct.
             if (centerProf.modeA_strength <= 0f && centerProf.modeB_strength <= 0f && centerProf.modeC_strength <= 0f)
+            {
+                Log.LogInfo($"[VoxCaves] zone ({ox},{oz}) skip=all-off biome={centerBiome}");
                 return;
+            }
+
+            Log.LogInfo($"[VoxCaves] zone ({ox},{oz}) biome={centerBiome} mB={centerProf.modeB_strength:F2} mA={centerProf.modeA_strength:F2} mC={centerProf.modeC_strength:F2}");
 
             const int overlap = 4;
 
@@ -928,9 +875,12 @@ namespace VoxCaves
             // so the Y inner loop reads four sequential streams, prefetcher-friendly.
             int   cw4     = (bw + 3) / 4;
             bool  bakeC   = centerProf.modeC_strength > 0f && wg != null;
+            bool  bakeA   = centerProf.modeA_strength > 0f && wg != null;
             int   nb4Size = cw4 * cw4 * bh;
             int   nb2Size = cw4 * cw4;
             if (_noiseBuf  == null || _noiseBuf.Length  < nb4Size) _noiseBuf  = new float[nb4Size];
+            if (_tunBuf    == null || _tunBuf.Length    < nb4Size) _tunBuf    = new float[nb4Size];
+            if (_tunWBuf   == null || _tunWBuf.Length   < nb4Size) _tunWBuf   = new float[nb4Size];
             if (_bk2dAddH  == null || _bk2dAddH.Length  < nb2Size) _bk2dAddH  = new float[nb2Size];
             if (_bk2dLAmp  == null || _bk2dLAmp.Length  < nb2Size) _bk2dLAmp  = new float[nb2Size];
             if (_bk2dMcS   == null || _bk2dMcS.Length   < nb2Size) _bk2dMcS   = new float[nb2Size];
@@ -1021,6 +971,32 @@ namespace VoxCaves
                     _bk2dAddH![idx2] = 0f;
                     _bk2dLAmp![idx2] = 0f;
                 }
+
+                // Mode A 3D noise bake — same 1/4 XZ layout as Mode C.
+                // Bakes warped tunnel noise + width noise per (coarse XZ, full Y).
+                // Phase 1 bilinear-interpolates instead of computing 4× 3D noise per voxel.
+                if (bakeA && p4.modeA_strength > 0f)
+                {
+                    float mawf4  = _bk2dMawf! [idx2];
+                    float mawa4  = _bk2dMawa! [idx2];
+                    float maf4   = _bk2dMaf!  [idx2];
+                    float mavs4  = _bk2dMavs! [idx2];
+                    float mawvf4 = _bk2dMawvf![idx2];
+                    int baseIdxA = cx4 * cw4 * bh + cz4 * bh;
+                    for (int cy = 0; cy < bh; cy++)
+                    {
+                        float sy4  = (extLo + cy) * s * mavs4;
+                        float awx4 = _warpX!.GetNoise(wx4 * mawf4, sy4 * mawf4, wz4 * mawf4) * mawa4;
+                        float awz4 = _warpZ!.GetNoise(wx4 * mawf4, sy4 * mawf4, wz4 * mawf4) * mawa4;
+                        _tunBuf! [baseIdxA + cy] = _caveNoise!.GetNoise((wx4 + awx4) * maf4, sy4 * maf4, (wz4 + awz4) * maf4);
+                        _tunWBuf![baseIdxA + cy] = _widthNoise!.GetNoise(wx4 * mawvf4, sy4 * mawvf4, wz4 * mawvf4);
+                    }
+                }
+                else if (bakeA)
+                {
+                    int baseIdxA = cx4 * cw4 * bh + cz4 * bh;
+                    for (int cy = 0; cy < bh; cy++) { _tunBuf![baseIdxA + cy] = 0f; _tunWBuf![baseIdxA + cy] = 0f; }
+                }
             }
             // Full-res Mode B warpedH bake — eliminates wg.GetHeight from Phase 1.
             // Skipped entirely when Mode B is inactive, so no overhead in the common case.
@@ -1052,7 +1028,7 @@ namespace VoxCaves
             long _t0 = _sw.ElapsedMilliseconds;
 
             // ── Phase 1 ───────────────────────────────────────────────────────────
-            FillPhase1(buf, bw, bh, extLo, s, ox, oz, overlap, bakeC, wg, cw4, nearbyLocs);
+            FillPhase1(buf, bw, bh, extLo, s, ox, oz, overlap, bakeC, bakeA, wg, cw4, nearbyLocs);
             long _t1 = _sw.ElapsedMilliseconds;
 
             // ── Phase 2: Separable 3D Gaussian blur [0.25, 0.5, 0.25] ──────────────
@@ -1110,6 +1086,7 @@ namespace VoxCaves
             int maxYC  = yHi;
             var transBytes  = new sbyte[bh];
             var transHasOvr = new bool[bh];
+            var cacheData   = new sbyte[width * bh * width]; // (ci*bh + cy)*width + ri
 
             for (int ci = 0; ci < width; ci++)
             for (int ri = 0; ri < width; ri++)
@@ -1144,6 +1121,7 @@ namespace VoxCaves
                     int   cy       = gy - extLo;
                     float finalSDF = buf[(cx * bh + cy) * bw + cz];
                     sbyte newByte  = transHasOvr[cy] ? transBytes[cy] : ToSDFByte(finalSDF, s);
+                    cacheData[(ci * bh + cy) * width + ri] = newByte;
                     sbyte curByte  = _get!(field, gx, gy, gz);
                     if (newByte == curByte) continue;
                     _set!(field, gx, gy, gz, newByte);
@@ -1151,11 +1129,15 @@ namespace VoxCaves
                     carved++;
                 }
             }
+            _sdfCache[zoneKey] = (extLo, bh, width, cacheData);
 
             if (maxYC > yHi)
             {
                 if (!_zoneMaxY.TryGetValue(zoneKey, out int prevMaxY) || maxYC > prevMaxY)
                     _zoneMaxY[zoneKey] = maxYC;
+                int hiMark = maxYC + 8;
+                if (!_zoneExtHi.TryGetValue(zoneKey, out int prevHiMark) || hiMark > prevHiMark)
+                    _zoneExtHi[zoneKey] = hiMark;
             }
 
             if (_disableVegetation) _pendingVegCleanup = true;
@@ -1168,24 +1150,28 @@ namespace VoxCaves
         static void RecarveAll()
         {
             Log.LogInfo($"[VoxCaves] Hot-reload: re-voxelizing {_zoneParams.Count} zone(s).");
+            _sdfCache.Clear();
             if (_voxelizeColumnsMethod == null) return;
-            bool canRemesh = _enqueueMeshMethod != null && _finishSkinNowMethod != null
-                             && _int3Ctor != null;
+            bool canRemesh = _enqueueMeshMethod != null && _finishSkinNowMethod != null && _int3Ctor != null;
             if (!canRemesh)
                 Log.LogWarning("[VoxCaves] EnqueueMesh/FinishSkinNow unavailable — mesh rebuild skipped.");
 
             var snapshot = new List<(string key, (object field, object grid, int ox, int oz, int w, int yLo, int yHi) zp)>(_zoneParams.Count);
             foreach (var kv in _zoneParams) snapshot.Add((kv.Key, kv.Value));
 
+            // ── Pass 1: update all VoxelFields before touching any meshes ─────────
+            // Processing all fields first means cross-zone boundary bricks in Pass 2
+            // read current data from every neighbor, eliminating seam ordering issues.
             foreach (var (key, zp) in snapshot)
             {
-                // Reset range must cover the full Mode C extension (same formula as Carve()).
                 int extLo = zp.yLo - 24;
-                int hiMarginRc = 24;
+                // Start from previously stored high-water mark so turning Mode C off
+                // still resets the voxels it previously wrote above yHi.
+                int extHi = _zoneExtHi.TryGetValue(key, out int hiMark) ? hiMark : zp.yHi + 24;
                 {
                     float sRc = _scale is { } sv && sv > 0f ? sv : 1f;
                     var wgRc  = WorldGenerator.instance;
-                    if (wgRc != null && sRc > 0f)
+                    if (wgRc != null)
                     {
                         float cxRc = (zp.ox + zp.w * 0.5f) * sRc;
                         float czRc = (zp.oz + zp.w * 0.5f) * sRc;
@@ -1193,29 +1179,46 @@ namespace VoxCaves
                         if (cpRc.modeC_strength > 0f)
                         {
                             float maxAmpRc  = cpRc.modeC_noiseAmp * Mathf.Max(1f, 1f + cpRc.modeC_ampVary);
-                            float maxExtMRc = Mathf.Max(0f, 1f - cpRc.modeC_threshold) * maxAmpRc
-                                           + cpRc.modeC_warpAmp;
-                            hiMarginRc = Mathf.Max(24, (int)Mathf.Ceil(maxExtMRc / sRc) + 8);
+                            float maxExtMRc = Mathf.Max(0f, 1f - cpRc.modeC_threshold) * maxAmpRc + cpRc.modeC_warpAmp;
+                            int newHi = zp.yHi + Mathf.Max(24, (int)Mathf.Ceil(maxExtMRc / sRc) + 8);
+                            if (newHi > extHi) extHi = newHi;
                         }
                     }
                 }
-                int extHi = zp.yHi + hiMarginRc;
                 try
                 {
                     _voxelizeColumnsMethod.Invoke(null, new object[]
                         { zp.field, zp.grid, zp.ox, zp.oz, 0, zp.w - 1, 0, zp.w - 1, extLo, extHi });
                 }
-                catch (Exception e) { Log.LogWarning($"[VoxCaves] Revoxelize {key}: {e.Message}"); continue; }
+                catch (Exception e) { Log.LogWarning($"[VoxCaves] Revoxelize {key}: {e.Message}"); }
+            }
 
+            // ── Between passes: extend _yScanHi for zones where Mode C raised terrain ──
+            // CompletePatch only runs on fresh zone load, so hot-reload must do this itself.
+            if (_yScanHiField != null)
+            {
+                foreach (var (key, _) in snapshot)
+                {
+                    if (!_zoneMaxY.TryGetValue(key, out int maxY)) continue;
+                    _zoneMaxY.Remove(key);
+                    if (!_zoneObjects.TryGetValue(key, out var zo)) continue;
+                    if (zo is UnityEngine.Object u && !u) continue;
+                    int cur = (int)_yScanHiField.GetValue(zo)!;
+                    if (maxY > cur) _yScanHiField.SetValue(zo, maxY);
+                }
+            }
+
+            if (!canRemesh) return;
+
+            // ── Pass 2: rebuild meshes now that all VoxelFields are current ────────
+            foreach (var (key, zp) in snapshot)
+            {
                 if (!_zoneObjects.TryGetValue(key, out var zoneObj)) continue;
-                // Skip zones whose MonoBehaviour has been destroyed (fell out of active radius).
                 if (zoneObj is UnityEngine.Object uObj && !uObj) continue;
-                if (!canRemesh) continue;
 
-                // Allow first-brick Prefix to re-apply the freshly-cached SDF.
-                _sdfsApplied.Remove(key);
+                int extLo = zp.yLo - 24;
+                int extHi = _zoneExtHi.TryGetValue(key, out int hiMark2) ? hiMark2 : zp.yHi + 24;
 
-                // Enqueue the full extended brick range so all modified voxels get remeshed.
                 int bx0 = zp.ox >> 4, bx1 = (zp.ox + zp.w - 1) >> 4;
                 int bz0 = zp.oz >> 4, bz1 = (zp.oz + zp.w - 1) >> 4;
                 int by0 = extLo >> 4, by1 = extHi >> 4;
@@ -1236,67 +1239,6 @@ namespace VoxCaves
 
                 try { _finishSkinNowMethod!.Invoke(zoneObj, null); }
                 catch (Exception e) { Log.LogWarning($"[VoxCaves] FinishSkinNow {key}: {e.Message}"); }
-
-                // Tell neighboring zones to update their boundary meshes so seams clear too.
-                if (_pokeNeighborsMethod != null)
-                {
-                    try { _pokeNeighborsMethod.Invoke(zoneObj, new object[] { true, true }); }
-                    catch (Exception e) { Log.LogWarning($"[VoxCaves] PokeNeighbors {key}: {e.Message}"); }
-                }
-            }
-        }
-
-        // ── Apply cached SDF to VoxelField ───────────────────────────────────────
-        // Called once per zone on the first RebuildBrick Prefix. Writes the full zone
-        // SDF (with sub-voxel transBytes correction) to VoxelField before surface nets runs.
-        internal static void ApplyZoneSdf(ZoneSdfCache sdf, object field)
-        {
-            const int overlap = 4;
-            float[] buf  = sdf.Buf;
-            int bw = sdf.Bw, bh = sdf.Bh, extLo = sdf.ExtLo;
-            int ox = sdf.Ox, oz = sdf.Oz, width = sdf.Width;
-            float s = sdf.S;
-            int extHi = extLo + bh - 1;
-
-            var transBytes  = new sbyte[bh];
-            var transHasOvr = new bool[bh];
-
-            for (int ci = 0; ci < width; ci++)
-            for (int ri = 0; ri < width; ri++)
-            {
-                int cx = ci + overlap, cz = ri + overlap;
-                int gx = ox + ci,      gz = oz + ri;
-
-                Array.Clear(transHasOvr, 0, bh);
-                {
-                    float av = buf[(cx * bh + (bh - 1)) * bw + cz];
-                    for (int cy = bh - 2; cy >= 0; cy--)
-                    {
-                        float bv = buf[(cx * bh + cy) * bw + cz];
-                        bool topSurf = av > 0f && bv <= 0f;
-                        bool botSurf = av <= 0f && bv > 0f;
-                        if (topSurf || botSurf)
-                        {
-                            float d = av - bv;
-                            float t = Mathf.Clamp01(d != 0f ? (-bv) / d : 0.5f);
-                            sbyte lo, hi;
-                            if (topSurf) { lo = (sbyte)(int)Math.Round(-t * 127f);  hi = (sbyte)(int)Math.Round((1f - t) * 127f);  }
-                            else         { lo = (sbyte)(int)Math.Round(t * 127f);   hi = (sbyte)(int)Math.Round(-(1f - t) * 127f); }
-                            transBytes[cy]     = lo; transHasOvr[cy]     = true;
-                            transBytes[cy + 1] = hi; transHasOvr[cy + 1] = true;
-                        }
-                        av = bv;
-                    }
-                }
-
-                for (int gy = extLo; gy <= extHi; gy++)
-                {
-                    int   cy      = gy - extLo;
-                    float sdfVal  = buf[(cx * bh + cy) * bw + cz];
-                    sbyte newByte = transHasOvr[cy] ? transBytes[cy] : ToSDFByte(sdfVal, s);
-                    if (_get!(field, gx, gy, gz) == newByte) continue;
-                    _set!(field, gx, gy, gz, newByte);
-                }
             }
         }
 
@@ -1321,7 +1263,7 @@ namespace VoxCaves
             int layerCount, float[] hmC, float[] hmF,
             int bb00, int bb10, int bb01, int bb11, float bfx, float bfz,
             float mAwf, float mAwa, float mAf, float mAvs, float mAw, float mAwv, float mAwvf,
-            float worldX, float worldZ, bool bakeC)
+            float worldX, float worldZ, bool bakeC, bool bakeA)
         {
             float hmC0 = layerCount > 0 ? hmC[0] : 0f;
             float hmF0 = layerCount > 0 ? hmF[0] : 0f;
@@ -1367,12 +1309,25 @@ namespace VoxCaves
 
                 if (profMaS > 0f)
                 {
-                    float sy  = worldY * mAvs;
-                    float wx  = _warpX!.GetNoise(worldX * mAwf, sy * mAwf, worldZ * mAwf) * mAwa;
-                    float wz  = _warpZ!.GetNoise(worldX * mAwf, sy * mAwf, worldZ * mAwf) * mAwa;
-                    float n   = _caveNoise!.GetNoise((worldX + wx) * mAf, sy * mAf, (worldZ + wz) * mAf);
-                    float localWidth = Mathf.Max(mAw * (1f + mAwv
-                        * _widthNoise!.GetNoise(worldX * mAwvf, sy * mAwvf, worldZ * mAwvf)), 0.001f);
+                    float n, wn;
+                    if (bakeA)
+                    {
+                        float n0 = _tunBuf![bb00+cy] + (_tunBuf[bb10+cy] - _tunBuf[bb00+cy]) * bfx;
+                        float n1 = _tunBuf![bb01+cy] + (_tunBuf[bb11+cy] - _tunBuf[bb01+cy]) * bfx;
+                        n  = n0 + (n1 - n0) * bfz;
+                        float w0 = _tunWBuf![bb00+cy] + (_tunWBuf[bb10+cy] - _tunWBuf[bb00+cy]) * bfx;
+                        float w1 = _tunWBuf![bb01+cy] + (_tunWBuf[bb11+cy] - _tunWBuf[bb01+cy]) * bfx;
+                        wn = w0 + (w1 - w0) * bfz;
+                    }
+                    else
+                    {
+                        float sy = worldY * mAvs;
+                        float wx = _warpX!.GetNoise(worldX * mAwf, sy * mAwf, worldZ * mAwf) * mAwa;
+                        float wz = _warpZ!.GetNoise(worldX * mAwf, sy * mAwf, worldZ * mAwf) * mAwa;
+                        n  = _caveNoise!.GetNoise((worldX + wx) * mAf, sy * mAf, (worldZ + wz) * mAf);
+                        wn = _widthNoise!.GetNoise(worldX * mAwvf, (worldY * mAvs) * mAwvf, worldZ * mAwvf);
+                    }
+                    float localWidth = Mathf.Max(mAw * (1f + mAwv * wn), 0.001f);
                     float tunnelSDF = (localWidth - Mathf.Abs(n)) / localWidth * 4f * s;
                     float sdf = Mathf.Min(tunnelSDF, worldY - floorY) * profMaS;
                     combined = combined > sdf ? combined : sdf;
@@ -1417,12 +1372,25 @@ namespace VoxCaves
 
                 if (profMaS > 0f)
                 {
-                    float sy  = worldY * mAvs;
-                    float wx  = _warpX!.GetNoise(worldX * mAwf, sy * mAwf, worldZ * mAwf) * mAwa;
-                    float wz  = _warpZ!.GetNoise(worldX * mAwf, sy * mAwf, worldZ * mAwf) * mAwa;
-                    float n   = _caveNoise!.GetNoise((worldX + wx) * mAf, sy * mAf, (worldZ + wz) * mAf);
-                    float localWidth = Mathf.Max(mAw * (1f + mAwv
-                        * _widthNoise!.GetNoise(worldX * mAwvf, sy * mAwvf, worldZ * mAwvf)), 0.001f);
+                    float n, wn;
+                    if (bakeA)
+                    {
+                        float n0 = _tunBuf![bb00+cy] + (_tunBuf[bb10+cy] - _tunBuf[bb00+cy]) * bfx;
+                        float n1 = _tunBuf![bb01+cy] + (_tunBuf[bb11+cy] - _tunBuf[bb01+cy]) * bfx;
+                        n  = n0 + (n1 - n0) * bfz;
+                        float w0 = _tunWBuf![bb00+cy] + (_tunWBuf[bb10+cy] - _tunWBuf[bb00+cy]) * bfx;
+                        float w1 = _tunWBuf![bb01+cy] + (_tunWBuf[bb11+cy] - _tunWBuf[bb01+cy]) * bfx;
+                        wn = w0 + (w1 - w0) * bfz;
+                    }
+                    else
+                    {
+                        float sy = worldY * mAvs;
+                        float wx = _warpX!.GetNoise(worldX * mAwf, sy * mAwf, worldZ * mAwf) * mAwa;
+                        float wz = _warpZ!.GetNoise(worldX * mAwf, sy * mAwf, worldZ * mAwf) * mAwa;
+                        n  = _caveNoise!.GetNoise((worldX + wx) * mAf, sy * mAf, (worldZ + wz) * mAf);
+                        wn = _widthNoise!.GetNoise(worldX * mAwvf, (worldY * mAvs) * mAwvf, worldZ * mAwvf);
+                    }
+                    float localWidth = Mathf.Max(mAw * (1f + mAwv * wn), 0.001f);
                     float tunnelSDF = (localWidth - Mathf.Abs(n)) / localWidth * 4f * s;
                     float sdf = Mathf.Min(tunnelSDF, worldY - floorY) * profMaS;
                     combined = combined > sdf ? combined : sdf;
@@ -1454,12 +1422,25 @@ namespace VoxCaves
 
                 if (profMaS > 0f)
                 {
-                    float sy  = worldY * mAvs;
-                    float wx  = _warpX!.GetNoise(worldX * mAwf, sy * mAwf, worldZ * mAwf) * mAwa;
-                    float wz  = _warpZ!.GetNoise(worldX * mAwf, sy * mAwf, worldZ * mAwf) * mAwa;
-                    float n   = _caveNoise!.GetNoise((worldX + wx) * mAf, sy * mAf, (worldZ + wz) * mAf);
-                    float localWidth = Mathf.Max(mAw * (1f + mAwv
-                        * _widthNoise!.GetNoise(worldX * mAwvf, sy * mAwvf, worldZ * mAwvf)), 0.001f);
+                    float n, wn;
+                    if (bakeA)
+                    {
+                        float n0 = _tunBuf![bb00+cy] + (_tunBuf[bb10+cy] - _tunBuf[bb00+cy]) * bfx;
+                        float n1 = _tunBuf![bb01+cy] + (_tunBuf[bb11+cy] - _tunBuf[bb01+cy]) * bfx;
+                        n  = n0 + (n1 - n0) * bfz;
+                        float w0 = _tunWBuf![bb00+cy] + (_tunWBuf[bb10+cy] - _tunWBuf[bb00+cy]) * bfx;
+                        float w1 = _tunWBuf![bb01+cy] + (_tunWBuf[bb11+cy] - _tunWBuf[bb01+cy]) * bfx;
+                        wn = w0 + (w1 - w0) * bfz;
+                    }
+                    else
+                    {
+                        float sy = worldY * mAvs;
+                        float wx = _warpX!.GetNoise(worldX * mAwf, sy * mAwf, worldZ * mAwf) * mAwa;
+                        float wz = _warpZ!.GetNoise(worldX * mAwf, sy * mAwf, worldZ * mAwf) * mAwa;
+                        n  = _caveNoise!.GetNoise((worldX + wx) * mAf, sy * mAf, (worldZ + wz) * mAf);
+                        wn = _widthNoise!.GetNoise(worldX * mAwvf, (worldY * mAvs) * mAwvf, worldZ * mAwvf);
+                    }
+                    float localWidth = Mathf.Max(mAw * (1f + mAwv * wn), 0.001f);
                     float tunnelSDF = (localWidth - Mathf.Abs(n)) / localWidth * 4f * s;
                     float sdf = Mathf.Min(tunnelSDF, worldY - floorY) * profMaS;
                     combined = combined > sdf ? combined : sdf;
@@ -1469,6 +1450,24 @@ namespace VoxCaves
             }
         }
 
+        // ── Per-point SDF for FallbackDensity patch ───────────────────────────────
+        // Computes our SDF for a single voxel (absolute voxel coordinates).
+        // Lookup into the SDF cache baked by Phase 3 of Carve().
+        // Returns false on cache miss (zone not yet carved) → caller falls through to vanilla.
+        internal static bool TryComputePointSDF(int vx, int vy, int vz, out sbyte result)
+        {
+            result = sbyte.MaxValue;
+            // Zone origin: floor-divide by 64
+            int ox = vx - ((vx % 64 + 64) % 64);
+            int oz = vz - ((vz % 64 + 64) % 64);
+            if (!_sdfCache.TryGetValue($"{ox},{oz}", out var c)) return false;
+            int ci = vx - ox, ri = vz - oz, cy = vy - c.extLo;
+            if (ci < 0 || ci >= c.width || ri < 0 || ri >= c.width || cy < 0 || cy >= c.bh)
+                return false;
+            result = c.data[(ci * c.bh + cy) * c.width + ri];
+            return true;
+        }
+
         // Extracted into its own method so Mono JITs it independently from Carve().
         // Carve() grew too large for Mono's optimized JIT path, causing 8× slowdown in the hot loop.
         // Profile parameters come from the always-baked 2D coarse arrays via bilinear interpolation,
@@ -1476,7 +1475,7 @@ namespace VoxCaves
         // h (terrain surface height) must be exact per-column — coarse interpolation of h
         // produces visible terrain artifacts because baseSDF = worldY - h drives the surface position.
         static void FillPhase1(float[] buf, int bw, int bh, int extLo, float s,
-            int ox, int oz, int overlap, bool bakeC, WorldGenerator? wg, int cw4,
+            int ox, int oz, int overlap, bool bakeC, bool bakeA, WorldGenerator? wg, int cw4,
             List<Vector2> nearbyLocs)
         {
             long _setupTicks = 0L, _yloopTicks = 0L;
@@ -1551,7 +1550,7 @@ namespace VoxCaves
                     layerCount, hmC, hmF,
                     bb00, bb10, bb01, bb11, bfx, bfz,
                     mAwf, mAwa, mAf, mAvs, mAw, mAwv, mAwvf,
-                    worldX, worldZ, bakeC);
+                    worldX, worldZ, bakeC, bakeA);
                 _yloopTicks += System.Diagnostics.Stopwatch.GetTimestamp() - _tb;
             }
             Log.LogInfo($"[VoxCaves] Ph1 breakdown: setup={_setupTicks*1000/_freq}ms yloop={_yloopTicks*1000/_freq}ms");
@@ -1609,133 +1608,36 @@ namespace VoxCaves
                 if (maxY > cur) Plugin._yScanHiField.SetValue(__instance, maxY);
                 Plugin._zoneMaxY.Remove(key);
             }
-
-            // Evict SDF cache — VoxelField committed; player edits after this must not
-            // be overwritten by our procedural SDF on subsequent brick rebuilds.
-            Plugin._zoneSdfs.Remove(key);
-            Plugin._sdfsApplied.Remove(key);
-        }
-    }
-
-    // Write our procedural SDF to VoxelField immediately after the zone activates,
-    // before any bricks are enqueued for meshing.  Synchronous but correct: VoxelField
-    // is fully populated in the same frame as Activate, so surface nets never reads
-    // stale (vanilla) values from this zone.  Cross-zone seams at boundaries are handled
-    // by Voxheim's own PokeNeighbors call in Complete().
-    [HarmonyPatch]
-    static class ActivatePatch
-    {
-        static MethodBase? TargetMethod()
-        {
-            var t = Plugin.FindType("Voxheim.Unity.VoxelZone", "Voxheim");
-            var m = t?.GetMethod("Activate",
-                BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-            if (m == null) Plugin.Log.LogWarning("[VoxCaves] VoxelZone.Activate not found.");
-            return m;
         }
 
+        // After Complete() sets _isActive=true, poke neighbors so their boundary
+        // bricks rebuild using this zone's carved _field instead of FallbackDensity or stale data.
+        // PokeNeighbors(in VoxelBounds, bool defer) finds all active adjacent zones and enqueues
+        // a deferred remesh of the bricks overlapping the supplied bounds.
         static void Postfix(object __instance)
         {
-            // Set _isActive=true so that pending neighbor zones processing their
-            // boundary bricks (in future frames) can already read this zone's _field
-            // via StitchedSource without waiting for our Complete() to fire.
-            if (Plugin._isActiveField != null)
-                Plugin._isActiveField.SetValue(__instance, true);
+            if (Plugin._pokeNeighborsMethod == null) return;
+            if (Plugin._voxelBoundsType == null || Plugin._vbMinField == null
+                || Plugin._vbMaxField == null || Plugin._vbAnyField == null) return;
+            if (Plugin._zoneOriginX == null || Plugin._zoneOriginZ == null) return;
+            if (Plugin._int3Ctor == null) return;
 
-            // Hand the instance to SkinPatch.Postfix, which runs right after Skin()
-            // registers this zone in s_zones.
-            Plugin._lastActivatedZone = __instance;
-        }
-    }
+            int ox = (int)Plugin._zoneOriginX.GetValue(__instance)!;
+            int oz = (int)Plugin._zoneOriginZ.GetValue(__instance)!;
+            if (!Plugin._zoneParams.TryGetValue($"{ox},{oz}", out var zp)) return;
 
-    // Fires after Skin() registers the new zone in s_zones.
-    // Enqueues boundary-brick remeshes for already-complete neighbor zones whose
-    // boundary bricks were previously built with FallbackDensity (this zone didn't
-    // exist yet).  Those bricks are processed over the next few frames via Update().
-    [HarmonyPatch]
-    static class SkinPatch
-    {
-        static MethodBase? TargetMethod()
-        {
-            var t = Plugin.FindType("Voxheim.Unity.VoxelZone", "Voxheim");
-            var m = t?.GetMethod("Skin",
-                BindingFlags.NonPublic | BindingFlags.Static, null,
-                new[] { typeof(Heightmap), typeof(bool) }, null);
-            if (m == null) Plugin.Log.LogWarning("[VoxCaves] VoxelZone.Skin not found — boundary seam fix disabled.");
-            return m;
-        }
+            // Build VoxelBounds covering the full carved voxel extent of this zone.
+            // Neighbors only need bricks that touch this zone's edge, but covering the
+            // full zone is safe and ensures we catch Mode C terrain raised above yHi.
+            object minV = Plugin._int3Ctor.Invoke(new object[] { zp.ox,          zp.yLo - 32, zp.oz });
+            object maxV = Plugin._int3Ctor.Invoke(new object[] { zp.ox + zp.w - 1, zp.yHi + 128, zp.oz + zp.w - 1 });
+            object bounds = Activator.CreateInstance(Plugin._voxelBoundsType);
+            Plugin._vbMinField.SetValue(bounds, minV);
+            Plugin._vbMaxField.SetValue(bounds, maxV);
+            Plugin._vbAnyField.SetValue(bounds, true);
 
-        static void Postfix(object hmap, bool immediate)
-        {
-            var zone = Plugin._lastActivatedZone;
-            Plugin._lastActivatedZone = null;
-            if (zone == null) return;
-
-            // Also run Voxheim's own poke in case there IS a detectable height delta.
-            try { Plugin._pokeNeighborsMethod?.Invoke(zone, new object[] { true, true }); }
-            catch { /* non-fatal */ }
-
-            if (Plugin._int3Ctor == null || Plugin._zoneOriginX == null || Plugin._zoneOriginZ == null
-                || Plugin._rebuildBrickMethod == null) return;
-
-            int ox = (int)Plugin._zoneOriginX.GetValue(zone)!;
-            int oz = (int)Plugin._zoneOriginZ.GetValue(zone)!;
-            // Y brick range: use this zone's scan bounds with padding, or a safe default.
-            int by0 = Plugin._yScanLoField != null
-                ? ((int)Plugin._yScanLoField.GetValue(zone)! - 2) >> 4
-                : -4;
-            int by1 = Plugin._yScanHiField != null
-                ? ((int)Plugin._yScanHiField.GetValue(zone)! + 2) >> 4
-                : 25;
-            const int W = 64; // voxels per zone side
-            int bx0 = ox >> 4;  int bx1 = (ox + W - 1) >> 4;
-            int bz0 = oz >> 4;  int bz1 = (oz + W - 1) >> 4;
-
-            // For each of the 4 adjacent positions, look up complete neighbors and
-            // enqueue their single boundary-brick column that faces this new zone.
-            // (inZ=true → N/S neighbor, boundary is a bz slice; false → E/W, bx slice)
-            ReadonlySpanLike(
-                ($"{ox},{oz - W}", true,  (oz - 1) >> 4),  // South neighbor's North boundary
-                ($"{ox},{oz + W}", true,  (oz + W) >> 4),  // North neighbor's South boundary
-                ($"{ox - W},{oz}", false, (ox - 1) >> 4),  // West neighbor's East boundary
-                ($"{ox + W},{oz}", false, (ox + W) >> 4),  // East neighbor's West boundary
-                bx0, bx1, bz0, bz1, by0, by1);
-        }
-
-        static void ReadonlySpanLike(
-            (string key, bool inZ, int bFixed) s,
-            (string key, bool inZ, int bFixed) n,
-            (string key, bool inZ, int bFixed) w,
-            (string key, bool inZ, int bFixed) e,
-            int bx0, int bx1, int bz0, int bz1, int by0, int by1)
-        {
-            EnqueueSide(s, bx0, bx1, bz0, bz1, by0, by1);
-            EnqueueSide(n, bx0, bx1, bz0, bz1, by0, by1);
-            EnqueueSide(w, bx0, bx1, bz0, bz1, by0, by1);
-            EnqueueSide(e, bx0, bx1, bz0, bz1, by0, by1);
-        }
-
-        static void EnqueueSide((string key, bool inZ, int bFixed) dir,
-            int bx0, int bx1, int bz0, int bz1, int by0, int by1)
-        {
-            if (!Plugin._zoneObjects.TryGetValue(dir.key, out var neighbor)) return;
-            var ctor = Plugin._int3Ctor!;
-            if (dir.inZ)
-            {
-                int bz = dir.bFixed;
-                for (int by = by0; by <= by1; by++)
-                    for (int bx = bx0; bx <= bx1; bx++)
-                        Plugin._seamRepairQueue.Enqueue(
-                            (neighbor, ctor.Invoke(new object[] { bx, by, bz })!));
-            }
-            else
-            {
-                int bx = dir.bFixed;
-                for (int by = by0; by <= by1; by++)
-                    for (int bz = bz0; bz <= bz1; bz++)
-                        Plugin._seamRepairQueue.Enqueue(
-                            (neighbor, ctor.Invoke(new object[] { bx, by, bz })!));
-            }
+            try { Plugin._pokeNeighborsMethod.Invoke(__instance, new object[] { bounds, true }); }
+            catch (Exception ex) { Plugin.Log.LogWarning($"[VoxCaves] PokeNeighbors threw: {ex.Message}"); }
         }
     }
 
@@ -1746,12 +1648,11 @@ namespace VoxCaves
         {
             Plugin.LoadBiomeConfig();
             Plugin._pendingVegCleanup = true; // run cliff + disableVegetation cleanup after world loads
-            Plugin._zoneSdfs.Clear();
-            Plugin._sdfsApplied.Clear();
             Plugin._zoneObjects.Clear();
             Plugin._zoneParams.Clear();
             Plugin._zoneMaxY.Clear();
-            Plugin._seamRepairQueue.Clear();
+            Plugin._zoneExtHi.Clear();
+            Plugin._sdfCache.Clear();
             Plugin._locationPositions.Clear();
             Plugin._locationsCached = false;
             Plugin._caveNoise    = null;
@@ -1766,6 +1667,38 @@ namespace VoxCaves
             Plugin._addVaryNoise    = null;
             Plugin._widthNoise      = null;
             Plugin._twistVaryNoise  = null;
+        }
+    }
+
+    // Patches StitchedSource.FallbackDensity (private nested class inside VoxelZone).
+    // FallbackDensity is called when a boundary voxel's zone is absent or inactive in s_zones.
+    // We return our own SDF so boundary bricks are built correctly on first mesh — no post-hoc repair needed.
+    [HarmonyPatch]
+    static class FallbackDensityPatch
+    {
+        static MethodBase? TargetMethod()
+        {
+            var zoneT     = Plugin.FindType("Voxheim.Unity.VoxelZone", "Voxheim");
+            var stitchedT = zoneT?.GetNestedType("StitchedSource", BindingFlags.NonPublic);
+            var m         = stitchedT?.GetMethod("FallbackDensity", BindingFlags.NonPublic | BindingFlags.Instance);
+            if (m == null) Plugin.Log.LogWarning("[VoxCaves] FallbackDensity not found — cross-zone boundary density will be vanilla.");
+            return m;
+        }
+
+        // __0 is the Int3 voxel parameter, boxed because we can't reference the type at compile time.
+        static bool Prefix(ref sbyte __result, object __0)
+        {
+            if (Plugin._int3FieldX == null || Plugin._int3FieldY == null || Plugin._int3FieldZ == null)
+                return true;
+            int vx = (int)Plugin._int3FieldX.GetValue(__0)!;
+            int vy = (int)Plugin._int3FieldY.GetValue(__0)!;
+            int vz = (int)Plugin._int3FieldZ.GetValue(__0)!;
+            if (Plugin.TryComputePointSDF(vx, vy, vz, out sbyte r))
+            {
+                __result = r;
+                return false;
+            }
+            return true;
         }
     }
 
