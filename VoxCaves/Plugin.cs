@@ -45,6 +45,8 @@ namespace VoxCaves
 
         public float modeB_vScale;      // Y scale when sampling 3D wall-noise (low=flat, high=vertical)
         public float modeB_noiseAmp;   // amplitude of 3D SDF perturbation on Mode B walls (world units; 0=off)
+        public float modeB_yOffset;    // push band centre this many units below the terrain surface (0=on surface; >mbR = enclosed cave)
+        public float modeB_twist;      // XZ rotation of wall noise per world unit Y (radians/m)
 
         // ── Shared ────────────────────────────────────────────────────────────────
         public float blur_passes;      // smoothing iterations (0=off)
@@ -56,7 +58,7 @@ namespace VoxCaves
         {
             blur_passes     = 0f,  perona_k = 0f, perona_lambda = 0.1f,
             modeB_strength        = 0f,     modeB_radius          = 6f,    modeB_warpAmp           = 80f,
-            modeB_warpFrequency   = 0.005f, modeB_vScale = 0.5f, modeB_noiseAmp = 0f,
+            modeB_warpFrequency   = 0.005f, modeB_vScale = 0.5f, modeB_noiseAmp = 0f, modeB_yOffset = 0f, modeB_twist = 0f,
             modeA_strength  = 0f,     modeA_width         = 0.18f, modeA_frequency   = 0.015f,
             modeA_warpAmp   = 10f,    modeA_warpFrequency = 0.04f, modeA_vScale       = 0.35f,
             modeA_widthVary = 0f,     modeA_widthFrequency = 0.003f,
@@ -97,6 +99,8 @@ namespace VoxCaves
         // ── Location protection ───────────────────────────────────────────────────
         internal static readonly List<Vector2> _locationPositions = new();
         internal static bool _locationsCached;
+        internal static bool _protectLocations = true;
+        internal static bool _forceRecarve = false;
         const float LocProtectR = 30f;
         const float LocFadeR    = 40f;
 
@@ -180,6 +184,9 @@ namespace VoxCaves
         internal static float[]? _bk2dMbr;   // modeB_radius
         internal static float[]? _bk2dMbvs;  // modeB_vScale
         internal static float[]? _bk2dMbna;  // modeB_noiseAmp
+        internal static float[]? _bk2dMbyo;  // modeB_yOffset
+        internal static float[]? _bk2dMbtwist; // modeB_twist
+        // 2D coarse bake — terrain geometry (used by Mode A to orient noise in surface space)
         // 2D coarse bake — Mode A shape params
         internal static float[]? _bk2dMawf;  // modeA_warpFrequency
         internal static float[]? _bk2dMawa;  // modeA_warpAmp
@@ -444,6 +451,8 @@ namespace VoxCaves
                     case "modeb_warpfrequency":   p.modeB_warpFrequency   = v; break;
                     case "modeb_vscale":          p.modeB_vScale          = v; break;
                     case "modeb_noiseamp":        p.modeB_noiseAmp        = v; break;
+                    case "modeb_yoffset":         p.modeB_yOffset         = v; break;
+                    case "modeb_twist":           p.modeB_twist           = v; break;
                     case "modea_strength":        p.modeA_strength        = v; break;
                     case "modea_width":           p.modeA_width           = v; break;
                     case "modea_frequency":       p.modeA_frequency       = v; break;
@@ -526,6 +535,8 @@ namespace VoxCaves
                             _disableVegetation = v == "1" || v == "true";
                             if (_disableVegetation) _pendingVegCleanup = true;
                         }
+                        if (k == "protectlocations")
+                            _protectLocations = !(v == "0" || v == "false");
                     }
                     continue;
                 }
@@ -571,6 +582,7 @@ namespace VoxCaves
             sb.AppendLine("# modeB_warpFrequency   = 0.005  # spatial frequency of XZ warp");
             sb.AppendLine("# modeB_vScale          = 0.5    # Y scale for 3D wall-noise (low=flat, high=vertical)");
             sb.AppendLine("# modeB_noiseAmp        = 0      # 3D SDF perturbation on band walls (world units; 0=off)");
+            sb.AppendLine("# modeB_yOffset         = 0      # push band centre N units below surface (0=trench; >mbR=enclosed cave)");
             sb.AppendLine("# # Mode A — 3D noise tunnel network (punches through Mode C solid)");
             sb.AppendLine("# modeA_strength        = 0      # 0=off 1=full");
             sb.AppendLine("# modeA_width           = 0.5    # tunnel size (noise threshold 0-1)");
@@ -597,6 +609,7 @@ namespace VoxCaves
             sb.AppendLine();
             sb.AppendLine("[Debug]");
             sb.AppendLine("disableVegetation = false");
+            sb.AppendLine("protectLocations  = true   # false = carve through location areas (use with SpawnLocation Y-snap patch)");
             sb.AppendLine();
 
             sb.AppendLine("[Profile:vanilla_heightmap]");
@@ -729,6 +742,8 @@ namespace VoxCaves
                 modeB_warpFrequency  = K(p0.modeB_warpFrequency,  pE.modeB_warpFrequency,  pW.modeB_warpFrequency,  pN.modeB_warpFrequency,  pS.modeB_warpFrequency,  pNE.modeB_warpFrequency,  pNW.modeB_warpFrequency,  pSE.modeB_warpFrequency,  pSW.modeB_warpFrequency ),
                 modeB_vScale         = K(p0.modeB_vScale,         pE.modeB_vScale,         pW.modeB_vScale,         pN.modeB_vScale,         pS.modeB_vScale,         pNE.modeB_vScale,         pNW.modeB_vScale,         pSE.modeB_vScale,         pSW.modeB_vScale        ),
                 modeB_noiseAmp       = K(p0.modeB_noiseAmp,       pE.modeB_noiseAmp,       pW.modeB_noiseAmp,       pN.modeB_noiseAmp,       pS.modeB_noiseAmp,       pNE.modeB_noiseAmp,       pNW.modeB_noiseAmp,       pSE.modeB_noiseAmp,       pSW.modeB_noiseAmp      ),
+                modeB_yOffset        = K(p0.modeB_yOffset,        pE.modeB_yOffset,        pW.modeB_yOffset,        pN.modeB_yOffset,        pS.modeB_yOffset,        pNE.modeB_yOffset,        pNW.modeB_yOffset,        pSE.modeB_yOffset,        pSW.modeB_yOffset       ),
+                modeB_twist          = K(p0.modeB_twist,          pE.modeB_twist,          pW.modeB_twist,          pN.modeB_twist,          pS.modeB_twist,          pNE.modeB_twist,          pNW.modeB_twist,          pSE.modeB_twist,          pSW.modeB_twist         ),
                 modeA_strength       = K(p0.modeA_strength,       pE.modeA_strength,       pW.modeA_strength,       pN.modeA_strength,       pS.modeA_strength,       pNE.modeA_strength,       pNW.modeA_strength,       pSE.modeA_strength,       pSW.modeA_strength      ),
                 modeA_width          = K(p0.modeA_width,          pE.modeA_width,          pW.modeA_width,          pN.modeA_width,          pS.modeA_width,          pNE.modeA_width,          pNW.modeA_width,          pSE.modeA_width,          pSW.modeA_width         ),
                 modeA_frequency      = K(p0.modeA_frequency,      pE.modeA_frequency,      pW.modeA_frequency,      pN.modeA_frequency,      pS.modeA_frequency,      pNE.modeA_frequency,      pNW.modeA_frequency,      pSE.modeA_frequency,      pSW.modeA_frequency     ),
@@ -792,7 +807,7 @@ namespace VoxCaves
 
         static float LocationFactor(float worldX, float worldZ, List<Vector2> nearbyLocs)
         {
-            if (nearbyLocs.Count == 0) return 1f;
+            if (!_protectLocations || nearbyLocs.Count == 0) return 1f;
             float minDist = float.MaxValue;
             for (int i = 0; i < nearbyLocs.Count; i++)
             {
@@ -850,7 +865,7 @@ namespace VoxCaves
             bool allModesOff = centerProf.modeA_strength <= 0f && centerProf.modeB_strength <= 0f && centerProf.modeC_strength <= 0f;
             if (allModesOff)
             {
-                if (!_sdfCache.ContainsKey(zoneKey))
+                if (!_forceRecarve && !_sdfCache.ContainsKey(zoneKey))
                 {
                     // Never carved — VoxelField is Voxheim's vanilla, nothing to do.
                     Log.LogInfo($"[VoxCaves] zone ({ox},{oz}) skip=all-off biome={centerBiome}");
@@ -928,6 +943,8 @@ namespace VoxCaves
             if (_bk2dMbr   == null || _bk2dMbr.Length   < nb2Size) _bk2dMbr   = new float[nb2Size];
             if (_bk2dMbvs  == null || _bk2dMbvs.Length  < nb2Size) _bk2dMbvs  = new float[nb2Size];
             if (_bk2dMbna  == null || _bk2dMbna.Length  < nb2Size) _bk2dMbna  = new float[nb2Size];
+            if (_bk2dMbyo    == null || _bk2dMbyo.Length    < nb2Size) _bk2dMbyo    = new float[nb2Size];
+            if (_bk2dMbtwist == null || _bk2dMbtwist.Length < nb2Size) _bk2dMbtwist = new float[nb2Size];
             if (_bk2dMawf  == null || _bk2dMawf.Length  < nb2Size) _bk2dMawf  = new float[nb2Size];
             if (_bk2dMawa  == null || _bk2dMawa.Length  < nb2Size) _bk2dMawa  = new float[nb2Size];
             if (_bk2dMaf   == null || _bk2dMaf.Length   < nb2Size) _bk2dMaf   = new float[nb2Size];
@@ -963,6 +980,8 @@ namespace VoxCaves
                 _bk2dMbr! [idx2] = p4.modeB_radius;
                 _bk2dMbvs![idx2] = p4.modeB_vScale;
                 _bk2dMbna![idx2] = p4.modeB_noiseAmp;
+                _bk2dMbyo![idx2]    = p4.modeB_yOffset;
+                _bk2dMbtwist![idx2] = p4.modeB_twist;
                 _bk2dMawf![idx2] = p4.modeA_warpFrequency;
                 _bk2dMawa![idx2] = p4.modeA_warpAmp;
                 _bk2dMaf! [idx2] = p4.modeA_frequency;
@@ -971,6 +990,7 @@ namespace VoxCaves
                 _bk2dMawv![idx2] = p4.modeA_widthVary;
                 _bk2dMawvf![idx2]= p4.modeA_widthFrequency;
                 if (p4.modeB_strength > 0f) anyMbActive = true;
+
 
                 // Mode C anchor quantities — only needed when modeC is active.
                 if (bakeC && p4.modeC_strength > 0f)
@@ -1054,15 +1074,15 @@ namespace VoxCaves
                                    Mathf.Lerp(a[i01], a[i11], fx), fz);
                     float wf    = BL2(_bk2dMbwf!, b00, b10, b01, b11, bfx2, bfz2);
                     float wa    = BL2(_bk2dMbwa!, b00, b10, b01, b11, bfx2, bfz2);
+                    float yo    = BL2(_bk2dMbyo!, b00, b10, b01, b11, bfx2, bfz2);
                     float locF2 = LocationFactor(wx, wz, nearbyLocs);
                     float dx    = _hmWarpX!.GetNoise(wx * wf, wz * wf) * (wa * locF2);
                     float dz2   = _hmWarpZ!.GetNoise(wx * wf, wz * wf) * (wa * locF2);
-                    _bkWarpedH![cx * bw + cz] = wg.GetHeight(wx + dx, wz + dz2);
+                    _bkWarpedH![cx * bw + cz] = wg.GetHeight(wx + dx, wz + dz2) - yo;
                 }
             }
 
             long _t0 = _sw.ElapsedMilliseconds;
-            Log.LogInfo($"[VoxCaves] Ph0 anyMbActive={anyMbActive} mbS[0]={(_bk2dMbS!=null&&_bk2dMbS.Length>0?_bk2dMbS[0]:float.NaN):F2} mbR[0]={(_bk2dMbr!=null&&_bk2dMbr.Length>0?_bk2dMbr[0]:float.NaN):F2} flD[0]={(_bk2dFlD!=null&&_bk2dFlD.Length>0?_bk2dFlD[0]:float.NaN):F2} warpedH[0]={(_bkWarpedH!=null&&_bkWarpedH.Length>0?_bkWarpedH[0]:float.NaN):F2}");
 
             // ── Phase 1 ───────────────────────────────────────────────────────────
             FillPhase1(buf, bw, bh, extLo, s, ox, oz, overlap, bakeC, bakeA, wg, cw4, nearbyLocs);
@@ -1272,6 +1292,7 @@ namespace VoxCaves
         {
             Log.LogInfo($"[VoxCaves] Hot-reload: re-voxelizing {_zoneParams.Count} zone(s).");
             _sdfCache.Clear();
+            _forceRecarve = true;
             if (_voxelizeColumnsMethod == null) return;
             bool canRemesh = _enqueueMeshMethod != null && _finishSkinNowMethod != null && _int3Ctor != null;
             if (!canRemesh)
@@ -1313,6 +1334,7 @@ namespace VoxCaves
                 }
                 catch (Exception e) { Log.LogWarning($"[VoxCaves] Revoxelize {key}: {e.Message}"); }
             }
+            _forceRecarve = false;
 
             // ── Between passes: extend _yScanHi for zones where Mode C raised terrain ──
             // CompletePatch only runs on fresh zone load, so hot-reload must do this itself.
@@ -1381,7 +1403,7 @@ namespace VoxCaves
         static void FillYColumn(float[] buf, int bw, int bh, int extLo, float s, int cx, int cz,
             float h, float addH, float profMcS, float profMcT, float localAmp, bool mcActive,
             float locFac, float floorY, float profMbS, float profMaS,
-            float mbWarpedH, float mbR, float mbNA, float mbVS, float mbWF,
+            float mbWarpedH, float mbR, float mbNA, float mbVS, float mbWF, float mbTwist,
             int bb00, int bb10, int bb01, int bb11, float bfx, float bfz,
             float mAwf, float mAwa, float mAf, float mAvs, float mAw, float mAwv, float mAwvf,
             float worldX, float worldZ, bool bakeC, bool bakeA)
@@ -1475,7 +1497,15 @@ namespace VoxCaves
                     if (mbNA > 0f)
                     {
                         float sy = worldY * mbVS;
-                        bandSDF += _mbNoise!.GetNoise(worldX * mbWF, sy * mbWF, worldZ * mbWF) * mbNA;
+                        float nx = worldX, nz = worldZ;
+                        if (mbTwist != 0f)
+                        {
+                            float ang = worldY * mbTwist;
+                            float c = Mathf.Cos(ang), ss = Mathf.Sin(ang);
+                            nx = worldX * c - worldZ * ss;
+                            nz = worldX * ss + worldZ * c;
+                        }
+                        bandSDF += _mbNoise!.GetNoise(nx * mbWF, sy * mbWF, nz * mbWF) * mbNA;
                     }
                     float fd = worldY - floorY;
                     float sdf = (bandSDF < fd ? bandSDF : fd) * profMbS;
@@ -1629,14 +1659,15 @@ namespace VoxCaves
                 float floorY   = h - profFlD;
                 float locFac   = LocationFactor(worldX, worldZ, nearbyLocs);
 
-                float mbWarpedH = 0f, mbR = 0f, mbNA = 0f, mbVS = 0f, mbWF = 0f;
+                float mbWarpedH = 0f, mbR = 0f, mbNA = 0f, mbVS = 0f, mbWF = 0f, mbTwist = 0f;
                 if (profMbS > 0f)
                 {
                     mbWarpedH = _bkWarpedH![cx * bw + cz];
-                    mbR       = BL(_bk2dMbr!,  b200, b210, b201, b211, bfx, bfz);
-                    mbNA      = BL(_bk2dMbna!, b200, b210, b201, b211, bfx, bfz);
-                    mbVS      = BL(_bk2dMbvs!, b200, b210, b201, b211, bfx, bfz);
-                    mbWF      = BL(_bk2dMbwf!, b200, b210, b201, b211, bfx, bfz);
+                    mbR       = BL(_bk2dMbr!,     b200, b210, b201, b211, bfx, bfz);
+                    mbNA      = BL(_bk2dMbna!,    b200, b210, b201, b211, bfx, bfz);
+                    mbVS      = BL(_bk2dMbvs!,    b200, b210, b201, b211, bfx, bfz);
+                    mbWF      = BL(_bk2dMbwf!,    b200, b210, b201, b211, bfx, bfz);
+                    mbTwist   = BL(_bk2dMbtwist!, b200, b210, b201, b211, bfx, bfz);
                 }
 
                 float mAwf=0f, mAwa=0f, mAf=0f, mAvs=0f, mAw=0f, mAwv=0f, mAwvf=0f;
@@ -1656,7 +1687,7 @@ namespace VoxCaves
                 FillYColumn(buf, bw, bh, extLo, s, cx, cz,
                     h, addH, profMcS, profMcT, localAmp, profMcS > 0f && bakeC,
                     locFac, floorY, profMbS, profMaS,
-                    mbWarpedH, mbR, mbNA, mbVS, mbWF,
+                    mbWarpedH, mbR, mbNA, mbVS, mbWF, mbTwist,
                     bb00, bb10, bb01, bb11, bfx, bfz,
                     mAwf, mAwa, mAf, mAvs, mAw, mAwv, mAwvf,
                     worldX, worldZ, bakeC, bakeA);
@@ -1781,6 +1812,29 @@ namespace VoxCaves
         }
     }
 
+    [HarmonyPatch]
+    static class VoxelZoneDestroyPatch
+    {
+        static MethodBase? TargetMethod()
+        {
+            var t = Plugin.FindType("Voxheim.Unity.VoxelZone", "Voxheim");
+            return t?.GetMethod("OnDestroy", BindingFlags.NonPublic | BindingFlags.Instance);
+        }
+
+        static void Postfix(object __instance)
+        {
+            if (Plugin._zoneOriginX == null || Plugin._zoneOriginZ == null) return;
+            int ox = (int)Plugin._zoneOriginX.GetValue(__instance)!;
+            int oz = (int)Plugin._zoneOriginZ.GetValue(__instance)!;
+            string key = $"{ox},{oz}";
+            Plugin._zoneParams.Remove(key);
+            Plugin._sdfCache.Remove(key);
+            Plugin._zoneObjects.Remove(key);
+            Plugin._zoneMaxY.Remove(key);
+            Plugin._zoneExtHi.Remove(key);
+        }
+    }
+
     // Patches StitchedSource.FallbackDensity (private nested class inside VoxelZone).
     // FallbackDensity is called when a boundary voxel's zone is absent or inactive in s_zones.
     // We return our own SDF so boundary bricks are built correctly on first mesh — no post-hoc repair needed.
@@ -1841,6 +1895,25 @@ namespace VoxCaves
                         BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
                 _zdoPosField?.SetValue(zdo, pos);
             }
+        }
+    }
+
+    [HarmonyPatch]
+    static class SpawnLocationPatch
+    {
+        static MethodBase? TargetMethod() =>
+            typeof(ZoneSystem).GetMethod("SpawnLocation",
+                BindingFlags.NonPublic | BindingFlags.Instance);
+
+        // Correct Y before any ZDOs are created.
+        // GetGroundData uses a physics raycast which fails in SpawnMode.Ghost (no collider).
+        // For Mode B terrain the carved cave is underground; the surface stays at wg.GetHeight.
+        // Mode C support will require a proper surface scan — update this when Mode C is used.
+        static void Prefix(ref Vector3 pos)
+        {
+            var wg = WorldGenerator.instance;
+            if (wg == null) return;
+            pos.y = wg.GetHeight(pos.x, pos.z);
         }
     }
 }
