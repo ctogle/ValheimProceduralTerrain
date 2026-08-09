@@ -26,6 +26,7 @@ namespace VoxCaves
         public float modeA_vScale;         // Y scale before noise lookup (low=horizontal, high=vertical)
         public float modeA_widthVary;      // amplitude of spatial width modulation (0=uniform, 1=2× variation)
         public float modeA_widthFrequency; // spatial frequency of width modulation noise
+        public float modeA_yOffset;        // anchor tunnel noise this many units below heightmap (0=absolute world Y)
 
         // ── Mode C: 3D density field raised above heightmap ──────────────────────
         public float modeC_threshold;      // noise threshold for solid interior (-1..1, like modeA_width)
@@ -39,6 +40,7 @@ namespace VoxCaves
         public float modeC_twistFrequency; // spatial frequency of twist variation noise
         public float modeC_ampVary;        // amplitude of spatial noise-amplitude modulation (0=uniform)
         public float modeC_ampFrequency;   // spatial frequency of amplitude modulation noise
+        public float modeC_yOffset;        // shift density field anchor this many units below the heightmap (0=surface)
 
         public float modeB_vScale;      // Y scale when sampling 3D wall-noise (low=flat, high=vertical)
         public float modeB_noiseAmp;   // amplitude of 3D SDF perturbation on Mode B walls (world units; 0=off)
@@ -97,6 +99,8 @@ namespace VoxCaves
         internal static readonly List<Vector2> _locationPositions = new();
         internal static bool _locationsCached;
         internal static bool  _protectLocations    = true;
+        internal static bool  _islandRemoval       = true;
+        internal static bool  _pocketRemoval       = true;
         internal static float _biomeBlendRadius    = 192f;
         internal static bool  _biomeBlendSmooth    = true;   // false=linear, true=smoothstep
         internal static int   _transitionBlurPasses = 3;     // min blur passes for any active zone
@@ -115,16 +119,19 @@ namespace VoxCaves
         // ── Noise ─────────────────────────────────────────────────────────────────
         // All noise objects use frequency=1.0; call sites scale coordinates by
         // the blended per-biome frequency so blended frequencies interpolate cleanly.
-        internal static FastNoiseLite? _caveNoise;     // Mode A: 3D tunnel noise
-        internal static FastNoiseLite? _warpX;         // Mode A: 3D warp X
-        internal static FastNoiseLite? _warpZ;         // Mode A: 3D warp Z
+        internal static FastNoiseLite? _caveNoise;      // Mode A: 3D tunnel noise field 1
+        internal static FastNoiseLite? _caveNoise2;     // Mode A: 3D tunnel noise field 2 (tubes = intersection of two zero-crossing sheets)
+        internal static FastNoiseLite? _warpX;          // Mode A: 3D warp X
+        internal static FastNoiseLite? _warpZ;          // Mode A: 3D warp Z
+        internal static FastNoiseLite? _warpX2;         // Mode A: 3D warp X for field 2
+        internal static FastNoiseLite? _warpZ2;         // Mode A: 3D warp Z for field 2
         internal static FastNoiseLite? _hmWarpX;       // Mode B: XZ warp X
         internal static FastNoiseLite? _hmWarpZ;       // Mode B: XZ warp Z
         internal static FastNoiseLite? _hmAddWarpX;    // Mode C: anchor warp X
         internal static FastNoiseLite? _hmAddWarpZ;    // Mode C: anchor warp Z
         internal static FastNoiseLite? _addNoise;        // Mode C: 3D density field
         internal static FastNoiseLite? _addVaryNoise;   // Mode C: amplitude modulation
-        internal static FastNoiseLite? _widthNoise;     // Mode A: tunnel width modulation
+        internal static FastNoiseLite? _widthNoise;      // Mode A: tunnel width modulation
         internal static FastNoiseLite? _twistVaryNoise; // Mode C: twist scale modulation
         internal static FastNoiseLite? _mbNoise;        // Mode B: 3D wall perturbation
 
@@ -146,11 +153,13 @@ namespace VoxCaves
         // Profile cache — cleared on config reload; no longer populated (kept for compat with any external readers).
         internal static readonly Dictionary<long, CaveProfile> _profileCache = new();
 
-        // Scratch buffers for the biome pre-blur pass (Step 1–3 of the smooth-weight pipeline).
-        // _biomeGrid: padded GetBiome sample grid [px * pcw + pz], stores Heightmap.Biome as int.
-        // _blurRowA/B: temp 1-D blur buffers (one row at a time, reused for X then Z pass).
-        // _blendedProfs: blended CaveProfile at each coarse grid cell [cx4 * cw4 + cz4].
-        static int[]?         _biomeGrid    = null;  // padded GetBiome sample grid
+        // Scratch buffers for BFS biome blend.
+        // _biomeFrac: supersampled fractional biome weights per padded coarse cell.
+        //   Layout: [px * pcw + pz] * MaxBiomeSlots + slotIdx
+        //   Slot mapping built fresh each zone (biomeSlot dict in BakeBlendedProfiles).
+        const int SuperN        = 2;   // NxN sub-samples per coarse cell (2→4 samples, 9x smoother boundary)
+        const int MaxBiomeSlots = 16;  // Valheim has ~9 biomes; 16 is safe headroom
+        static float[]?       _biomeFrac    = null;  // [pgSize * MaxBiomeSlots]
         static int[]?         _biomeDist    = null;  // BFS distance map scratch (per-biome)
         static int[]?         _biomeBfsQ    = null;  // BFS queue scratch
         static float[]?       _biomeTotW    = null;  // per-cell weight accumulator
@@ -176,7 +185,8 @@ namespace VoxCaves
         internal static float[]? _bufB;
 
         internal static float[]? _noiseBuf;  // coarse Mode C bake: [cx4*(cw4*bh) + cz4*bh + cy]
-        internal static float[]? _tunBuf;   // coarse Mode A: tunnel noise (after warp)
+        internal static float[]? _tunBuf;   // coarse Mode A: tunnel noise field 1 (after warp)
+        internal static float[]? _tunBuf2;  // coarse Mode A: tunnel noise field 2 (after warp)
         internal static float[]? _tunWBuf;  // coarse Mode A: width modulation noise
         // 2D coarse bake (same XZ grid as _noiseBuf): [cx4*cw4 + cz4]
         internal static float[]? _bk2dAddH;  // Mode C anchor height
@@ -201,6 +211,7 @@ namespace VoxCaves
         internal static float[]? _bk2dMaw;   // modeA_width
         internal static float[]? _bk2dMawv;  // modeA_widthVary
         internal static float[]? _bk2dMawvf; // modeA_widthFrequency
+        internal static float[]? _bk2dMayo;  // modeA_yOffset
         // Full-res (bw×bw) — Mode B warped heightmap (wg.GetHeight after XZ warp)
         internal static float[]? _bkWarpedH;
 
@@ -227,7 +238,29 @@ namespace VoxCaves
             new Terminal.ConsoleCommand("voxcaves_dump", "dump SDF + biome blend data for the next 9 zones processed to BepInEx/config/voxcaves_dump_*.json", _ =>
             {
                 _dumpZonesRemaining = 9;
-                Terminal.Log("[VoxCaves] Will dump next 9 zones to voxcaves_dump_*.json");
+                Log.LogInfo("[VoxCaves] Will dump next 9 zones to voxcaves_dump_*.json");
+            });
+            new Terminal.ConsoleCommand("voxcaves_probe", "voxcaves_probe [x z] — print biome blend breakdown + profile params at world pos (default: player pos)", args =>
+            {
+                try
+                {
+                    var wg = WorldGenerator.instance;
+                    if (wg == null) { Log.LogWarning("[VoxCaves] probe: WorldGenerator not ready."); return; }
+                    float s = _scale is { } sv && sv > 0f ? sv : 1f;
+                    float wx, wz;
+                    if (args.Length >= 3 && float.TryParse(args[1], out float ax) && float.TryParse(args[2], out float az))
+                        { wx = ax; wz = az; }
+                    else
+                    {
+                        var player = Player.m_localPlayer;
+                        if (player == null) { Log.LogWarning("[VoxCaves] probe: no player; pass x z args."); return; }
+                        wx = player.transform.position.x;
+                        wz = player.transform.position.z;
+                    }
+                    Log.LogInfo($"[VoxCaves] Probing biome blend at world ({wx:F1}, {wz:F1}):");
+                    ProbeBlend(wx, wz, wg, s);
+                }
+                catch (Exception e) { Log.LogError($"[VoxCaves] probe exception: {e}"); }
             });
             Log.LogInfo("[VoxCaves] Ready.");
         }
@@ -474,6 +507,7 @@ namespace VoxCaves
                     case "modea_vscale":          p.modeA_vScale          = v; break;
                     case "modea_widthvary":       p.modeA_widthVary       = v; break;
                     case "modea_widthfrequency":  p.modeA_widthFrequency  = v; break;
+                    case "modea_yoffset":         p.modeA_yOffset         = v; break;
                     case "modec_strength":        break; // removed — use modeC_noiseAmp=0 to disable
                     case "modec_threshold":       p.modeC_threshold       = v; break;
                     case "modec_noiseamp":        p.modeC_noiseAmp        = v; break;
@@ -486,6 +520,7 @@ namespace VoxCaves
                     case "modec_twistfrequency":  p.modeC_twistFrequency  = v; break;
                     case "modec_ampvary":         p.modeC_ampVary         = v; break;
                     case "modec_ampfrequency":    p.modeC_ampFrequency    = v; break;
+                    case "modec_yoffset":         p.modeC_yOffset         = v; break;
                     case "blur_passes":            p.blur_passes            = v; break;
                     case "perona_k":              p.perona_k              = v; break;
                     case "perona_lambda":         p.perona_lambda         = v; break;
@@ -552,6 +587,10 @@ namespace VoxCaves
                         }
                         if (k == "protectlocations")
                             _protectLocations = !(v == "0" || v == "false");
+                        if (k == "islandremoval")
+                            _islandRemoval = !(v == "0" || v == "false");
+                        if (k == "pocketremoval")
+                            _pocketRemoval = !(v == "0" || v == "false");
                         if (k == "biomeblendradius" && float.TryParse(v, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float bbr))
                             _biomeBlendRadius = Mathf.Max(1f, bbr);
                         if (k == "biomeblendsmooth")
@@ -631,6 +670,8 @@ namespace VoxCaves
             sb.AppendLine("[Debug]");
             sb.AppendLine("disableVegetation = false");
             sb.AppendLine("protectLocations  = true   # false = carve through location areas (use with SpawnLocation Y-snap patch)");
+            sb.AppendLine("islandRemoval     = true   # false = disable floating-island BFS removal");
+            sb.AppendLine("pocketRemoval     = true   # false = disable sealed underground pocket BFS fill");
             sb.AppendLine("biomeBlendRadius  = 192    # world units over which biome profiles blend at boundaries");
             sb.AppendLine();
 
@@ -682,9 +723,12 @@ namespace VoxCaves
                 return n;
             }
 
-            _caveNoise   = MakeNoise(0); // Mode A tunnel
-            _warpX       = MakeNoise(2); // Mode A warp X
-            _warpZ       = MakeNoise(3); // Mode A warp Z
+            _caveNoise   = MakeNoise(0);  // Mode A tunnel field 1
+            _caveNoise2  = MakeNoise(1);  // Mode A tunnel field 2
+            _warpX       = MakeNoise(2);  // Mode A warp X (field 1)
+            _warpZ       = MakeNoise(3);  // Mode A warp Z (field 1)
+            _warpX2      = MakeNoise(13); // Mode A warp X (field 2)
+            _warpZ2      = MakeNoise(14); // Mode A warp Z (field 2)
             _hmWarpX     = MakeNoise(4); // Mode B warp X
             _hmWarpZ     = MakeNoise(5); // Mode B warp Z
             _hmAddWarpX  = MakeNoise(6); // Mode C anchor warp X
@@ -715,17 +759,125 @@ namespace VoxCaves
             if (prof.modeA_width <= 0f || worldY <= floorY) return 0f;
             float sy  = worldY * prof.modeA_vScale;
             float twf = prof.modeA_warpFrequency;
-            float wx  = _warpX!.GetNoise(worldX * twf, sy * twf, worldZ * twf) * prof.modeA_warpAmp;
-            float wz  = _warpZ!.GetNoise(worldX * twf, sy * twf, worldZ * twf) * prof.modeA_warpAmp;
+            float wx  = _warpX! .GetNoise(worldX * twf, sy * twf, worldZ * twf) * prof.modeA_warpAmp;
+            float wz  = _warpZ! .GetNoise(worldX * twf, sy * twf, worldZ * twf) * prof.modeA_warpAmp;
+            float wx2 = _warpX2!.GetNoise(worldX * twf, sy * twf, worldZ * twf) * prof.modeA_warpAmp;
+            float wz2 = _warpZ2!.GetNoise(worldX * twf, sy * twf, worldZ * twf) * prof.modeA_warpAmp;
             float tf  = prof.modeA_frequency;
-            float n   = _caveNoise!.GetNoise((worldX + wx) * tf, sy * tf, (worldZ + wz) * tf);
-            float absN = Mathf.Abs(n);
-            if (absN >= prof.modeA_width) return 0f;
-            return (prof.modeA_width - absN) / prof.modeA_width;
+            float na  = _caveNoise! .GetNoise((worldX + wx)  * tf, sy * tf, (worldZ + wz)  * tf);
+            float nb  = _caveNoise2!.GetNoise((worldX + wx2) * tf, sy * tf, (worldZ + wz2) * tf);
+            float dist = Mathf.Sqrt(na * na + nb * nb) * 0.7071f;
+            if (dist >= prof.modeA_width) return 0f;
+            return (prof.modeA_width - dist) / prof.modeA_width;
         }
 
-        // ── Point-query biome blend (BFS distance, same approach as BakeBlendedProfiles) ──
-        // Used by callers outside Carve() that don't have a zone bake grid available.
+        // ── voxcaves_probe: biome blend breakdown logged to console ──────────────────
+        static void ProbeBlend(float worldX, float worldZ, WorldGenerator wg, float s)
+        {
+            var   profs      = _biomeProfiles;
+            float coarseStep = 4f * s;
+            int   pad        = (int)(_biomeBlendRadius / coarseStep) + 2;
+            int   pcw        = 1 + 2 * pad;
+            int   pgSize     = pcw * pcw;
+            int   maxHops    = (int)(_biomeBlendRadius / coarseStep) + 1;
+            int   center     = pad * pcw + pad;
+
+            int fracStride = pgSize * MaxBiomeSlots;
+            if (_biomeFrac == null || _biomeFrac.Length < fracStride) _biomeFrac = new float[fracStride];
+            Array.Clear(_biomeFrac, 0, fracStride);
+            if (_biomeDist == null || _biomeDist.Length < pgSize) _biomeDist = new int[pgSize];
+            if (_biomeBfsQ == null || _biomeBfsQ.Length < pgSize) _biomeBfsQ = new int[pgSize];
+
+            var biomeSlot = new Dictionary<int, int>(MaxBiomeSlots);
+            float subWeight = 1f / (SuperN * SuperN);
+            for (int px = 0; px < pcw; px++)
+            for (int pz = 0; pz < pcw; pz++)
+            {
+                float cx = worldX + (px - pad) * coarseStep;
+                float cz = worldZ + (pz - pad) * coarseStep;
+                int cellBase = (px * pcw + pz) * MaxBiomeSlots;
+                for (int si = 0; si < SuperN; si++)
+                for (int sk = 0; sk < SuperN; sk++)
+                {
+                    int b = (int)wg.GetBiome(cx + (si + 0.5f) * coarseStep / SuperN,
+                                             cz + (sk + 0.5f) * coarseStep / SuperN);
+                    if (!biomeSlot.TryGetValue(b, out int slot))
+                    {
+                        if (biomeSlot.Count >= MaxBiomeSlots) continue;
+                        slot = biomeSlot.Count;
+                        biomeSlot[b] = slot;
+                    }
+                    _biomeFrac[cellBase + slot] += subWeight;
+                }
+            }
+
+            // Center cell fractions (what fraction of sub-samples at this exact cell are each biome)
+            var sb = new System.Text.StringBuilder();
+            sb.Append($"  center cell fractions: ");
+            foreach (var (biomeInt, slot) in biomeSlot)
+            {
+                float f = _biomeFrac[center * MaxBiomeSlots + slot];
+                if (f > 0f) sb.Append($"{(Heightmap.Biome)biomeInt}={f:F2} ");
+            }
+            Log.LogInfo(sb.ToString());
+
+            float totW = 0f;
+            var contributions = new List<(string name, int distCells, float frac, float w, CaveProfile prof)>();
+
+            foreach (var (biomeInt, slot) in biomeSlot)
+            {
+                int qHead = 0, qTail = 0;
+                for (int i = 0; i < pgSize; i++)
+                {
+                    if (_biomeFrac[i * MaxBiomeSlots + slot] > 0f)
+                        { _biomeDist[i] = 0; _biomeBfsQ[qTail++] = i; }
+                    else _biomeDist[i] = int.MaxValue;
+                }
+                while (qHead < qTail)
+                {
+                    int cell = _biomeBfsQ[qHead++];
+                    int nd   = _biomeDist[cell] + 1;
+                    if (nd > maxHops) continue;
+                    int px = cell / pcw, pz = cell % pcw;
+                    if (px > 0)     { int n=cell-pcw; if (_biomeDist[n]>nd){_biomeDist[n]=nd;_biomeBfsQ[qTail++]=n;} }
+                    if (px < pcw-1) { int n=cell+pcw; if (_biomeDist[n]>nd){_biomeDist[n]=nd;_biomeBfsQ[qTail++]=n;} }
+                    if (pz > 0)     { int n=cell-1;   if (_biomeDist[n]>nd){_biomeDist[n]=nd;_biomeBfsQ[qTail++]=n;} }
+                    if (pz < pcw-1) { int n=cell+1;   if (_biomeDist[n]>nd){_biomeDist[n]=nd;_biomeBfsQ[qTail++]=n;} }
+                }
+                int distC = _biomeDist[center];
+                if (distC > maxHops) continue;
+                float t = distC * coarseStep / _biomeBlendRadius;
+                float w = _biomeBlendSmooth ? 1f - t * t * (3f - 2f * t) : 1f - t;
+                if (w <= 0f) continue;
+                float frac = distC == 0 ? _biomeFrac[center * MaxBiomeSlots + slot] : 1f;
+                w *= frac;
+                if (w <= 0f) continue;
+                totW += w;
+                var prof = profs.TryGetValue((Heightmap.Biome)biomeInt, out var p) ? p : CaveProfile.Default;
+                contributions.Add(($"{(Heightmap.Biome)biomeInt}", distC, frac, w, prof));
+            }
+
+            if (totW <= 0f) { Log.LogInfo("  no biome contribution (totW=0)"); return; }
+
+            Log.LogInfo($"  blendRadius={_biomeBlendRadius} coarseStep={coarseStep:F1} maxHops={maxHops}  totW={totW:F3}");
+            foreach (var (name, distCells, frac, w, prof) in contributions)
+            {
+                float normW = w / totW;
+                float worldDist = distCells * coarseStep;
+                Log.LogInfo($"  [{name}]  dist={worldDist:F0}wu ({distCells} hops)  seedFrac={frac:F2}  weight={w:F3}  normW={normW:P0}  mcAmp={prof.modeC_noiseAmp:F1}  mbR={prof.modeB_radius:F1}  blur={prof.blur_passes:F0}");
+            }
+
+            // Blended result
+            float rcp = 1f / totW;
+            float blendMcAmp = contributions.Sum(c => c.w * c.prof.modeC_noiseAmp) * rcp;
+            float blendMbR   = contributions.Sum(c => c.w * c.prof.modeB_radius)   * rcp;
+            float blendBlur  = contributions.Sum(c => c.w * c.prof.blur_passes)    * rcp;
+            float blendFloor = contributions.Sum(c => c.w * c.prof.floorDepth)     * rcp;
+            Log.LogInfo($"  → blended: mcAmp={blendMcAmp:F2}  mbRadius={blendMbR:F2}  blur={blendBlur:F1}  floorDepth={blendFloor:F1}");
+        }
+
+        // ── Point-query biome blend — same supersampled fractional approach as BakeBlendedProfiles ──
+        // Used by callers that need a blend for a single world point (e.g. hot-reload ceiling estimate).
         static CaveProfile PointBlendProfile(float worldX, float worldZ, WorldGenerator wg, float s)
         {
             var   profs      = _biomeProfiles;
@@ -734,31 +886,47 @@ namespace VoxCaves
             int   pcw        = 1 + 2 * pad;
             int   pgSize     = pcw * pcw;
             int   maxHops    = (int)(_biomeBlendRadius / coarseStep) + 1;
+            int   center     = pad * pcw + pad;
 
-            // Reuse class-level scratch buffers (safe: this is never called from inside Carve()).
-            if (_biomeGrid == null || _biomeGrid.Length < pgSize) _biomeGrid = new int[pgSize];
+            int fracStride = pgSize * MaxBiomeSlots;
+            if (_biomeFrac == null || _biomeFrac.Length < fracStride) _biomeFrac = new float[fracStride];
+            Array.Clear(_biomeFrac, 0, fracStride);
             if (_biomeDist == null || _biomeDist.Length < pgSize) _biomeDist = new int[pgSize];
             if (_biomeBfsQ == null || _biomeBfsQ.Length < pgSize) _biomeBfsQ = new int[pgSize];
 
+            var biomeSlot = new Dictionary<int, int>(MaxBiomeSlots);
+            float subWeight = 1f / (SuperN * SuperN);
             for (int px = 0; px < pcw; px++)
             for (int pz = 0; pz < pcw; pz++)
-                _biomeGrid[px * pcw + pz] = (int)wg.GetBiome(
-                    worldX + (px - pad) * coarseStep,
-                    worldZ + (pz - pad) * coarseStep);
-
-            var seenBiomes = new System.Collections.Generic.HashSet<int>();
-            for (int i = 0; i < pgSize; i++) seenBiomes.Add(_biomeGrid[i]);
+            {
+                float cx = worldX + (px - pad) * coarseStep;
+                float cz = worldZ + (pz - pad) * coarseStep;
+                int cellBase = (px * pcw + pz) * MaxBiomeSlots;
+                for (int si = 0; si < SuperN; si++)
+                for (int sk = 0; sk < SuperN; sk++)
+                {
+                    int b = (int)wg.GetBiome(cx + (si + 0.5f) * coarseStep / SuperN,
+                                             cz + (sk + 0.5f) * coarseStep / SuperN);
+                    if (!biomeSlot.TryGetValue(b, out int slot))
+                    {
+                        if (biomeSlot.Count >= MaxBiomeSlots) continue;
+                        slot = biomeSlot.Count;
+                        biomeSlot[b] = slot;
+                    }
+                    _biomeFrac[cellBase + slot] += subWeight;
+                }
+            }
 
             var   result = new CaveProfile();
             float totW   = 0f;
-            int   center = pad * pcw + pad;
 
-            foreach (int biomeInt in seenBiomes)
+            foreach (var (biomeInt, slot) in biomeSlot)
             {
                 int qHead = 0, qTail = 0;
                 for (int i = 0; i < pgSize; i++)
                 {
-                    if (_biomeGrid[i] == biomeInt) { _biomeDist[i] = 0; _biomeBfsQ[qTail++] = i; }
+                    if (_biomeFrac[i * MaxBiomeSlots + slot] > 0f)
+                        { _biomeDist[i] = 0; _biomeBfsQ[qTail++] = i; }
                     else _biomeDist[i] = int.MaxValue;
                 }
                 while (qHead < qTail)
@@ -777,6 +945,8 @@ namespace VoxCaves
                 float tC = distC * coarseStep / _biomeBlendRadius;
                 float w  = _biomeBlendSmooth ? 1f - tC * tC * (3f - 2f * tC) : 1f - tC;
                 if (w <= 0f) continue;
+                if (distC == 0) w *= _biomeFrac[center * MaxBiomeSlots + slot];
+                if (w <= 0f) continue;
                 totW += w;
                 var prof = profs.TryGetValue((Heightmap.Biome)biomeInt, out var p) ? p : CaveProfile.Default;
                 result.modeB_radius         += w*prof.modeB_radius;    result.modeB_warpAmp       += w*prof.modeB_warpAmp;
@@ -787,12 +957,14 @@ namespace VoxCaves
                 result.modeA_warpAmp        += w*prof.modeA_warpAmp;   result.modeA_warpFrequency += w*prof.modeA_warpFrequency;
                 result.modeA_vScale         += w*prof.modeA_vScale;    result.modeA_widthVary     += w*prof.modeA_widthVary;
                 result.modeA_widthFrequency += w*prof.modeA_widthFrequency;
+                result.modeA_yOffset        += w*prof.modeA_yOffset;
                 result.modeC_threshold      += w*prof.modeC_threshold; result.modeC_noiseAmp      += w*prof.modeC_noiseAmp;
                 result.modeC_frequency      += w*prof.modeC_frequency; result.modeC_warpAmp       += w*prof.modeC_warpAmp;
                 result.modeC_warpFrequency  += w*prof.modeC_warpFrequency; result.modeC_vScale    += w*prof.modeC_vScale;
                 result.modeC_twist          += w*prof.modeC_twist;     result.modeC_twistVary     += w*prof.modeC_twistVary;
                 result.modeC_twistFrequency += w*prof.modeC_twistFrequency; result.modeC_ampVary  += w*prof.modeC_ampVary;
                 result.modeC_ampFrequency   += w*prof.modeC_ampFrequency;
+                result.modeC_yOffset        += w*prof.modeC_yOffset;
                 result.blur_passes          += w*prof.blur_passes;     result.perona_k            += w*prof.perona_k;
                 result.perona_lambda        += w*prof.perona_lambda;   result.floorDepth          += w*prof.floorDepth;
             }
@@ -803,11 +975,11 @@ namespace VoxCaves
                 result.modeB_vScale*=rcp; result.modeB_noiseAmp*=rcp; result.modeB_yOffset*=rcp; result.modeB_twist*=rcp;
                 result.modeA_width*=rcp; result.modeA_frequency*=rcp; result.modeA_warpAmp*=rcp;
                 result.modeA_warpFrequency*=rcp; result.modeA_vScale*=rcp; result.modeA_widthVary*=rcp;
-                result.modeA_widthFrequency*=rcp;
+                result.modeA_widthFrequency*=rcp; result.modeA_yOffset*=rcp;
                 result.modeC_threshold*=rcp; result.modeC_noiseAmp*=rcp; result.modeC_frequency*=rcp;
                 result.modeC_warpAmp*=rcp; result.modeC_warpFrequency*=rcp; result.modeC_vScale*=rcp;
                 result.modeC_twist*=rcp; result.modeC_twistVary*=rcp; result.modeC_twistFrequency*=rcp;
-                result.modeC_ampVary*=rcp; result.modeC_ampFrequency*=rcp;
+                result.modeC_ampVary*=rcp; result.modeC_ampFrequency*=rcp; result.modeC_yOffset*=rcp;
                 result.blur_passes*=rcp; result.perona_k*=rcp; result.perona_lambda*=rcp; result.floorDepth*=rcp;
             }
             return result;
@@ -826,24 +998,42 @@ namespace VoxCaves
                 profs.TryGetValue(b, out var p) ? p : CaveProfile.Default;
 
             float coarseStep = 4f * s;
-            // Pad enough that BFS can reach blendRadius world units from every edge cell.
-            int pad   = (int)(_biomeBlendRadius / coarseStep) + 2;
-            int pcw   = cw4 + 2 * pad;
+            int pad    = (int)(_biomeBlendRadius / coarseStep) + 2;
+            int pcw    = cw4 + 2 * pad;
             int pgSize = pcw * pcw;
+            int maxHops = (int)(_biomeBlendRadius / coarseStep) + 1;
 
-            // ── Step 1: sample GetBiome on padded grid ───────────────────────────────
-            if (_biomeGrid == null || _biomeGrid.Length < pgSize) _biomeGrid = new int[pgSize];
+            // ── Step 1: supersample GetBiome — SuperN×SuperN calls per coarse cell ──
+            // Each cell gets fractional membership per biome rather than a single hard label.
+            // This eliminates the aliasing artifact where one zone shows more BF influence
+            // than its neighbor simply because its single sample fell inside a thin biome finger.
+            int fracStride = pgSize * MaxBiomeSlots;
+            if (_biomeFrac == null || _biomeFrac.Length < fracStride) _biomeFrac = new float[fracStride];
+            Array.Clear(_biomeFrac, 0, fracStride);
+
+            var biomeSlot = new Dictionary<int, int>(MaxBiomeSlots);
+            float subWeight = 1f / (SuperN * SuperN);
             for (int px = 0; px < pcw; px++)
             for (int pz = 0; pz < pcw; pz++)
             {
-                int gx = ox - overlap + (px - pad) * 4;
-                int gz = oz - overlap + (pz - pad) * 4;
-                _biomeGrid[px * pcw + pz] = (int)wg.GetBiome(gx * s, gz * s);
+                int gx0 = ox - overlap + (px - pad) * 4;
+                int gz0 = oz - overlap + (pz - pad) * 4;
+                int cellBase = (px * pcw + pz) * MaxBiomeSlots;
+                for (int si = 0; si < SuperN; si++)
+                for (int sk = 0; sk < SuperN; sk++)
+                {
+                    float wx = (gx0 + (si + 0.5f) * 4f / SuperN) * s;
+                    float wz = (gz0 + (sk + 0.5f) * 4f / SuperN) * s;
+                    int b = (int)wg.GetBiome(wx, wz);
+                    if (!biomeSlot.TryGetValue(b, out int slot))
+                    {
+                        if (biomeSlot.Count >= MaxBiomeSlots) continue;
+                        slot = biomeSlot.Count;
+                        biomeSlot[b] = slot;
+                    }
+                    _biomeFrac[cellBase + slot] += subWeight;
+                }
             }
-
-            // Collect distinct biomes present in the padded grid.
-            var seenBiomes = new System.Collections.Generic.HashSet<int>();
-            for (int i = 0; i < pgSize; i++) seenBiomes.Add(_biomeGrid[i]);
 
             // ── Step 2: per-biome BFS distance transform + accumulate ────────────────
             int cellCount = cw4 * cw4;
@@ -854,21 +1044,18 @@ namespace VoxCaves
             for (int i = 0; i < cellCount; i++) { _blendedProfs[i] = new CaveProfile(); _biomeTotW[i] = 0f; }
 
             if (_biomeDist == null || _biomeDist.Length < pgSize) _biomeDist = new int[pgSize];
-            // BFS queue: worst case every padded cell is enqueued.
             if (_biomeBfsQ == null || _biomeBfsQ.Length < pgSize) _biomeBfsQ = new int[pgSize];
 
-            // Max BFS hops before weight reaches zero (blendRadius in coarse cells, rounded up).
-            int maxHops = (int)(_biomeBlendRadius / coarseStep) + 1;
-
-            foreach (int biomeInt in seenBiomes)
+            foreach (var (biomeInt, slot) in biomeSlot)
             {
                 var prof = GetP((Heightmap.Biome)biomeInt);
 
-                // Multi-source BFS: seed from every cell of this biome, distance = 0.
+                // Multi-source BFS: seed from every cell that has any fraction of this biome.
                 int qHead = 0, qTail = 0;
                 for (int i = 0; i < pgSize; i++)
                 {
-                    if (_biomeGrid[i] == biomeInt) { _biomeDist[i] = 0; _biomeBfsQ[qTail++] = i; }
+                    if (_biomeFrac[i * MaxBiomeSlots + slot] > 0f)
+                        { _biomeDist[i] = 0; _biomeBfsQ[qTail++] = i; }
                     else _biomeDist[i] = int.MaxValue;
                 }
                 while (qHead < qTail)
@@ -877,7 +1064,6 @@ namespace VoxCaves
                     int nd   = _biomeDist[cell] + 1;
                     if (nd > maxHops) continue;
                     int px = cell / pcw, pz = cell % pcw;
-                    // 4-connected neighbors
                     if (px > 0)     { int n = cell - pcw; if (_biomeDist[n] > nd) { _biomeDist[n] = nd; _biomeBfsQ[qTail++] = n; } }
                     if (px < pcw-1) { int n = cell + pcw; if (_biomeDist[n] > nd) { _biomeDist[n] = nd; _biomeBfsQ[qTail++] = n; } }
                     if (pz > 0)     { int n = cell - 1;   if (_biomeDist[n] > nd) { _biomeDist[n] = nd; _biomeBfsQ[qTail++] = n; } }
@@ -885,13 +1071,21 @@ namespace VoxCaves
                 }
 
                 // Accumulate weighted profile into each inner coarse cell.
+                // At distance 0, scale by fractional membership so a cell that is 50% BF
+                // contributes half as much as a fully-BF cell at the same distance.
                 for (int cx4 = 0; cx4 < cw4; cx4++)
                 for (int cz4 = 0; cz4 < cw4; cz4++)
                 {
-                    int distCells = _biomeDist[(cx4 + pad) * pcw + (cz4 + pad)];
+                    int pIdx = (cx4 + pad) * pcw + (cz4 + pad);
+                    int distCells = _biomeDist[pIdx];
                     if (distCells > maxHops) continue;
-                    float t = distCells * coarseStep / _biomeBlendRadius;  // 0 at biome edge, 1 at blend limit
+                    float t = distCells * coarseStep / _biomeBlendRadius;
                     float w = _biomeBlendSmooth ? 1f - t * t * (3f - 2f * t) : 1f - t;
+                    if (w <= 0f) continue;
+                    // Scale by fractional membership at the seed cell (distance 0 only).
+                    // For propagated cells (dist > 0) the full falloff weight applies as-is.
+                    if (distCells == 0)
+                        w *= _biomeFrac[pIdx * MaxBiomeSlots + slot];
                     if (w <= 0f) continue;
                     int idx = cx4 * cw4 + cz4;
                     ref var acc = ref _blendedProfs[idx];
@@ -910,6 +1104,7 @@ namespace VoxCaves
                     acc.modeA_vScale          += w * prof.modeA_vScale;
                     acc.modeA_widthVary       += w * prof.modeA_widthVary;
                     acc.modeA_widthFrequency  += w * prof.modeA_widthFrequency;
+                    acc.modeA_yOffset         += w * prof.modeA_yOffset;
                     acc.modeC_threshold       += w * prof.modeC_threshold;
                     acc.modeC_noiseAmp        += w * prof.modeC_noiseAmp;
                     acc.modeC_frequency       += w * prof.modeC_frequency;
@@ -921,6 +1116,7 @@ namespace VoxCaves
                     acc.modeC_twistFrequency  += w * prof.modeC_twistFrequency;
                     acc.modeC_ampVary         += w * prof.modeC_ampVary;
                     acc.modeC_ampFrequency    += w * prof.modeC_ampFrequency;
+                    acc.modeC_yOffset         += w * prof.modeC_yOffset;
                     acc.blur_passes           += w * prof.blur_passes;
                     acc.perona_k              += w * prof.perona_k;
                     acc.perona_lambda         += w * prof.perona_lambda;
@@ -940,12 +1136,12 @@ namespace VoxCaves
                 p.modeB_noiseAmp        *= rcp; p.modeB_yOffset       *= rcp; p.modeB_twist *= rcp;
                 p.modeA_width           *= rcp; p.modeA_frequency     *= rcp;
                 p.modeA_warpAmp         *= rcp; p.modeA_warpFrequency *= rcp;
-                p.modeA_vScale          *= rcp; p.modeA_widthVary     *= rcp; p.modeA_widthFrequency *= rcp;
+                p.modeA_vScale          *= rcp; p.modeA_widthVary     *= rcp; p.modeA_widthFrequency *= rcp; p.modeA_yOffset *= rcp;
                 p.modeC_threshold       *= rcp; p.modeC_noiseAmp      *= rcp;
                 p.modeC_frequency       *= rcp; p.modeC_warpAmp       *= rcp;
                 p.modeC_warpFrequency   *= rcp; p.modeC_vScale        *= rcp;
                 p.modeC_twist           *= rcp; p.modeC_twistVary     *= rcp; p.modeC_twistFrequency *= rcp;
-                p.modeC_ampVary         *= rcp; p.modeC_ampFrequency  *= rcp;
+                p.modeC_ampVary         *= rcp; p.modeC_ampFrequency  *= rcp; p.modeC_yOffset *= rcp;
                 p.blur_passes           *= rcp; p.perona_k            *= rcp;
                 p.perona_lambda         *= rcp; p.floorDepth          *= rcp;
             }
@@ -1105,6 +1301,7 @@ namespace VoxCaves
             int   nb2Size = cw4 * cw4;
             if (_noiseBuf  == null || _noiseBuf.Length  < nb4Size) _noiseBuf  = new float[nb4Size];
             if (_tunBuf    == null || _tunBuf.Length    < nb4Size) _tunBuf    = new float[nb4Size];
+            if (_tunBuf2   == null || _tunBuf2.Length   < nb4Size) _tunBuf2   = new float[nb4Size];
             if (_tunWBuf   == null || _tunWBuf.Length   < nb4Size) _tunWBuf   = new float[nb4Size];
             if (_bk2dAddH  == null || _bk2dAddH.Length  < nb2Size) _bk2dAddH  = new float[nb2Size];
             if (_bk2dLAmp  == null || _bk2dLAmp.Length  < nb2Size) _bk2dLAmp  = new float[nb2Size];
@@ -1125,10 +1322,27 @@ namespace VoxCaves
             if (_bk2dMaw   == null || _bk2dMaw.Length   < nb2Size) _bk2dMaw   = new float[nb2Size];
             if (_bk2dMawv  == null || _bk2dMawv.Length  < nb2Size) _bk2dMawv  = new float[nb2Size];
             if (_bk2dMawvf == null || _bk2dMawvf.Length < nb2Size) _bk2dMawvf = new float[nb2Size];
+            if (_bk2dMayo  == null || _bk2dMayo.Length  < nb2Size) _bk2dMayo  = new float[nb2Size];
             // BakeBlendedProfiles already ran above (before hiMargin); _blendedProfs is current.
 
-            // 2D param bake — copy from pre-blurred profiles into _bk2d* arrays for Phase 1.
+            // Pre-scan profiles to determine bakeC/bakeA BEFORE the bake loop.
+            // bakeC/bakeA must be known up-front so that every coarse cell writes _bk2dAddH /
+            // _noiseBuf regardless of its own noiseAmp — cells processed before the first
+            // active cell would otherwise leave those arrays holding stale data from the
+            // previous zone, corrupting the bilinear interpolation in Phase 1.
             bool anyMbActive = false;
+            if (_blendedProfs != null)
+            {
+                for (int i = 0; i < nb2Size && i < _blendedProfs.Length; i++)
+                {
+                    if (_blendedProfs[i].modeC_noiseAmp > 0f) bakeC = true;
+                    if (_blendedProfs[i].modeA_width    > 0f) bakeA = true;
+                    if (_blendedProfs[i].modeB_radius   > 0f) anyMbActive = true;
+                    if (bakeC && bakeA && anyMbActive) break;
+                }
+            }
+
+            // 2D param bake — copy from pre-blurred profiles into _bk2d* arrays for Phase 1.
             for (int cx4 = 0; cx4 < cw4; cx4++)
             for (int cz4 = 0; cz4 < cw4; cz4++)
             {
@@ -1157,9 +1371,8 @@ namespace VoxCaves
                 _bk2dMaw! [idx2] = p4.modeA_width;
                 _bk2dMawv![idx2] = p4.modeA_widthVary;
                 _bk2dMawvf![idx2]= p4.modeA_widthFrequency;
-                if (p4.modeB_radius > 0f) anyMbActive = true;
-                if (p4.modeC_noiseAmp > 0f) bakeC = true;
-                if (p4.modeA_width > 0f) bakeA = true;
+                _bk2dMayo! [idx2]= p4.modeA_yOffset;
+                // (bakeC / bakeA / anyMbActive already pre-scanned above)
 
 
                 // Mode C anchor quantities — only needed when modeC is active.
@@ -1168,7 +1381,7 @@ namespace VoxCaves
                     float awf4  = p4.modeC_warpFrequency;
                     float awx4  = _hmAddWarpX!.GetNoise(wx4 * awf4, wz4 * awf4) * p4.modeC_warpAmp;
                     float awz4  = _hmAddWarpZ!.GetNoise(wx4 * awf4, wz4 * awf4) * p4.modeC_warpAmp;
-                    float addH4 = wg!.GetHeight(wx4 + awx4, wz4 + awz4);
+                    float addH4    = wg!.GetHeight(wx4 + awx4, wz4 + awz4) - p4.modeC_yOffset;
                     float avf4  = p4.modeC_ampFrequency;
                     _bk2dAddH![idx2] = addH4;
                     _bk2dLAmp![idx2] = Mathf.Max(p4.modeC_noiseAmp * (1f + p4.modeC_ampVary
@@ -1212,20 +1425,25 @@ namespace VoxCaves
                     float maf4   = _bk2dMaf!  [idx2];
                     float mavs4  = _bk2dMavs! [idx2];
                     float mawvf4 = _bk2dMawvf![idx2];
+                    float mayo4  = p4.modeA_yOffset;
+                    float addHA4 = mayo4 > 0f ? wg!.GetHeight(wx4, wz4) : 0f;
                     int baseIdxA = cx4 * cw4 * bh + cz4 * bh;
                     for (int cy = 0; cy < bh; cy++)
                     {
-                        float sy4  = (extLo + cy) * s * mavs4;
-                        float awx4 = _warpX!.GetNoise(wx4 * mawf4, sy4 * mawf4, wz4 * mawf4) * mawa4;
-                        float awz4 = _warpZ!.GetNoise(wx4 * mawf4, sy4 * mawf4, wz4 * mawf4) * mawa4;
-                        _tunBuf! [baseIdxA + cy] = _caveNoise!.GetNoise((wx4 + awx4) * maf4, sy4 * maf4, (wz4 + awz4) * maf4);
+                        float sy4   = ((extLo + cy) * s - addHA4 + mayo4) * mavs4;
+                        float awx4  = _warpX! .GetNoise(wx4 * mawf4, sy4 * mawf4, wz4 * mawf4) * mawa4;
+                        float awz4  = _warpZ! .GetNoise(wx4 * mawf4, sy4 * mawf4, wz4 * mawf4) * mawa4;
+                        float awx4b = _warpX2!.GetNoise(wx4 * mawf4, sy4 * mawf4, wz4 * mawf4) * mawa4;
+                        float awz4b = _warpZ2!.GetNoise(wx4 * mawf4, sy4 * mawf4, wz4 * mawf4) * mawa4;
+                        _tunBuf! [baseIdxA + cy] = _caveNoise! .GetNoise((wx4 + awx4)  * maf4, sy4 * maf4, (wz4 + awz4)  * maf4);
+                        _tunBuf2![baseIdxA + cy] = _caveNoise2!.GetNoise((wx4 + awx4b) * maf4, sy4 * maf4, (wz4 + awz4b) * maf4);
                         _tunWBuf![baseIdxA + cy] = _widthNoise!.GetNoise(wx4 * mawvf4, sy4 * mawvf4, wz4 * mawvf4);
                     }
                 }
                 else if (bakeA)
                 {
                     int baseIdxA = cx4 * cw4 * bh + cz4 * bh;
-                    for (int cy = 0; cy < bh; cy++) { _tunBuf![baseIdxA + cy] = 0f; _tunWBuf![baseIdxA + cy] = 0f; }
+                    for (int cy = 0; cy < bh; cy++) { _tunBuf![baseIdxA + cy] = 0f; _tunBuf2![baseIdxA + cy] = 0f; _tunWBuf![baseIdxA + cy] = 0f; }
                 }
             }
             // Full-res Mode B warpedH bake — eliminates wg.GetHeight from Phase 1.
@@ -1366,7 +1584,7 @@ namespace VoxCaves
             // Runs after blur so that blur can't sever thin solid necks and leave
             // bulbs disconnected. BFS from cy=0 (always solid ground); any solid voxel
             // unreachable from the bottom is a post-blur floating island.
-            {
+            if (_islandRemoval) {
                 int islandBufSize = bw * bh * bw;
                 int stride_x      = bh * bw;
                 if (_visitedBuf  == null || _visitedBuf.Length  < islandBufSize) _visitedBuf  = new bool[islandBufSize];
@@ -1404,6 +1622,63 @@ namespace VoxCaves
                     if (!_visitedBuf[i] && buf[i] < 0f) { buf[i] = s; removed++; }
 
                 Log.LogInfo($"[VoxCaves] island-fill zone ({ox},{oz}): seeds={qTail} removed={removed}");
+            }
+
+            // ── Phase 2.6: Sealed underground pocket removal ──────────────────────────
+            // BFS from all boundary air voxels (top face + 4 side faces).
+            // Any air voxel unreachable from the boundary is a sealed pocket → fill solid.
+            // Seeding from side faces treats zone-edge caves as open (conservative).
+            if (_pocketRemoval) {
+                Array.Clear(_visitedBuf!, 0, bw * bh * bw);
+                int stride_x = bh * bw;
+                int qHead = 0, qTail = 0;
+
+                void TryEnqueueAir(int i)
+                {
+                    if (!_visitedBuf![i] && buf[i] >= 0f) { _visitedBuf[i] = true; _islandQueue![qTail++] = i; }
+                }
+
+                // Top face (cy = bh-1)
+                for (int cx = 0; cx < bw; cx++)
+                for (int cz = 0; cz < bw; cz++)
+                    TryEnqueueAir(cx * stride_x + (bh - 1) * bw + cz);
+
+                // Side faces (cx=0, cx=bw-1, cz=0, cz=bw-1)
+                for (int cy = 0; cy < bh; cy++)
+                for (int cz = 0; cz < bw; cz++)
+                {
+                    TryEnqueueAir(0          * stride_x + cy * bw + cz);
+                    TryEnqueueAir((bw - 1)   * stride_x + cy * bw + cz);
+                }
+                for (int cx = 0; cx < bw; cx++)
+                for (int cy = 0; cy < bh; cy++)
+                {
+                    TryEnqueueAir(cx * stride_x + cy * bw + 0);
+                    TryEnqueueAir(cx * stride_x + cy * bw + (bw - 1));
+                }
+
+                while (qHead < qTail)
+                {
+                    int idx = _islandQueue![qHead++];
+                    int cx  = idx / stride_x;
+                    int rem = idx % stride_x;
+                    int cy  = rem / bw;
+                    int cz  = rem % bw;
+                    int ni;
+                    if (cx > 0)    { ni = idx - stride_x; if (!_visitedBuf![ni] && buf[ni] >= 0f) { _visitedBuf[ni] = true; _islandQueue[qTail++] = ni; } }
+                    if (cx < bw-1) { ni = idx + stride_x; if (!_visitedBuf![ni] && buf[ni] >= 0f) { _visitedBuf[ni] = true; _islandQueue[qTail++] = ni; } }
+                    if (cy > 0)    { ni = idx - bw;        if (!_visitedBuf![ni] && buf[ni] >= 0f) { _visitedBuf[ni] = true; _islandQueue[qTail++] = ni; } }
+                    if (cy < bh-1) { ni = idx + bw;        if (!_visitedBuf![ni] && buf[ni] >= 0f) { _visitedBuf[ni] = true; _islandQueue[qTail++] = ni; } }
+                    if (cz > 0)    { ni = idx - 1;         if (!_visitedBuf![ni] && buf[ni] >= 0f) { _visitedBuf[ni] = true; _islandQueue[qTail++] = ni; } }
+                    if (cz < bw-1) { ni = idx + 1;         if (!_visitedBuf![ni] && buf[ni] >= 0f) { _visitedBuf[ni] = true; _islandQueue[qTail++] = ni; } }
+                }
+
+                int filled = 0;
+                int total  = bw * bh * bw;
+                for (int i = 0; i < total; i++)
+                    if (!_visitedBuf![i] && buf[i] >= 0f) { buf[i] = -s; filled++; }
+
+                Log.LogInfo($"[VoxCaves] pocket-fill zone ({ox},{oz}): filled={filled}");
             }
 
             // ── Phase 3: Write SDF directly to VoxelField via the 'field' parameter ────
@@ -1504,11 +1779,25 @@ namespace VoxCaves
                 sb.AppendLine("{");
                 sb.AppendLine($"  \"zone\": {{ \"ox\": {ox}, \"oz\": {oz}, \"overlap\": {overlap}, \"s\": {s}, \"bw\": {bw}, \"bh\": {bh}, \"extLo\": {extLo}, \"cw4\": {cw4}, \"blendRadius\": {_biomeBlendRadius} }},");
 
-                // ── Biome grid (padded) ──────────────────────────────────────────
+                // ── Biome grid (padded) — dominant biome per cell from _biomeFrac ──
                 sb.Append("  \"biomeGrid\": { \"pcw\": "); sb.Append(pcw); sb.AppendLine(",");
                 sb.Append("    \"data\": [");
-                if (_biomeGrid != null)
-                    for (int i = 0; i < pcw * pcw; i++) { if (i > 0) sb.Append(','); sb.Append(_biomeGrid[i]); }
+                // _biomeFrac is [pgSize * MaxBiomeSlots]; we emit the dominant slot index (not biome enum)
+                // as a rough visual aid — slot 0 = first biome seen, etc.
+                if (_biomeFrac != null)
+                {
+                    for (int i = 0; i < pcw * pcw; i++)
+                    {
+                        if (i > 0) sb.Append(',');
+                        int dom = 0; float domF = 0f;
+                        for (int sl = 0; sl < MaxBiomeSlots; sl++)
+                        {
+                            float f = _biomeFrac[i * MaxBiomeSlots + sl];
+                            if (f > domF) { domF = f; dom = sl; }
+                        }
+                        sb.Append(dom);
+                    }
+                }
                 sb.AppendLine("] },");
 
                 // ── Blended profiles per coarse cell ────────────────────────────
@@ -1519,7 +1808,9 @@ namespace VoxCaves
                     int idx = cx4 * cw4 + cz4;
                     bool last = (cx4 == cw4 - 1 && cz4 == cw4 - 1);
                     float wx = (ox - overlap + cx4 * 4) * s, wz = (oz - overlap + cz4 * 4) * s;
-                    int biomeRaw = (_biomeGrid != null) ? _biomeGrid[(cx4 + pad) * pcw + (cz4 + pad)] : -1;
+                    int pIdx2 = (cx4 + pad) * pcw + (cz4 + pad);
+                    int biomeRaw = -1;
+                    if (_biomeFrac != null) { float domF2=0f; for(int sl=0;sl<MaxBiomeSlots;sl++){float f=_biomeFrac[pIdx2*MaxBiomeSlots+sl];if(f>domF2){domF2=f;biomeRaw=sl;}} }
                     float totW  = (_biomeTotW    != null && idx < _biomeTotW.Length)    ? _biomeTotW[idx]    : -1f;
                     float mcAmp = (_blendedProfs != null && idx < _blendedProfs.Length) ? _blendedProfs[idx].modeC_noiseAmp : -1f;
                     float mbR2  = (_blendedProfs != null && idx < _blendedProfs.Length) ? _blendedProfs[idx].modeB_radius   : -1f;
@@ -1552,16 +1843,54 @@ namespace VoxCaves
                 string outPath = Path.Combine(BepInEx.Paths.ConfigPath, $"voxcaves_dump_{ox}_{oz}.json");
                 File.WriteAllText(outPath, sb.ToString());
                 Log.LogInfo($"[VoxCaves] Dump written → {outPath}");
-                Terminal.Log($"[VoxCaves] Dump → {outPath}");
+                Log.LogInfo($"[VoxCaves] Dump → {outPath}");
             }
             catch (Exception ex) { Log.LogError($"[VoxCaves] Dump failed: {ex.Message}"); }
         }
 
         // ── Hot-reload: re-run the full voxel pipeline on every loaded zone ───────
+        internal static void ResetWorldState()
+        {
+            LoadBiomeConfig();
+            _pendingVegCleanup = true;
+            _zoneObjects.Clear();
+            _zoneParams.Clear();
+            _zoneMaxY.Clear();
+            _zoneExtHi.Clear();
+            _sdfCache.Clear();
+            _profileCache.Clear();
+            _heightCache.Clear();
+            _locationPositions.Clear();
+            _locationsCached = false;
+            _caveNoise       = null;
+            _caveNoise2      = null;
+            _warpX           = null;
+            _warpZ           = null;
+            _warpX2          = null;
+            _warpZ2          = null;
+            _hmWarpX         = null;
+            _hmWarpZ         = null;
+            _hmAddWarpX      = null;
+            _hmAddWarpZ      = null;
+            _addNoise        = null;
+            _addVaryNoise    = null;
+            _widthNoise      = null;
+            _twistVaryNoise  = null;
+            _mbNoise         = null;
+        }
+
         static void RecarveAll()
         {
             Log.LogInfo($"[VoxCaves] Hot-reload: re-voxelizing {_zoneParams.Count} zone(s).");
+            // Clear all config-derived and geometry-derived caches so the re-voxelization
+            // starts from a clean slate. _zoneParams and _zoneObjects are kept because
+            // they are the iteration target — the zone objects and geometry metadata
+            // (origin, width, yLo/yHi) are world-geometry facts, not profile-dependent.
             _sdfCache.Clear();
+            _profileCache.Clear();
+            _heightCache.Clear();
+            _zoneMaxY.Clear();
+            _zoneExtHi.Clear();
             if (_voxelizeColumnsMethod == null) return;
             bool canRemesh = _enqueueMeshMethod != null && _finishSkinNowMethod != null && _int3Ctor != null;
             if (!canRemesh)
@@ -1728,26 +2057,35 @@ namespace VoxCaves
 
                 if (mAw > 0f)
                 {
-                    float n, wn;
+                    float na, nb, wn;
                     if (bakeA)
                     {
-                        float n0 = _tunBuf![bb00+cy] + (_tunBuf[bb10+cy] - _tunBuf[bb00+cy]) * bfx;
-                        float n1 = _tunBuf![bb01+cy] + (_tunBuf[bb11+cy] - _tunBuf[bb01+cy]) * bfx;
-                        n  = n0 + (n1 - n0) * bfz;
+                        float t0 = _tunBuf![bb00+cy]  + (_tunBuf[bb10+cy]  - _tunBuf[bb00+cy])  * bfx;
+                        float t1 = _tunBuf![bb01+cy]  + (_tunBuf[bb11+cy]  - _tunBuf[bb01+cy])  * bfx;
+                        na = t0 + (t1 - t0) * bfz;
+                        float t0b = _tunBuf2![bb00+cy] + (_tunBuf2[bb10+cy] - _tunBuf2[bb00+cy]) * bfx;
+                        float t1b = _tunBuf2![bb01+cy] + (_tunBuf2[bb11+cy] - _tunBuf2[bb01+cy]) * bfx;
+                        nb = t0b + (t1b - t0b) * bfz;
                         float w0 = _tunWBuf![bb00+cy] + (_tunWBuf[bb10+cy] - _tunWBuf[bb00+cy]) * bfx;
                         float w1 = _tunWBuf![bb01+cy] + (_tunWBuf[bb11+cy] - _tunWBuf[bb01+cy]) * bfx;
                         wn = w0 + (w1 - w0) * bfz;
                     }
                     else
                     {
-                        float sy = worldY * mAvs;
-                        float wx = _warpX!.GetNoise(worldX * mAwf, sy * mAwf, worldZ * mAwf) * mAwa;
-                        float wz = _warpZ!.GetNoise(worldX * mAwf, sy * mAwf, worldZ * mAwf) * mAwa;
-                        n  = _caveNoise!.GetNoise((worldX + wx) * mAf, sy * mAf, (worldZ + wz) * mAf);
+                        float sy  = worldY * mAvs;
+                        float wx  = _warpX! .GetNoise(worldX * mAwf, sy * mAwf, worldZ * mAwf) * mAwa;
+                        float wz  = _warpZ! .GetNoise(worldX * mAwf, sy * mAwf, worldZ * mAwf) * mAwa;
+                        float wx2 = _warpX2!.GetNoise(worldX * mAwf, sy * mAwf, worldZ * mAwf) * mAwa;
+                        float wz2 = _warpZ2!.GetNoise(worldX * mAwf, sy * mAwf, worldZ * mAwf) * mAwa;
+                        na = _caveNoise! .GetNoise((worldX + wx)  * mAf, sy * mAf, (worldZ + wz)  * mAf);
+                        nb = _caveNoise2!.GetNoise((worldX + wx2) * mAf, sy * mAf, (worldZ + wz2) * mAf);
                         wn = _widthNoise!.GetNoise(worldX * mAwvf, (worldY * mAvs) * mAwvf, worldZ * mAwvf);
                     }
                     float localWidth = Mathf.Max(mAw * (1f + mAwv * wn), 0.001f);
-                    float tunnelSDF = (localWidth - Mathf.Abs(n)) / localWidth * 4f * s;
+                    // L2 distance of two independent noise fields: intersection of two zero-crossing
+                    // sheets = cylindrical tube network. Normalized by 1/sqrt(2) to keep dist in ~[0,1].
+                    float dist      = Mathf.Sqrt(na * na + nb * nb) * 0.7071f;
+                    float tunnelSDF = (localWidth - dist) / localWidth * 4f * s;
                     float sdf = Mathf.Min(tunnelSDF, worldY - floorY);
                     combined = combined > sdf ? combined : sdf;
                 }
@@ -1797,26 +2135,35 @@ namespace VoxCaves
 
                 if (mAw > 0f)
                 {
-                    float n, wn;
+                    float na, nb, wn;
                     if (bakeA)
                     {
-                        float n0 = _tunBuf![bb00+cy] + (_tunBuf[bb10+cy] - _tunBuf[bb00+cy]) * bfx;
-                        float n1 = _tunBuf![bb01+cy] + (_tunBuf[bb11+cy] - _tunBuf[bb01+cy]) * bfx;
-                        n  = n0 + (n1 - n0) * bfz;
+                        float t0 = _tunBuf![bb00+cy]  + (_tunBuf[bb10+cy]  - _tunBuf[bb00+cy])  * bfx;
+                        float t1 = _tunBuf![bb01+cy]  + (_tunBuf[bb11+cy]  - _tunBuf[bb01+cy])  * bfx;
+                        na = t0 + (t1 - t0) * bfz;
+                        float t0b = _tunBuf2![bb00+cy] + (_tunBuf2[bb10+cy] - _tunBuf2[bb00+cy]) * bfx;
+                        float t1b = _tunBuf2![bb01+cy] + (_tunBuf2[bb11+cy] - _tunBuf2[bb01+cy]) * bfx;
+                        nb = t0b + (t1b - t0b) * bfz;
                         float w0 = _tunWBuf![bb00+cy] + (_tunWBuf[bb10+cy] - _tunWBuf[bb00+cy]) * bfx;
                         float w1 = _tunWBuf![bb01+cy] + (_tunWBuf[bb11+cy] - _tunWBuf[bb01+cy]) * bfx;
                         wn = w0 + (w1 - w0) * bfz;
                     }
                     else
                     {
-                        float sy = worldY * mAvs;
-                        float wx = _warpX!.GetNoise(worldX * mAwf, sy * mAwf, worldZ * mAwf) * mAwa;
-                        float wz = _warpZ!.GetNoise(worldX * mAwf, sy * mAwf, worldZ * mAwf) * mAwa;
-                        n  = _caveNoise!.GetNoise((worldX + wx) * mAf, sy * mAf, (worldZ + wz) * mAf);
+                        float sy  = worldY * mAvs;
+                        float wx  = _warpX! .GetNoise(worldX * mAwf, sy * mAwf, worldZ * mAwf) * mAwa;
+                        float wz  = _warpZ! .GetNoise(worldX * mAwf, sy * mAwf, worldZ * mAwf) * mAwa;
+                        float wx2 = _warpX2!.GetNoise(worldX * mAwf, sy * mAwf, worldZ * mAwf) * mAwa;
+                        float wz2 = _warpZ2!.GetNoise(worldX * mAwf, sy * mAwf, worldZ * mAwf) * mAwa;
+                        na = _caveNoise! .GetNoise((worldX + wx)  * mAf, sy * mAf, (worldZ + wz)  * mAf);
+                        nb = _caveNoise2!.GetNoise((worldX + wx2) * mAf, sy * mAf, (worldZ + wz2) * mAf);
                         wn = _widthNoise!.GetNoise(worldX * mAwvf, (worldY * mAvs) * mAwvf, worldZ * mAwvf);
                     }
                     float localWidth = Mathf.Max(mAw * (1f + mAwv * wn), 0.001f);
-                    float tunnelSDF = (localWidth - Mathf.Abs(n)) / localWidth * 4f * s;
+                    // L2 distance of two independent noise fields: intersection of two zero-crossing
+                    // sheets = cylindrical tube network. Normalized by 1/sqrt(2) to keep dist in ~[0,1].
+                    float dist      = Mathf.Sqrt(na * na + nb * nb) * 0.7071f;
+                    float tunnelSDF = (localWidth - dist) / localWidth * 4f * s;
                     float sdf = Mathf.Min(tunnelSDF, worldY - floorY);
                     combined = combined > sdf ? combined : sdf;
                 }
@@ -1847,26 +2194,35 @@ namespace VoxCaves
 
                 if (mAw > 0f)
                 {
-                    float n, wn;
+                    float na, nb, wn;
                     if (bakeA)
                     {
-                        float n0 = _tunBuf![bb00+cy] + (_tunBuf[bb10+cy] - _tunBuf[bb00+cy]) * bfx;
-                        float n1 = _tunBuf![bb01+cy] + (_tunBuf[bb11+cy] - _tunBuf[bb01+cy]) * bfx;
-                        n  = n0 + (n1 - n0) * bfz;
+                        float t0 = _tunBuf![bb00+cy]  + (_tunBuf[bb10+cy]  - _tunBuf[bb00+cy])  * bfx;
+                        float t1 = _tunBuf![bb01+cy]  + (_tunBuf[bb11+cy]  - _tunBuf[bb01+cy])  * bfx;
+                        na = t0 + (t1 - t0) * bfz;
+                        float t0b = _tunBuf2![bb00+cy] + (_tunBuf2[bb10+cy] - _tunBuf2[bb00+cy]) * bfx;
+                        float t1b = _tunBuf2![bb01+cy] + (_tunBuf2[bb11+cy] - _tunBuf2[bb01+cy]) * bfx;
+                        nb = t0b + (t1b - t0b) * bfz;
                         float w0 = _tunWBuf![bb00+cy] + (_tunWBuf[bb10+cy] - _tunWBuf[bb00+cy]) * bfx;
                         float w1 = _tunWBuf![bb01+cy] + (_tunWBuf[bb11+cy] - _tunWBuf[bb01+cy]) * bfx;
                         wn = w0 + (w1 - w0) * bfz;
                     }
                     else
                     {
-                        float sy = worldY * mAvs;
-                        float wx = _warpX!.GetNoise(worldX * mAwf, sy * mAwf, worldZ * mAwf) * mAwa;
-                        float wz = _warpZ!.GetNoise(worldX * mAwf, sy * mAwf, worldZ * mAwf) * mAwa;
-                        n  = _caveNoise!.GetNoise((worldX + wx) * mAf, sy * mAf, (worldZ + wz) * mAf);
+                        float sy  = worldY * mAvs;
+                        float wx  = _warpX! .GetNoise(worldX * mAwf, sy * mAwf, worldZ * mAwf) * mAwa;
+                        float wz  = _warpZ! .GetNoise(worldX * mAwf, sy * mAwf, worldZ * mAwf) * mAwa;
+                        float wx2 = _warpX2!.GetNoise(worldX * mAwf, sy * mAwf, worldZ * mAwf) * mAwa;
+                        float wz2 = _warpZ2!.GetNoise(worldX * mAwf, sy * mAwf, worldZ * mAwf) * mAwa;
+                        na = _caveNoise! .GetNoise((worldX + wx)  * mAf, sy * mAf, (worldZ + wz)  * mAf);
+                        nb = _caveNoise2!.GetNoise((worldX + wx2) * mAf, sy * mAf, (worldZ + wz2) * mAf);
                         wn = _widthNoise!.GetNoise(worldX * mAwvf, (worldY * mAvs) * mAwvf, worldZ * mAwvf);
                     }
                     float localWidth = Mathf.Max(mAw * (1f + mAwv * wn), 0.001f);
-                    float tunnelSDF = (localWidth - Mathf.Abs(n)) / localWidth * 4f * s;
+                    // L2 distance of two independent noise fields: intersection of two zero-crossing
+                    // sheets = cylindrical tube network. Normalized by 1/sqrt(2) to keep dist in ~[0,1].
+                    float dist      = Mathf.Sqrt(na * na + nb * nb) * 0.7071f;
+                    float tunnelSDF = (localWidth - dist) / localWidth * 4f * s;
                     float sdf = Mathf.Min(tunnelSDF, worldY - floorY);
                     combined = combined > sdf ? combined : sdf;
                 }
@@ -2064,32 +2420,16 @@ namespace VoxCaves
     [HarmonyPatch(typeof(ZNet), nameof(ZNet.SetServer))]
     static class WorldLoadPatch
     {
-        static void Postfix()
-        {
-            Plugin.LoadBiomeConfig();
-            Plugin._pendingVegCleanup = true; // run cliff + disableVegetation cleanup after world loads
-            Plugin._zoneObjects.Clear();
-            Plugin._zoneParams.Clear();
-            Plugin._zoneMaxY.Clear();
-            Plugin._zoneExtHi.Clear();
-            Plugin._sdfCache.Clear();
-            Plugin._profileCache.Clear();
-            Plugin._heightCache.Clear();
-            Plugin._locationPositions.Clear();
-            Plugin._locationsCached = false;
-            Plugin._caveNoise    = null;
-            Plugin._warpX        = null;
-            Plugin._warpZ        = null;
-            Plugin._hmWarpX      = null;
-            Plugin._hmWarpZ      = null;
-            Plugin._hmAddWarpX   = null;
-            Plugin._hmAddWarpZ   = null;
-            Plugin._addNoise        = null;
-            Plugin._addVaryNoise    = null;
-            Plugin._widthNoise      = null;
-            Plugin._twistVaryNoise  = null;
-            Plugin._mbNoise         = null;
-        }
+        static void Postfix() => Plugin.ResetWorldState();
+    }
+
+    // ZNet.Shutdown fires on logout / return to main menu in the same process.
+    // Without this, _heightCache and all zone dictionaries survive into the next
+    // world load, feeding the new world stale geometry from the previous seed.
+    [HarmonyPatch(typeof(ZNet), nameof(ZNet.Shutdown))]
+    static class WorldUnloadPatch
+    {
+        static void Prefix() => Plugin.ResetWorldState();
     }
 
     [HarmonyPatch]
