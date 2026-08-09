@@ -144,9 +144,18 @@ namespace VoxCaves
         internal static readonly Dictionary<string, int> _zoneMaxY  = new();
         internal static readonly Dictionary<string, int> _zoneExtHi = new(); // highest voxel Y ever written; used to size the reset range in hot-reload
 
-        // BlendProfile memoization: keyed by (gx4 << 32 | (uint)gz4) — coarse voxel coords.
-        // Cleared on world load and config reload; persists through RecarveAll (config unchanged).
+        // Profile cache — cleared on config reload; no longer populated (kept for compat with any external readers).
         internal static readonly Dictionary<long, CaveProfile> _profileCache = new();
+
+        // Scratch buffers for the biome pre-blur pass (Step 1–3 of the smooth-weight pipeline).
+        // _biomeGrid: padded GetBiome sample grid [px * pcw + pz], stores Heightmap.Biome as int.
+        // _blurRowA/B: temp 1-D blur buffers (one row at a time, reused for X then Z pass).
+        // _blendedProfs: blended CaveProfile at each coarse grid cell [cx4 * cw4 + cz4].
+        static int[]?         _biomeGrid    = null;  // padded GetBiome sample grid
+        static int[]?         _biomeDist    = null;  // BFS distance map scratch (per-biome)
+        static int[]?         _biomeBfsQ    = null;  // BFS queue scratch
+        static float[]?       _biomeTotW    = null;  // per-cell weight accumulator
+        static CaveProfile[]? _blendedProfs = null;  // blended profile at each coarse cell
 
         // Scratch buffers for floating-island BFS (Phase 1.5). Pre-allocated, resized on demand.
         static bool[]? _visitedBuf;
@@ -705,73 +714,236 @@ namespace VoxCaves
             return (prof.modeA_width - absN) / prof.modeA_width * prof.modeA_strength;
         }
 
-        // ── Biome profile blending ────────────────────────────────────────────────────
-        // 5×5 Gaussian kernel, step = blendRadius/2, σ = blendRadius/2.
-        // 25 samples give smooth symmetric blending across biome boundaries.
-        // No centre-biome gate — vanilla and active zones blend freely.
-        static CaveProfile BlendProfile(float worldX, float worldZ, WorldGenerator wg)
+        // ── Point-query biome blend (BFS distance, same approach as BakeBlendedProfiles) ──
+        // Used by callers outside Carve() that don't have a zone bake grid available.
+        static CaveProfile PointBlendProfile(float worldX, float worldZ, WorldGenerator wg, float s)
         {
-            float step  = _biomeBlendRadius * 0.5f;
-            float sigma = step;
-            var   profs = _biomeProfiles;
+            var   profs      = _biomeProfiles;
+            float coarseStep = 4f * s;
+            int   pad        = (int)(_biomeBlendRadius / coarseStep) + 2;
+            int   pcw        = 1 + 2 * pad;
+            int   pgSize     = pcw * pcw;
+            int   maxHops    = (int)(_biomeBlendRadius / coarseStep) + 1;
 
-            CaveProfile Get(Heightmap.Biome b) =>
+            // Reuse class-level scratch buffers (safe: this is never called from inside Carve()).
+            if (_biomeGrid == null || _biomeGrid.Length < pgSize) _biomeGrid = new int[pgSize];
+            if (_biomeDist == null || _biomeDist.Length < pgSize) _biomeDist = new int[pgSize];
+            if (_biomeBfsQ == null || _biomeBfsQ.Length < pgSize) _biomeBfsQ = new int[pgSize];
+
+            for (int px = 0; px < pcw; px++)
+            for (int pz = 0; pz < pcw; pz++)
+                _biomeGrid[px * pcw + pz] = (int)wg.GetBiome(
+                    worldX + (px - pad) * coarseStep,
+                    worldZ + (pz - pad) * coarseStep);
+
+            var seenBiomes = new System.Collections.Generic.HashSet<int>();
+            for (int i = 0; i < pgSize; i++) seenBiomes.Add(_biomeGrid[i]);
+
+            var   result = new CaveProfile();
+            float totW   = 0f;
+            int   center = pad * pcw + pad;
+
+            foreach (int biomeInt in seenBiomes)
+            {
+                int qHead = 0, qTail = 0;
+                for (int i = 0; i < pgSize; i++)
+                {
+                    if (_biomeGrid[i] == biomeInt) { _biomeDist[i] = 0; _biomeBfsQ[qTail++] = i; }
+                    else _biomeDist[i] = int.MaxValue;
+                }
+                while (qHead < qTail)
+                {
+                    int cell = _biomeBfsQ[qHead++];
+                    int nd   = _biomeDist[cell] + 1;
+                    if (nd > maxHops) continue;
+                    int px = cell / pcw, pz = cell % pcw;
+                    if (px > 0)     { int n=cell-pcw; if (_biomeDist[n]>nd){_biomeDist[n]=nd;_biomeBfsQ[qTail++]=n;} }
+                    if (px < pcw-1) { int n=cell+pcw; if (_biomeDist[n]>nd){_biomeDist[n]=nd;_biomeBfsQ[qTail++]=n;} }
+                    if (pz > 0)     { int n=cell-1;   if (_biomeDist[n]>nd){_biomeDist[n]=nd;_biomeBfsQ[qTail++]=n;} }
+                    if (pz < pcw-1) { int n=cell+1;   if (_biomeDist[n]>nd){_biomeDist[n]=nd;_biomeBfsQ[qTail++]=n;} }
+                }
+                int distC = _biomeDist[center];
+                if (distC > maxHops) continue;
+                float w = 1f - distC * coarseStep / _biomeBlendRadius;
+                if (w <= 0f) continue;
+                totW += w;
+                var prof = profs.TryGetValue((Heightmap.Biome)biomeInt, out var p) ? p : CaveProfile.Default;
+                result.modeB_strength      += w*prof.modeB_strength;   result.modeB_radius         += w*prof.modeB_radius;
+                result.modeB_warpAmp       += w*prof.modeB_warpAmp;    result.modeB_warpFrequency  += w*prof.modeB_warpFrequency;
+                result.modeB_vScale        += w*prof.modeB_vScale;     result.modeB_noiseAmp       += w*prof.modeB_noiseAmp;
+                result.modeB_yOffset       += w*prof.modeB_yOffset;    result.modeB_twist          += w*prof.modeB_twist;
+                result.modeA_strength      += w*prof.modeA_strength;   result.modeA_width          += w*prof.modeA_width;
+                result.modeA_frequency     += w*prof.modeA_frequency;  result.modeA_warpAmp        += w*prof.modeA_warpAmp;
+                result.modeA_warpFrequency += w*prof.modeA_warpFrequency; result.modeA_vScale      += w*prof.modeA_vScale;
+                result.modeA_widthVary     += w*prof.modeA_widthVary;  result.modeA_widthFrequency += w*prof.modeA_widthFrequency;
+                result.modeC_strength      += w*prof.modeC_strength;   result.modeC_threshold      += w*prof.modeC_threshold;
+                result.modeC_noiseAmp      += w*prof.modeC_noiseAmp;   result.modeC_frequency      += w*prof.modeC_frequency;
+                result.modeC_warpAmp       += w*prof.modeC_warpAmp;    result.modeC_warpFrequency  += w*prof.modeC_warpFrequency;
+                result.modeC_vScale        += w*prof.modeC_vScale;     result.modeC_twist          += w*prof.modeC_twist;
+                result.modeC_twistVary     += w*prof.modeC_twistVary;  result.modeC_twistFrequency += w*prof.modeC_twistFrequency;
+                result.modeC_ampVary       += w*prof.modeC_ampVary;    result.modeC_ampFrequency   += w*prof.modeC_ampFrequency;
+                result.blur_passes         += w*prof.blur_passes;      result.perona_k             += w*prof.perona_k;
+                result.perona_lambda       += w*prof.perona_lambda;    result.floorDepth           += w*prof.floorDepth;
+            }
+            if (totW > 0f)
+            {
+                float rcp = 1f / totW;
+                result.modeB_strength*=rcp; result.modeB_radius*=rcp; result.modeB_warpAmp*=rcp;
+                result.modeB_warpFrequency*=rcp; result.modeB_vScale*=rcp; result.modeB_noiseAmp*=rcp;
+                result.modeB_yOffset*=rcp; result.modeB_twist*=rcp; result.modeA_strength*=rcp;
+                result.modeA_width*=rcp; result.modeA_frequency*=rcp; result.modeA_warpAmp*=rcp;
+                result.modeA_warpFrequency*=rcp; result.modeA_vScale*=rcp; result.modeA_widthVary*=rcp;
+                result.modeA_widthFrequency*=rcp; result.modeC_strength*=rcp; result.modeC_threshold*=rcp;
+                result.modeC_noiseAmp*=rcp; result.modeC_frequency*=rcp; result.modeC_warpAmp*=rcp;
+                result.modeC_warpFrequency*=rcp; result.modeC_vScale*=rcp; result.modeC_twist*=rcp;
+                result.modeC_twistVary*=rcp; result.modeC_twistFrequency*=rcp; result.modeC_ampVary*=rcp;
+                result.modeC_ampFrequency*=rcp; result.blur_passes*=rcp; result.perona_k*=rcp;
+                result.perona_lambda*=rcp; result.floorDepth*=rcp;
+            }
+            return result;
+        }
+
+        // ── Distance-based biome weight pipeline ─────────────────────────────────────
+        // For each coarse grid cell, computes the world-space distance to each distinct
+        // biome via BFS on the padded sample grid, then derives blend weights from that
+        // distance.  Weight = max(0, 1 - dist/blendRadius), normalized so all biome
+        // weights sum to 1.  This gives exact 50/50 at any biome boundary, pure 1.0
+        // far inside a biome, and a predictable linear falloff of width blendRadius.
+        static void BakeBlendedProfiles(int cw4, int ox, int oz, int overlap, float s, WorldGenerator wg)
+        {
+            var profs = _biomeProfiles;
+            CaveProfile GetP(Heightmap.Biome b) =>
                 profs.TryGetValue(b, out var p) ? p : CaveProfile.Default;
 
-            float totalW = 0f;
-            float
-                fMbStr=0,fMbR=0,fMbWA=0,fMbWF=0,fMbVS=0,fMbNA=0,fMbYO=0,fMbTw=0,
-                fMaStr=0,fMaW=0,fMaF=0,fMaWA=0,fMaWF=0,fMaVS=0,fMaWv=0,fMaWvF=0,
-                fMcStr=0,fMcTh=0,fMcNA=0,fMcF=0,fMcWA=0,fMcWF=0,fMcVS=0,
-                fMcTw=0,fMcTwV=0,fMcTwF=0,fMcAV=0,fMcAF=0,
-                fBlur=0,fPK=0,fPL=0,fFlD=0;
+            float coarseStep = 4f * s;
+            // Pad enough that BFS can reach blendRadius world units from every edge cell.
+            int pad   = (int)(_biomeBlendRadius / coarseStep) + 2;
+            int pcw   = cw4 + 2 * pad;
+            int pgSize = pcw * pcw;
 
-            float inv2s2 = 1f / (2f * sigma * sigma);
-            for (int ix = -2; ix <= 2; ix++)
-            for (int iz = -2; iz <= 2; iz++)
+            // ── Step 1: sample GetBiome on padded grid ───────────────────────────────
+            if (_biomeGrid == null || _biomeGrid.Length < pgSize) _biomeGrid = new int[pgSize];
+            for (int px = 0; px < pcw; px++)
+            for (int pz = 0; pz < pcw; pz++)
             {
-                float dx = ix * step, dz = iz * step;
-                float w  = Mathf.Exp(-(dx*dx + dz*dz) * inv2s2);
-                var   p  = Get(wg.GetBiome(worldX + dx, worldZ + dz));
-                totalW   += w;
-                fMbStr+=w*p.modeB_strength;      fMbR  +=w*p.modeB_radius;
-                fMbWA +=w*p.modeB_warpAmp;       fMbWF +=w*p.modeB_warpFrequency;
-                fMbVS +=w*p.modeB_vScale;        fMbNA +=w*p.modeB_noiseAmp;
-                fMbYO +=w*p.modeB_yOffset;       fMbTw +=w*p.modeB_twist;
-                fMaStr+=w*p.modeA_strength;      fMaW  +=w*p.modeA_width;
-                fMaF  +=w*p.modeA_frequency;     fMaWA +=w*p.modeA_warpAmp;
-                fMaWF +=w*p.modeA_warpFrequency; fMaVS +=w*p.modeA_vScale;
-                fMaWv +=w*p.modeA_widthVary;     fMaWvF+=w*p.modeA_widthFrequency;
-                fMcStr+=w*p.modeC_strength;      fMcTh +=w*p.modeC_threshold;
-                fMcNA +=w*p.modeC_noiseAmp;      fMcF  +=w*p.modeC_frequency;
-                fMcWA +=w*p.modeC_warpAmp;       fMcWF +=w*p.modeC_warpFrequency;
-                fMcVS +=w*p.modeC_vScale;        fMcTw +=w*p.modeC_twist;
-                fMcTwV+=w*p.modeC_twistVary;     fMcTwF+=w*p.modeC_twistFrequency;
-                fMcAV +=w*p.modeC_ampVary;       fMcAF +=w*p.modeC_ampFrequency;
-                fBlur +=w*p.blur_passes;         fPK   +=w*p.perona_k;
-                fPL   +=w*p.perona_lambda;       fFlD  +=w*p.floorDepth;
+                int gx = ox - overlap + (px - pad) * 4;
+                int gz = oz - overlap + (pz - pad) * 4;
+                _biomeGrid[px * pcw + pz] = (int)wg.GetBiome(gx * s, gz * s);
             }
 
-            float rcp = 1f / totalW;
-            return new CaveProfile
+            // Collect distinct biomes present in the padded grid.
+            var seenBiomes = new System.Collections.Generic.HashSet<int>();
+            for (int i = 0; i < pgSize; i++) seenBiomes.Add(_biomeGrid[i]);
+
+            // ── Step 2: per-biome BFS distance transform + accumulate ────────────────
+            int cellCount = cw4 * cw4;
+            if (_blendedProfs == null || _blendedProfs.Length < cellCount)
+                _blendedProfs = new CaveProfile[cellCount];
+            if (_biomeTotW == null || _biomeTotW.Length < cellCount)
+                _biomeTotW = new float[cellCount];
+            for (int i = 0; i < cellCount; i++) { _blendedProfs[i] = new CaveProfile(); _biomeTotW[i] = 0f; }
+
+            if (_biomeDist == null || _biomeDist.Length < pgSize) _biomeDist = new int[pgSize];
+            // BFS queue: worst case every padded cell is enqueued.
+            if (_biomeBfsQ == null || _biomeBfsQ.Length < pgSize) _biomeBfsQ = new int[pgSize];
+
+            // Max BFS hops before weight reaches zero (blendRadius in coarse cells, rounded up).
+            int maxHops = (int)(_biomeBlendRadius / coarseStep) + 1;
+
+            foreach (int biomeInt in seenBiomes)
             {
-                modeB_strength       = fMbStr*rcp, modeB_radius         = fMbR  *rcp,
-                modeB_warpAmp        = fMbWA *rcp, modeB_warpFrequency  = fMbWF *rcp,
-                modeB_vScale         = fMbVS *rcp, modeB_noiseAmp       = fMbNA *rcp,
-                modeB_yOffset        = fMbYO *rcp, modeB_twist          = fMbTw *rcp,
-                modeA_strength       = fMaStr*rcp, modeA_width          = fMaW  *rcp,
-                modeA_frequency      = fMaF  *rcp, modeA_warpAmp        = fMaWA *rcp,
-                modeA_warpFrequency  = fMaWF *rcp, modeA_vScale         = fMaVS *rcp,
-                modeA_widthVary      = fMaWv *rcp, modeA_widthFrequency = fMaWvF*rcp,
-                modeC_strength       = fMcStr*rcp, modeC_threshold      = fMcTh *rcp,
-                modeC_noiseAmp       = fMcNA *rcp, modeC_frequency      = fMcF  *rcp,
-                modeC_warpAmp        = fMcWA *rcp, modeC_warpFrequency  = fMcWF *rcp,
-                modeC_vScale         = fMcVS *rcp, modeC_twist          = fMcTw *rcp,
-                modeC_twistVary      = fMcTwV*rcp, modeC_twistFrequency = fMcTwF*rcp,
-                modeC_ampVary        = fMcAV *rcp, modeC_ampFrequency   = fMcAF *rcp,
-                blur_passes          = fBlur *rcp, perona_k             = fPK   *rcp,
-                perona_lambda        = fPL   *rcp, floorDepth           = fFlD  *rcp,
-            };
+                var prof = GetP((Heightmap.Biome)biomeInt);
+
+                // Multi-source BFS: seed from every cell of this biome, distance = 0.
+                int qHead = 0, qTail = 0;
+                for (int i = 0; i < pgSize; i++)
+                {
+                    if (_biomeGrid[i] == biomeInt) { _biomeDist[i] = 0; _biomeBfsQ[qTail++] = i; }
+                    else _biomeDist[i] = int.MaxValue;
+                }
+                while (qHead < qTail)
+                {
+                    int cell = _biomeBfsQ[qHead++];
+                    int nd   = _biomeDist[cell] + 1;
+                    if (nd > maxHops) continue;
+                    int px = cell / pcw, pz = cell % pcw;
+                    // 4-connected neighbors
+                    if (px > 0)     { int n = cell - pcw; if (_biomeDist[n] > nd) { _biomeDist[n] = nd; _biomeBfsQ[qTail++] = n; } }
+                    if (px < pcw-1) { int n = cell + pcw; if (_biomeDist[n] > nd) { _biomeDist[n] = nd; _biomeBfsQ[qTail++] = n; } }
+                    if (pz > 0)     { int n = cell - 1;   if (_biomeDist[n] > nd) { _biomeDist[n] = nd; _biomeBfsQ[qTail++] = n; } }
+                    if (pz < pcw-1) { int n = cell + 1;   if (_biomeDist[n] > nd) { _biomeDist[n] = nd; _biomeBfsQ[qTail++] = n; } }
+                }
+
+                // Accumulate weighted profile into each inner coarse cell.
+                for (int cx4 = 0; cx4 < cw4; cx4++)
+                for (int cz4 = 0; cz4 < cw4; cz4++)
+                {
+                    int distCells = _biomeDist[(cx4 + pad) * pcw + (cz4 + pad)];
+                    if (distCells > maxHops) continue;
+                    float w = 1f - distCells * coarseStep / _biomeBlendRadius;
+                    if (w <= 0f) continue;
+                    int idx = cx4 * cw4 + cz4;
+                    ref var acc = ref _blendedProfs[idx];
+                    _biomeTotW[idx]           += w;
+                    acc.modeB_strength        += w * prof.modeB_strength;
+                    acc.modeB_radius          += w * prof.modeB_radius;
+                    acc.modeB_warpAmp         += w * prof.modeB_warpAmp;
+                    acc.modeB_warpFrequency   += w * prof.modeB_warpFrequency;
+                    acc.modeB_vScale          += w * prof.modeB_vScale;
+                    acc.modeB_noiseAmp        += w * prof.modeB_noiseAmp;
+                    acc.modeB_yOffset         += w * prof.modeB_yOffset;
+                    acc.modeB_twist           += w * prof.modeB_twist;
+                    acc.modeA_strength        += w * prof.modeA_strength;
+                    acc.modeA_width           += w * prof.modeA_width;
+                    acc.modeA_frequency       += w * prof.modeA_frequency;
+                    acc.modeA_warpAmp         += w * prof.modeA_warpAmp;
+                    acc.modeA_warpFrequency   += w * prof.modeA_warpFrequency;
+                    acc.modeA_vScale          += w * prof.modeA_vScale;
+                    acc.modeA_widthVary       += w * prof.modeA_widthVary;
+                    acc.modeA_widthFrequency  += w * prof.modeA_widthFrequency;
+                    acc.modeC_strength        += w * prof.modeC_strength;
+                    acc.modeC_threshold       += w * prof.modeC_threshold;
+                    acc.modeC_noiseAmp        += w * prof.modeC_noiseAmp;
+                    acc.modeC_frequency       += w * prof.modeC_frequency;
+                    acc.modeC_warpAmp         += w * prof.modeC_warpAmp;
+                    acc.modeC_warpFrequency   += w * prof.modeC_warpFrequency;
+                    acc.modeC_vScale          += w * prof.modeC_vScale;
+                    acc.modeC_twist           += w * prof.modeC_twist;
+                    acc.modeC_twistVary       += w * prof.modeC_twistVary;
+                    acc.modeC_twistFrequency  += w * prof.modeC_twistFrequency;
+                    acc.modeC_ampVary         += w * prof.modeC_ampVary;
+                    acc.modeC_ampFrequency    += w * prof.modeC_ampFrequency;
+                    acc.blur_passes           += w * prof.blur_passes;
+                    acc.perona_k              += w * prof.perona_k;
+                    acc.perona_lambda         += w * prof.perona_lambda;
+                    acc.floorDepth            += w * prof.floorDepth;
+                }
+            }
+
+            // ── Step 3: Normalize ─────────────────────────────────────────────────────
+            for (int idx = 0; idx < cellCount; idx++)
+            {
+                float wt = _biomeTotW[idx];
+                if (wt <= 0f) continue;
+                float rcp = 1f / wt;
+                ref var p = ref _blendedProfs[idx];
+                p.modeB_strength      *= rcp; p.modeB_radius          *= rcp;
+                p.modeB_warpAmp       *= rcp; p.modeB_warpFrequency   *= rcp;
+                p.modeB_vScale        *= rcp; p.modeB_noiseAmp        *= rcp;
+                p.modeB_yOffset       *= rcp; p.modeB_twist           *= rcp;
+                p.modeA_strength      *= rcp; p.modeA_width           *= rcp;
+                p.modeA_frequency     *= rcp; p.modeA_warpAmp         *= rcp;
+                p.modeA_warpFrequency *= rcp; p.modeA_vScale          *= rcp;
+                p.modeA_widthVary     *= rcp; p.modeA_widthFrequency  *= rcp;
+                p.modeC_strength      *= rcp; p.modeC_threshold       *= rcp;
+                p.modeC_noiseAmp      *= rcp; p.modeC_frequency       *= rcp;
+                p.modeC_warpAmp       *= rcp; p.modeC_warpFrequency   *= rcp;
+                p.modeC_vScale        *= rcp; p.modeC_twist           *= rcp;
+                p.modeC_twistVary     *= rcp; p.modeC_twistFrequency  *= rcp;
+                p.modeC_ampVary       *= rcp; p.modeC_ampFrequency    *= rcp;
+                p.blur_passes         *= rcp; p.perona_k              *= rcp;
+                p.perona_lambda       *= rcp; p.floorDepth            *= rcp;
+            }
         }
 
         // ── Location cache ────────────────────────────────────────────────────────
@@ -855,18 +1027,25 @@ namespace VoxCaves
                 return;
             }
 
-            // Sample centre profile once for structural params (blur, Mode C margin).
-            var centerProf = wg != null ? BlendProfile(zoneX, zoneZ, wg) : CaveProfile.Default;
-            int blurPasses = (int)centerProf.blur_passes;
+            const int overlap = 4;
+            int bwEarly = width + 2 * overlap;
+            int cw4Early = (bwEarly + 3) / 4;
+
+            // Run the distance-based biome blend pass before hiMargin so all subsequent
+            // profile reads use the same representation — no old kernel anywhere.
+            if (wg != null) BakeBlendedProfiles(cw4Early, ox, oz, overlap, s, wg);
+
+            // Read center and corners directly from _blendedProfs.
+            CaveProfile ProfAt(int cx4, int cz4) =>
+                (_blendedProfs != null && cx4 * cw4Early + cz4 < _blendedProfs.Length)
+                    ? _blendedProfs[cx4 * cw4Early + cz4] : CaveProfile.Default;
+            int lastC = cw4Early - 1;
+            var centerProf = ProfAt(cw4Early / 2, cw4Early / 2);
 
             var centerBiome = wg?.GetBiome(zoneX, zoneZ) ?? Heightmap.Biome.None;
-
             Log.LogInfo($"[VoxCaves] zone ({ox},{oz}) biome={centerBiome} mB={centerProf.modeB_strength:F2} mA={centerProf.modeA_strength:F2} mC={centerProf.modeC_strength:F2}");
 
-            const int overlap = 4;
-
             // Build nearby-location list for the location-protection fade.
-            // Done after the early exit so vanilla zones pay zero cost.
             float searchR = width * s * 0.5f + LocProtectR + LocFadeR;
             var nearbyLocs = new List<Vector2>();
             foreach (var loc in _locationPositions)
@@ -876,30 +1055,19 @@ namespace VoxCaves
                     nearbyLocs.Add(loc);
             }
 
-            // Mode C can raise terrain well above the vanilla ceiling (yHi).
-            // Compute the maximum possible Mode C top in voxels above yHi so Phase 3
-            // writes the full solid column and the mesher gets a real gradient at the surface.
-            // Without this, voxels above extHi stay as vanilla air (+127), causing a hard
-            // -127→+127 cliff at the cutoff that forces the surface to snap to extHi + 0.5.
-            // Use the zone-wide max Mode C params for buffer headroom — the centre
-            // may be vanilla while corners have active Mode C from biome blending.
+            // Mode C can raise terrain above yHi — compute headroom from blended corners.
             int hiMargin = 24;
             {
-                float maxAmp  = centerProf.modeC_noiseAmp * Mathf.Max(1f, 1f + centerProf.modeC_ampVary);
-                float maxExtM = Mathf.Max(0f, 1f - centerProf.modeC_threshold) * maxAmp
-                              + centerProf.modeC_warpAmp;
-                // Also sample corners in case centre is vanilla but corners are active.
-                void CheckCorner(float cx, float cz) {
-                    if (wg == null) return;
-                    var cp = BlendProfile(cx, cz, wg);
+                float maxExtM = 0f;
+                void CheckProf(CaveProfile cp) {
                     if (cp.modeC_strength <= 0f) return;
                     float a = cp.modeC_noiseAmp * Mathf.Max(1f, 1f + cp.modeC_ampVary);
                     float e = Mathf.Max(0f, 1f - cp.modeC_threshold) * a + cp.modeC_warpAmp;
                     if (e > maxExtM) maxExtM = e;
                 }
-                float zh = width * 0.5f * s;
-                CheckCorner(zoneX - zh, zoneZ - zh); CheckCorner(zoneX + zh, zoneZ - zh);
-                CheckCorner(zoneX - zh, zoneZ + zh); CheckCorner(zoneX + zh, zoneZ + zh);
+                CheckProf(centerProf);
+                CheckProf(ProfAt(0,       0      )); CheckProf(ProfAt(lastC, 0      ));
+                CheckProf(ProfAt(0,       lastC  )); CheckProf(ProfAt(lastC, lastC  ));
                 if (maxExtM > 0f)
                     hiMargin = Mathf.Max(24, (int)Mathf.Ceil(maxExtM / s) + 8);
             }
@@ -922,7 +1090,7 @@ namespace VoxCaves
             // every 62 voxels, so 4-voxel coarse XZ is well within the faithful range.
             // Layout: _noiseBuf[cx4 * (cw4*bh) + cz4 * bh + cy] — cy-major per (cx4,cz4)
             // so the Y inner loop reads four sequential streams, prefetcher-friendly.
-            int   cw4     = (bw + 3) / 4;
+            int   cw4     = cw4Early;  // already computed above for BakeBlendedProfiles
             // Bake flags must reflect any column in the zone, not just the centre.
             // A transition zone with a vanilla centre may still have active columns.
             // We determine these after the Phase 0 loop below; pre-set false here.
@@ -954,8 +1122,9 @@ namespace VoxCaves
             if (_bk2dMaw   == null || _bk2dMaw.Length   < nb2Size) _bk2dMaw   = new float[nb2Size];
             if (_bk2dMawv  == null || _bk2dMawv.Length  < nb2Size) _bk2dMawv  = new float[nb2Size];
             if (_bk2dMawvf == null || _bk2dMawvf.Length < nb2Size) _bk2dMawvf = new float[nb2Size];
-            // 2D param bake — always runs so Phase 1 can use bilinear interpolation
-            // instead of calling BlendProfile per column (saves ~9600 GetBiome calls/zone).
+            // BakeBlendedProfiles already ran above (before hiMargin); _blendedProfs is current.
+
+            // 2D param bake — copy from pre-blurred profiles into _bk2d* arrays for Phase 1.
             bool anyMbActive = false;
             for (int cx4 = 0; cx4 < cw4; cx4++)
             for (int cz4 = 0; cz4 < cw4; cz4++)
@@ -964,13 +1133,9 @@ namespace VoxCaves
                 int   cz4w  = Math.Min(cz4 * 4, bw - 1);
                 int   gx4   = ox - overlap + cx4w, gz4 = oz - overlap + cz4w;
                 float wx4   = gx4 * s, wz4 = gz4 * s;
-                long  pKey  = (long)gx4 << 32 | (uint)gz4;
-                if (!Plugin._profileCache.TryGetValue(pKey, out var p4))
-                {
-                    p4 = wg != null ? BlendProfile(wx4, wz4, wg) : CaveProfile.Default;
-                    if (wg != null) Plugin._profileCache[pKey] = p4;
-                }
                 int   idx2  = cx4 * cw4 + cz4;
+                var   p4    = (wg != null && _blendedProfs != null && idx2 < _blendedProfs.Length)
+                              ? _blendedProfs[idx2] : CaveProfile.Default;
 
                 _bk2dMcS! [idx2] = p4.modeC_strength;
                 _bk2dMcT! [idx2] = p4.modeC_threshold;
@@ -1026,10 +1191,14 @@ namespace VoxCaves
                 }
                 else if (bakeC)
                 {
+                    // This cell has modeC_strength=0 but the zone has bakeC=true (nearby active cells).
+                    // Bilinear interpolation of addH mixes active and inactive coarse corners —
+                    // using 0 here corrupts the anchor height for transition columns between them.
+                    // Use the unwarped heightmap so interpolation stays geometrically valid.
+                    _bk2dAddH![idx2] = wg!.GetHeight(wx4, wz4);
+                    _bk2dLAmp![idx2] = 0f;
                     int baseIdx = cx4 * cw4 * bh + cz4 * bh;
                     for (int cy = 0; cy < bh; cy++) _noiseBuf[baseIdx + cy] = 0f;
-                    _bk2dAddH![idx2] = 0f;
-                    _bk2dLAmp![idx2] = 0f;
                 }
 
                 // Mode A 3D noise bake — same 1/4 XZ layout as Mode C.
@@ -1094,16 +1263,31 @@ namespace VoxCaves
 
             long _t1b = _sw.ElapsedMilliseconds;
 
+            // Read blur params from the blended center coarse cell so the distance-based
+            // weights govern blur behaviour, not the old 5×5 kernel centerProf.
+            CaveProfile blurProf = centerProf;
+            if (_blendedProfs != null)
+            {
+                int cCx = cw4 / 2, cCz = cw4 / 2;
+                blurProf = _blendedProfs[cCx * cw4 + cCz];
+            }
+            // Ceil so any nonzero blended blur_passes activates at least 1 pass.
+            // RoundToInt would give 0 for values like 0.3 in transition zones that
+            // still have active Mode C terrain and need smoothing.
+            int blurPasses = (bakeC || bakeA || anyMbActive)
+                ? Mathf.Max(Mathf.CeilToInt(blurProf.blur_passes), 0)
+                : 0;
+
             // ── Phase 2: Blur / smooth the SDF buffer ────────────────────────────────
             // Two modes selectable per profile via perona_k:
             //   perona_k = 0  → separable 5-tap Gaussian [1/16,4/16,6/16,4/16,1/16]
             //   perona_k > 0  → Perona-Malik anisotropic diffusion (preserves edges)
-            if (centerProf.perona_k > 0f)
+            if (blurProf.perona_k > 0f)
             {
                 // Perona-Malik: d_new = d + λ * Σ exp(-(Δ/K)²) * Δ  for 6 face neighbours.
                 // Smooths homogeneous regions aggressively; slows at SDF gradients ≥ K.
-                float invK2 = 1f / (centerProf.perona_k * centerProf.perona_k);
-                float lam   = centerProf.perona_lambda;
+                float invK2 = 1f / (blurProf.perona_k * blurProf.perona_k);
+                float lam   = blurProf.perona_lambda;
                 int   pbSz  = bw * bh * bw;
                 for (int pass = 0; pass < blurPasses; pass++)
                 {
@@ -1319,7 +1503,7 @@ namespace VoxCaves
                     {
                         float cxRc = (zp.ox + zp.w * 0.5f) * sRc;
                         float czRc = (zp.oz + zp.w * 0.5f) * sRc;
-                        var cpRc   = BlendProfile(cxRc, czRc, wgRc);
+                        var cpRc   = PointBlendProfile(cxRc, czRc, wgRc, sRc);
                         if (cpRc.modeC_strength > 0f)
                         {
                             float maxAmpRc  = cpRc.modeC_noiseAmp * Mathf.Max(1f, 1f + cpRc.modeC_ampVary);
@@ -1394,7 +1578,7 @@ namespace VoxCaves
                     : 1f;
             var wg = WorldGenerator.instance;
             float floorY = ComputeColumnFloor(worldX, worldZ, wg);
-            var prof = wg != null ? BlendProfile(worldX, worldZ, wg) : CaveProfile.Default;
+            var prof = wg != null ? PointBlendProfile(worldX, worldZ, wg, s) : CaveProfile.Default;
             float y = originalY;
             for (int i = 0; i < 256; i++, y -= s)
                 if (TunnelDensity(worldX, y, worldZ, floorY, prof) <= 0f) return y;
