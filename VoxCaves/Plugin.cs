@@ -104,6 +104,7 @@ namespace VoxCaves
         internal static float _biomeBlendRadius    = 192f;
         internal static bool  _biomeBlendSmooth    = true;   // false=linear, true=smoothstep
         internal static int   _transitionBlurPasses = 3;     // min blur passes for any active zone
+        internal static float _coastFade           = 0f;     // world units above sea level over which Ocean inflates into blend (0=off)
         const float LocProtectR = 30f;
         const float LocFadeR    = 40f;
 
@@ -180,9 +181,26 @@ namespace VoxCaves
         // Int3 field accessors — used by FallbackDensityPatch to extract X/Y/Z from boxed struct.
         internal static FieldInfo? _int3FieldX, _int3FieldY, _int3FieldZ;
 
+        // ── Cross-zone grounding face cache ──────────────────────────────────────
+        // Populated by PrecomputeFaceCaches() before the first Carve() call.
+        // Indexed by (ox, oz) territory origin (same coordinates as _zoneParams).
+        // Each face array is [bh * bw] bytes: 0=air, 1=grounded solid.
+        // Faces are at the territory boundary: negX=cx=overlap, posX=cx=overlap+w-1, etc.
+        internal struct ZoneFaceCache {
+            public int extLo, bh, bw;
+            public bool[] negX,    posX,    negZ,    posZ;    // [bh * bw]; true = grounded solid
+            public bool[] negXAir, posXAir, negZAir, posZAir; // [bh * bw]; true = air connected to boundary
+            // True if that face has ungrounded solid touching an uncached neighbor —
+            // EnsureFixpoint uses these to decide whether to expand the worklist.
+            public bool needsNegX, needsPosX, needsNegZ, needsPosZ;
+        }
+        internal static readonly Dictionary<(int, int), ZoneFaceCache> _zoneFaceCache = new();
+
         // Reused across Carve() calls to avoid per-zone GC pressure.
         internal static float[]? _bufA;
         internal static float[]? _bufB;
+        // Dedicated buffer for ComputeZoneFaceCache so it never clobbers Carve()'s active buf.
+        internal static float[]? _precomputeBuf;
 
         internal static float[]? _noiseBuf;  // coarse Mode C bake: [cx4*(cw4*bh) + cz4*bh + cy]
         internal static float[]? _tunBuf;   // coarse Mode A: tunnel noise field 1 (after warp)
@@ -597,6 +615,8 @@ namespace VoxCaves
                             _biomeBlendSmooth = !(v == "0" || v == "false");
                         if (k == "transitionblurpasses" && int.TryParse(v, out int tbp))
                             _transitionBlurPasses = Mathf.Max(0, tbp);
+                        if (k == "coastfade" && float.TryParse(v, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float cf))
+                            _coastFade = Mathf.Max(0f, cf);
                     }
                     continue;
                 }
@@ -673,6 +693,7 @@ namespace VoxCaves
             sb.AppendLine("islandRemoval     = true   # false = disable floating-island BFS removal");
             sb.AppendLine("pocketRemoval     = true   # false = disable sealed underground pocket BFS fill");
             sb.AppendLine("biomeBlendRadius  = 192    # world units over which biome profiles blend at boundaries");
+            sb.AppendLine("coastFade         = 0      # world units above sea level (30) over which Ocean inflates into blend; 0=off");
             sb.AppendLine();
 
             sb.AppendLine("[Profile:vanilla_heightmap]");
@@ -1124,6 +1145,59 @@ namespace VoxCaves
                 }
             }
 
+            // ── Step 2b: Height-based Ocean inflation ─────────────────────────────────
+            // Injects extra Ocean-profile weight wherever the heightmap is within coastFade
+            // world units of sea level (30f).  This suppresses carving in shallow coastal
+            // areas regardless of what biome label the map assigns there.
+            if (_coastFade > 0f)
+            {
+                const float SeaLevel = 30f;
+                var oceanProf = GetP(Heightmap.Biome.Ocean);
+                for (int cx4 = 0; cx4 < cw4; cx4++)
+                for (int cz4 = 0; cz4 < cw4; cz4++)
+                {
+                    float wx = (ox - overlap + cx4 * 4 + 2) * s;
+                    float wz = (oz - overlap + cz4 * 4 + 2) * s;
+                    float h  = wg.GetHeight(wx, wz);
+                    float coastW = 1f - Mathf.Clamp01((h - SeaLevel) / _coastFade);
+                    if (coastW <= 0f) continue;
+                    int idx = cx4 * cw4 + cz4;
+                    ref var acc = ref _blendedProfs[idx];
+                    _biomeTotW[idx]           += coastW;
+                    acc.modeB_radius          += coastW * oceanProf.modeB_radius;
+                    acc.modeB_warpAmp         += coastW * oceanProf.modeB_warpAmp;
+                    acc.modeB_warpFrequency   += coastW * oceanProf.modeB_warpFrequency;
+                    acc.modeB_vScale          += coastW * oceanProf.modeB_vScale;
+                    acc.modeB_noiseAmp        += coastW * oceanProf.modeB_noiseAmp;
+                    acc.modeB_yOffset         += coastW * oceanProf.modeB_yOffset;
+                    acc.modeB_twist           += coastW * oceanProf.modeB_twist;
+                    acc.modeA_width           += coastW * oceanProf.modeA_width;
+                    acc.modeA_frequency       += coastW * oceanProf.modeA_frequency;
+                    acc.modeA_warpAmp         += coastW * oceanProf.modeA_warpAmp;
+                    acc.modeA_warpFrequency   += coastW * oceanProf.modeA_warpFrequency;
+                    acc.modeA_vScale          += coastW * oceanProf.modeA_vScale;
+                    acc.modeA_widthVary       += coastW * oceanProf.modeA_widthVary;
+                    acc.modeA_widthFrequency  += coastW * oceanProf.modeA_widthFrequency;
+                    acc.modeA_yOffset         += coastW * oceanProf.modeA_yOffset;
+                    acc.modeC_threshold       += coastW * oceanProf.modeC_threshold;
+                    acc.modeC_noiseAmp        += coastW * oceanProf.modeC_noiseAmp;
+                    acc.modeC_frequency       += coastW * oceanProf.modeC_frequency;
+                    acc.modeC_warpAmp         += coastW * oceanProf.modeC_warpAmp;
+                    acc.modeC_warpFrequency   += coastW * oceanProf.modeC_warpFrequency;
+                    acc.modeC_vScale          += coastW * oceanProf.modeC_vScale;
+                    acc.modeC_twist           += coastW * oceanProf.modeC_twist;
+                    acc.modeC_twistVary       += coastW * oceanProf.modeC_twistVary;
+                    acc.modeC_twistFrequency  += coastW * oceanProf.modeC_twistFrequency;
+                    acc.modeC_ampVary         += coastW * oceanProf.modeC_ampVary;
+                    acc.modeC_ampFrequency    += coastW * oceanProf.modeC_ampFrequency;
+                    acc.modeC_yOffset         += coastW * oceanProf.modeC_yOffset;
+                    acc.blur_passes           += coastW * oceanProf.blur_passes;
+                    acc.perona_k              += coastW * oceanProf.perona_k;
+                    acc.perona_lambda         += coastW * oceanProf.perona_lambda;
+                    acc.floorDepth            += coastW * oceanProf.floorDepth;
+                }
+            }
+
             // ── Step 3: Normalize ─────────────────────────────────────────────────────
             for (int idx = 0; idx < cellCount; idx++)
             {
@@ -1286,193 +1360,9 @@ namespace VoxCaves
 
             var _sw = System.Diagnostics.Stopwatch.StartNew();
 
-            // ── Phase 0: Bake Mode C noise at 1/4 XZ, full Y ────────────────────────
-            // modeC_frequency = 0.008 → 1 cycle per 125 voxels; Nyquist allows a sample
-            // every 62 voxels, so 4-voxel coarse XZ is well within the faithful range.
-            // Layout: _noiseBuf[cx4 * (cw4*bh) + cz4 * bh + cy] — cy-major per (cx4,cz4)
-            // so the Y inner loop reads four sequential streams, prefetcher-friendly.
             int   cw4     = cw4Early;  // already computed above for BakeBlendedProfiles
-            // Bake flags must reflect any column in the zone, not just the centre.
-            // A transition zone with a vanilla centre may still have active columns.
-            // We determine these after the Phase 0 loop below; pre-set false here.
-            bool  bakeC   = false;
-            bool  bakeA   = false;
-            int   nb4Size = cw4 * cw4 * bh;
-            int   nb2Size = cw4 * cw4;
-            if (_noiseBuf  == null || _noiseBuf.Length  < nb4Size) _noiseBuf  = new float[nb4Size];
-            if (_tunBuf    == null || _tunBuf.Length    < nb4Size) _tunBuf    = new float[nb4Size];
-            if (_tunBuf2   == null || _tunBuf2.Length   < nb4Size) _tunBuf2   = new float[nb4Size];
-            if (_tunWBuf   == null || _tunWBuf.Length   < nb4Size) _tunWBuf   = new float[nb4Size];
-            if (_bk2dAddH  == null || _bk2dAddH.Length  < nb2Size) _bk2dAddH  = new float[nb2Size];
-            if (_bk2dLAmp  == null || _bk2dLAmp.Length  < nb2Size) _bk2dLAmp  = new float[nb2Size];
-            if (_bk2dMcS   == null || _bk2dMcS.Length   < nb2Size) _bk2dMcS   = new float[nb2Size];
-            if (_bk2dMcT   == null || _bk2dMcT.Length   < nb2Size) _bk2dMcT   = new float[nb2Size];
-            if (_bk2dFlD   == null || _bk2dFlD.Length   < nb2Size) _bk2dFlD   = new float[nb2Size];
-            if (_bk2dMbwf  == null || _bk2dMbwf.Length  < nb2Size) _bk2dMbwf  = new float[nb2Size];
-            if (_bk2dMbwa  == null || _bk2dMbwa.Length  < nb2Size) _bk2dMbwa  = new float[nb2Size];
-            if (_bk2dMbr   == null || _bk2dMbr.Length   < nb2Size) _bk2dMbr   = new float[nb2Size];
-            if (_bk2dMbvs  == null || _bk2dMbvs.Length  < nb2Size) _bk2dMbvs  = new float[nb2Size];
-            if (_bk2dMbna  == null || _bk2dMbna.Length  < nb2Size) _bk2dMbna  = new float[nb2Size];
-            if (_bk2dMbyo    == null || _bk2dMbyo.Length    < nb2Size) _bk2dMbyo    = new float[nb2Size];
-            if (_bk2dMbtwist == null || _bk2dMbtwist.Length < nb2Size) _bk2dMbtwist = new float[nb2Size];
-            if (_bk2dMawf  == null || _bk2dMawf.Length  < nb2Size) _bk2dMawf  = new float[nb2Size];
-            if (_bk2dMawa  == null || _bk2dMawa.Length  < nb2Size) _bk2dMawa  = new float[nb2Size];
-            if (_bk2dMaf   == null || _bk2dMaf.Length   < nb2Size) _bk2dMaf   = new float[nb2Size];
-            if (_bk2dMavs  == null || _bk2dMavs.Length  < nb2Size) _bk2dMavs  = new float[nb2Size];
-            if (_bk2dMaw   == null || _bk2dMaw.Length   < nb2Size) _bk2dMaw   = new float[nb2Size];
-            if (_bk2dMawv  == null || _bk2dMawv.Length  < nb2Size) _bk2dMawv  = new float[nb2Size];
-            if (_bk2dMawvf == null || _bk2dMawvf.Length < nb2Size) _bk2dMawvf = new float[nb2Size];
-            if (_bk2dMayo  == null || _bk2dMayo.Length  < nb2Size) _bk2dMayo  = new float[nb2Size];
-            // BakeBlendedProfiles already ran above (before hiMargin); _blendedProfs is current.
-
-            // Pre-scan profiles to determine bakeC/bakeA BEFORE the bake loop.
-            // bakeC/bakeA must be known up-front so that every coarse cell writes _bk2dAddH /
-            // _noiseBuf regardless of its own noiseAmp — cells processed before the first
-            // active cell would otherwise leave those arrays holding stale data from the
-            // previous zone, corrupting the bilinear interpolation in Phase 1.
-            bool anyMbActive = false;
-            if (_blendedProfs != null)
-            {
-                for (int i = 0; i < nb2Size && i < _blendedProfs.Length; i++)
-                {
-                    if (_blendedProfs[i].modeC_noiseAmp > 0f) bakeC = true;
-                    if (_blendedProfs[i].modeA_width    > 0f) bakeA = true;
-                    if (_blendedProfs[i].modeB_radius   > 0f) anyMbActive = true;
-                    if (bakeC && bakeA && anyMbActive) break;
-                }
-            }
-
-            // 2D param bake — copy from pre-blurred profiles into _bk2d* arrays for Phase 1.
-            for (int cx4 = 0; cx4 < cw4; cx4++)
-            for (int cz4 = 0; cz4 < cw4; cz4++)
-            {
-                int   cx4w  = Math.Min(cx4 * 4, bw - 1);
-                int   cz4w  = Math.Min(cz4 * 4, bw - 1);
-                int   gx4   = ox - overlap + cx4w, gz4 = oz - overlap + cz4w;
-                float wx4   = gx4 * s, wz4 = gz4 * s;
-                int   idx2  = cx4 * cw4 + cz4;
-                var   p4    = (wg != null && _blendedProfs != null && idx2 < _blendedProfs.Length)
-                              ? _blendedProfs[idx2] : CaveProfile.Default;
-
-                _bk2dMcS! [idx2] = p4.modeC_noiseAmp;
-                _bk2dMcT! [idx2] = p4.modeC_threshold;
-                _bk2dFlD! [idx2] = p4.floorDepth;
-                _bk2dMbwf![idx2] = p4.modeB_warpFrequency;
-                _bk2dMbwa![idx2] = p4.modeB_warpAmp;
-                _bk2dMbr! [idx2] = p4.modeB_radius;
-                _bk2dMbvs![idx2] = p4.modeB_vScale;
-                _bk2dMbna![idx2] = p4.modeB_noiseAmp;
-                _bk2dMbyo![idx2]    = p4.modeB_yOffset;
-                _bk2dMbtwist![idx2] = p4.modeB_twist;
-                _bk2dMawf![idx2] = p4.modeA_warpFrequency;
-                _bk2dMawa![idx2] = p4.modeA_warpAmp;
-                _bk2dMaf! [idx2] = p4.modeA_frequency;
-                _bk2dMavs![idx2] = p4.modeA_vScale;
-                _bk2dMaw! [idx2] = p4.modeA_width;
-                _bk2dMawv![idx2] = p4.modeA_widthVary;
-                _bk2dMawvf![idx2]= p4.modeA_widthFrequency;
-                _bk2dMayo! [idx2]= p4.modeA_yOffset;
-                // (bakeC / bakeA / anyMbActive already pre-scanned above)
-
-
-                // Mode C anchor quantities — only needed when modeC is active.
-                if (bakeC && p4.modeC_noiseAmp > 0f)
-                {
-                    float awf4  = p4.modeC_warpFrequency;
-                    float awx4  = _hmAddWarpX!.GetNoise(wx4 * awf4, wz4 * awf4) * p4.modeC_warpAmp;
-                    float awz4  = _hmAddWarpZ!.GetNoise(wx4 * awf4, wz4 * awf4) * p4.modeC_warpAmp;
-                    float addH4    = wg!.GetHeight(wx4 + awx4, wz4 + awz4) - p4.modeC_yOffset;
-                    float avf4  = p4.modeC_ampFrequency;
-                    _bk2dAddH![idx2] = addH4;
-                    _bk2dLAmp![idx2] = Mathf.Max(p4.modeC_noiseAmp * (1f + p4.modeC_ampVary
-                                           * _addVaryNoise!.GetNoise(wx4 * avf4, wz4 * avf4)), 0f);
-
-                    // 3D Mode C noise bake.
-                    float ts4 = 1f + p4.modeC_twistVary
-                        * _twistVaryNoise!.GetNoise(wx4 * p4.modeC_twistFrequency, wz4 * p4.modeC_twistFrequency);
-                    float af4 = p4.modeC_frequency, vs4 = p4.modeC_vScale, tw4 = p4.modeC_twist;
-                    int baseIdx = cx4 * cw4 * bh + cz4 * bh;
-                    for (int cy = 0; cy < bh; cy++)
-                    {
-                        float wy4  = (extLo + cy) * s;
-                        float sy4  = (wy4 - addH4) * vs4;
-                        float ang4 = wy4 * tw4 * ts4;
-                        float cos4 = Mathf.Cos(ang4), sin4 = Mathf.Sin(ang4);
-                        float tx4  = wx4 * cos4 - wz4 * sin4;
-                        float tz4  = wx4 * sin4 + wz4 * cos4;
-                        _noiseBuf[baseIdx + cy] = _addNoise!.GetNoise(tx4 * af4, sy4 * af4, tz4 * af4);
-                    }
-                }
-                else if (bakeC)
-                {
-                    // This cell has modeC_noiseAmp=0 but the zone has bakeC=true (nearby active cells).
-                    // Bilinear interpolation of addH mixes active and inactive coarse corners —
-                    // using 0 here corrupts the anchor height for transition columns between them.
-                    // Use the unwarped heightmap so interpolation stays geometrically valid.
-                    _bk2dAddH![idx2] = wg!.GetHeight(wx4, wz4);
-                    _bk2dLAmp![idx2] = 0f;
-                    int baseIdx = cx4 * cw4 * bh + cz4 * bh;
-                    for (int cy = 0; cy < bh; cy++) _noiseBuf[baseIdx + cy] = 0f;
-                }
-
-                // Mode A 3D noise bake — same 1/4 XZ layout as Mode C.
-                // Bakes warped tunnel noise + width noise per (coarse XZ, full Y).
-                // Phase 1 bilinear-interpolates instead of computing 4× 3D noise per voxel.
-                if (bakeA && p4.modeA_width > 0f)
-                {
-                    float mawf4  = _bk2dMawf! [idx2];
-                    float mawa4  = _bk2dMawa! [idx2];
-                    float maf4   = _bk2dMaf!  [idx2];
-                    float mavs4  = _bk2dMavs! [idx2];
-                    float mawvf4 = _bk2dMawvf![idx2];
-                    float mayo4  = p4.modeA_yOffset;
-                    float addHA4 = mayo4 > 0f ? wg!.GetHeight(wx4, wz4) : 0f;
-                    int baseIdxA = cx4 * cw4 * bh + cz4 * bh;
-                    for (int cy = 0; cy < bh; cy++)
-                    {
-                        float sy4   = ((extLo + cy) * s - addHA4 + mayo4) * mavs4;
-                        float awx4  = _warpX! .GetNoise(wx4 * mawf4, sy4 * mawf4, wz4 * mawf4) * mawa4;
-                        float awz4  = _warpZ! .GetNoise(wx4 * mawf4, sy4 * mawf4, wz4 * mawf4) * mawa4;
-                        float awx4b = _warpX2!.GetNoise(wx4 * mawf4, sy4 * mawf4, wz4 * mawf4) * mawa4;
-                        float awz4b = _warpZ2!.GetNoise(wx4 * mawf4, sy4 * mawf4, wz4 * mawf4) * mawa4;
-                        _tunBuf! [baseIdxA + cy] = _caveNoise! .GetNoise((wx4 + awx4)  * maf4, sy4 * maf4, (wz4 + awz4)  * maf4);
-                        _tunBuf2![baseIdxA + cy] = _caveNoise2!.GetNoise((wx4 + awx4b) * maf4, sy4 * maf4, (wz4 + awz4b) * maf4);
-                        _tunWBuf![baseIdxA + cy] = _widthNoise!.GetNoise(wx4 * mawvf4, sy4 * mawvf4, wz4 * mawvf4);
-                    }
-                }
-                else if (bakeA)
-                {
-                    int baseIdxA = cx4 * cw4 * bh + cz4 * bh;
-                    for (int cy = 0; cy < bh; cy++) { _tunBuf![baseIdxA + cy] = 0f; _tunBuf2![baseIdxA + cy] = 0f; _tunWBuf![baseIdxA + cy] = 0f; }
-                }
-            }
-            // Full-res Mode B warpedH bake — eliminates wg.GetHeight from Phase 1.
-            // Skipped entirely when Mode B is inactive, so no overhead in the common case.
-            if (anyMbActive && wg != null)
-            {
-                int fullSz = bw * bw;
-                if (_bkWarpedH == null || _bkWarpedH.Length < fullSz) _bkWarpedH = new float[fullSz];
-                for (int cx = 0; cx < bw; cx++)
-                for (int cz = 0; cz < bw; cz++)
-                {
-                    float wx = (ox - overlap + cx) * s, wz = (oz - overlap + cz) * s;
-                    int cx4  = cx / 4, cz4  = cz / 4;
-                    int cx4b = Math.Min(cx4 + 1, cw4 - 1), cz4b = Math.Min(cz4 + 1, cw4 - 1);
-                    float bfx2 = (cx & 3) * 0.25f, bfz2 = (cz & 3) * 0.25f;
-                    int b00 = cx4 * cw4 + cz4, b10 = cx4b * cw4 + cz4;
-                    int b01 = cx4 * cw4 + cz4b, b11 = cx4b * cw4 + cz4b;
-                    static float BL2(float[] a, int i00, int i10, int i01, int i11, float fx, float fz) =>
-                        Mathf.Lerp(Mathf.Lerp(a[i00], a[i10], fx),
-                                   Mathf.Lerp(a[i01], a[i11], fx), fz);
-                    float wf    = BL2(_bk2dMbwf!, b00, b10, b01, b11, bfx2, bfz2);
-                    float wa    = BL2(_bk2dMbwa!, b00, b10, b01, b11, bfx2, bfz2);
-                    float yo    = BL2(_bk2dMbyo!, b00, b10, b01, b11, bfx2, bfz2);
-                    float locF2 = LocationFactor(wx, wz, nearbyLocs);
-                    float dx    = _hmWarpX!.GetNoise(wx * wf, wz * wf) * (wa * locF2);
-                    float dz2   = _hmWarpZ!.GetNoise(wx * wf, wz * wf) * (wa * locF2);
-                    _bkWarpedH![cx * bw + cz] = wg.GetHeight(wx + dx, wz + dz2) - yo;
-                }
-            }
+            BakeSdfSetup(ox, oz, overlap, s, extLo, bh, bw, cw4, wg, nearbyLocs,
+                out bool bakeC, out bool bakeA, out bool anyMbActive);
 
             long _t0 = _sw.ElapsedMilliseconds;
 
@@ -1581,26 +1471,31 @@ namespace VoxCaves
             long _t2 = _sw.ElapsedMilliseconds;
 
             // ── Phase 2.5: Floating-island removal (after blur) ───────────────────────
-            // Runs after blur so that blur can't sever thin solid necks and leave
-            // bulbs disconnected. BFS from cy=0 (always solid ground); any solid voxel
-            // unreachable from the bottom is a post-blur floating island.
+            // BFS from cy=0 (bedrock); any solid voxel unreachable from the bottom is a
+            // floating island.  Cross-zone grounding uses neighbor face caches, computed
+            // on-demand by EnsureFixpoint only when the pre-pass finds ungrounded blobs
+            // touching a zone face — saving the neighbor computation in the common case.
             if (_islandRemoval) {
                 int islandBufSize = bw * bh * bw;
                 int stride_x      = bh * bw;
+                int terNegX25 = overlap;
+                int terPosX25 = overlap + width - 1;
+                int terNegZ25 = overlap;
+                int terPosZ25 = overlap + width - 1;
                 if (_visitedBuf  == null || _visitedBuf.Length  < islandBufSize) _visitedBuf  = new bool[islandBufSize];
                 if (_islandQueue == null || _islandQueue.Length < islandBufSize) _islandQueue = new int[islandBufSize];
                 Array.Clear(_visitedBuf, 0, islandBufSize);
 
                 int qHead = 0, qTail = 0;
 
+                // ── Pre-pass BFS: cy=0 seeds only ────────────────────────────────────
                 for (int cx = 0; cx < bw; cx++)
                 for (int cz = 0; cz < bw; cz++)
                 {
-                    int idx = cx * stride_x + cz; // cy=0: (cx*bh+0)*bw+cz
+                    int idx = cx * stride_x + cz; // cy=0
                     if (buf[idx] < 0f && !_visitedBuf[idx])
                     { _visitedBuf[idx] = true; _islandQueue[qTail++] = idx; }
                 }
-
                 while (qHead < qTail)
                 {
                     int idx = _islandQueue[qHead++];
@@ -1617,11 +1512,124 @@ namespace VoxCaves
                     if (cz < bw-1) { ni = idx + 1;         if (!_visitedBuf[ni] && buf[ni] < 0f) { _visitedBuf[ni] = true; _islandQueue[qTail++] = ni; } }
                 }
 
+                // Check which territory faces have ungrounded solid after the pre-pass.
+                bool ungNX = false, ungPX = false, ungNZ = false, ungPZ = false;
+                for (int cy = 0; cy < bh; cy++)
+                for (int cz = 0; cz < bw; cz++)
+                {
+                    int iNX = terNegX25 * stride_x + cy * bw + cz;
+                    int iPX = terPosX25 * stride_x + cy * bw + cz;
+                    if (!ungNX && buf[iNX] < 0f && !_visitedBuf[iNX]) ungNX = true;
+                    if (!ungPX && buf[iPX] < 0f && !_visitedBuf[iPX]) ungPX = true;
+                }
+                for (int cy = 0; cy < bh; cy++)
+                for (int cx = 0; cx < bw; cx++)
+                {
+                    int iNZ = cx * stride_x + cy * bw + terNegZ25;
+                    int iPZ = cx * stride_x + cy * bw + terPosZ25;
+                    if (!ungNZ && buf[iNZ] < 0f && !_visitedBuf[iNZ]) ungNZ = true;
+                    if (!ungPZ && buf[iPZ] < 0f && !_visitedBuf[iPZ]) ungPZ = true;
+                }
+
+                // ── Full BFS with neighbor caches (only when needed) ─────────────────
+                // If any face has ungrounded solid, fetch the relevant neighbor caches
+                // and re-run the BFS with those additional seeds.
+                bool needsFullPass = ungNX || ungPX || ungNZ || ungPZ;
+                if (needsFullPass)
+                {
+                    EnsureFixpoint(ox, oz, width, ungNX, ungPX, ungNZ, ungPZ);
+
+                    Array.Clear(_visitedBuf, 0, islandBufSize);
+                    qHead = 0; qTail = 0;
+
+                    // cy=0 seeds
+                    for (int cx = 0; cx < bw; cx++)
+                    for (int cz = 0; cz < bw; cz++)
+                    {
+                        int idx = cx * stride_x + cz;
+                        if (buf[idx] < 0f && !_visitedBuf[idx])
+                        { _visitedBuf[idx] = true; _islandQueue[qTail++] = idx; }
+                    }
+
+                    // Neighbor face cache seeds
+                    void SeedFromCache(bool[]? nFace, int nExtLo, int nBh, int nBw,
+                                       int ourCx, bool xFace)
+                    {
+                        if (nFace == null) return;
+                        for (int cperp = 0; cperp < bw; cperp++)
+                        for (int cy = 0; cy < bh; cy++)
+                        {
+                            int worldY = extLo + cy;
+                            int ncy    = worldY - nExtLo;
+                            if (ncy < 0 || ncy >= nBh) continue;
+                            int nIdx = ncy * nBw + cperp;
+                            if (nIdx >= nFace.Length || !nFace[nIdx]) continue;
+                            int bufIdx = xFace
+                                ? ourCx * stride_x + cy * bw + cperp
+                                : cperp * stride_x + cy * bw + ourCx;
+                            if (buf[bufIdx] < 0f && !_visitedBuf[bufIdx])
+                            { _visitedBuf[bufIdx] = true; _islandQueue[qTail++] = bufIdx; }
+                        }
+                    }
+
+                    if (_zoneFaceCache.TryGetValue((ox - width, oz), out var negXC25))
+                        SeedFromCache(negXC25.posX, negXC25.extLo, negXC25.bh, negXC25.bw, terNegX25, true);
+                    if (_zoneFaceCache.TryGetValue((ox + width, oz), out var posXC25))
+                        SeedFromCache(posXC25.negX, posXC25.extLo, posXC25.bh, posXC25.bw, terPosX25, true);
+                    if (_zoneFaceCache.TryGetValue((ox, oz - width), out var negZC25))
+                        SeedFromCache(negZC25.posZ, negZC25.extLo, negZC25.bh, negZC25.bw, terNegZ25, false);
+                    if (_zoneFaceCache.TryGetValue((ox, oz + width), out var posZC25))
+                        SeedFromCache(posZC25.negZ, posZC25.extLo, posZC25.bh, posZC25.bw, terPosZ25, false);
+
+                    while (qHead < qTail)
+                    {
+                        int idx = _islandQueue[qHead++];
+                        int cx  = idx / stride_x;
+                        int rem = idx % stride_x;
+                        int cy  = rem / bw;
+                        int cz  = rem % bw;
+                        int ni;
+                        if (cx > 0)    { ni = idx - stride_x; if (!_visitedBuf[ni] && buf[ni] < 0f) { _visitedBuf[ni] = true; _islandQueue[qTail++] = ni; } }
+                        if (cx < bw-1) { ni = idx + stride_x; if (!_visitedBuf[ni] && buf[ni] < 0f) { _visitedBuf[ni] = true; _islandQueue[qTail++] = ni; } }
+                        if (cy > 0)    { ni = idx - bw;        if (!_visitedBuf[ni] && buf[ni] < 0f) { _visitedBuf[ni] = true; _islandQueue[qTail++] = ni; } }
+                        if (cy < bh-1) { ni = idx + bw;        if (!_visitedBuf[ni] && buf[ni] < 0f) { _visitedBuf[ni] = true; _islandQueue[qTail++] = ni; } }
+                        if (cz > 0)    { ni = idx - 1;         if (!_visitedBuf[ni] && buf[ni] < 0f) { _visitedBuf[ni] = true; _islandQueue[qTail++] = ni; } }
+                        if (cz < bw-1) { ni = idx + 1;         if (!_visitedBuf[ni] && buf[ni] < 0f) { _visitedBuf[ni] = true; _islandQueue[qTail++] = ni; } }
+                    }
+                }
+
+                // Store A's face cache from the final BFS result.
+                {
+                    int faceSz25 = bh * bw;
+                    var ac = new ZoneFaceCache {
+                        extLo = extLo, bh = bh, bw = bw,
+                        negX    = new bool[faceSz25], posX    = new bool[faceSz25],
+                        negZ    = new bool[faceSz25], posZ    = new bool[faceSz25],
+                        negXAir = new bool[faceSz25], posXAir = new bool[faceSz25],
+                        negZAir = new bool[faceSz25], posZAir = new bool[faceSz25],
+                    };
+                    for (int cy = 0; cy < bh; cy++)
+                    for (int cz = 0; cz < bw; cz++)
+                    {
+                        int fIdx = cy * bw + cz;
+                        ac.negX[fIdx] = _visitedBuf[terNegX25 * stride_x + cy * bw + cz];
+                        ac.posX[fIdx] = _visitedBuf[terPosX25 * stride_x + cy * bw + cz];
+                    }
+                    for (int cy = 0; cy < bh; cy++)
+                    for (int cx = 0; cx < bw; cx++)
+                    {
+                        int fIdx = cy * bw + cx;
+                        ac.negZ[fIdx] = _visitedBuf[cx * stride_x + cy * bw + terNegZ25];
+                        ac.posZ[fIdx] = _visitedBuf[cx * stride_x + cy * bw + terPosZ25];
+                    }
+                    _zoneFaceCache[(ox, oz)] = ac;
+                }
+
                 int removed = 0;
                 for (int i = 0; i < islandBufSize; i++)
                     if (!_visitedBuf[i] && buf[i] < 0f) { buf[i] = s; removed++; }
 
-                Log.LogInfo($"[VoxCaves] island-fill zone ({ox},{oz}): seeds={qTail} removed={removed}");
+                Log.LogInfo($"[VoxCaves] island-fill zone ({ox},{oz}): pre={!needsFullPass} seeds={qTail} removed={removed}");
             }
 
             // ── Phase 2.6: Sealed underground pocket removal ──────────────────────────
@@ -1860,6 +1868,7 @@ namespace VoxCaves
             _sdfCache.Clear();
             _profileCache.Clear();
             _heightCache.Clear();
+            _zoneFaceCache.Clear();
             _locationPositions.Clear();
             _locationsCached = false;
             _caveNoise       = null;
@@ -1891,6 +1900,7 @@ namespace VoxCaves
             _heightCache.Clear();
             _zoneMaxY.Clear();
             _zoneExtHi.Clear();
+            _zoneFaceCache.Clear();
             if (_voxelizeColumnsMethod == null) return;
             bool canRemesh = _enqueueMeshMethod != null && _finishSkinNowMethod != null && _int3Ctor != null;
             if (!canRemesh)
@@ -2010,6 +2020,582 @@ namespace VoxCaves
             for (int i = 0; i < 256; i++, y -= s)
                 if (TunnelDensity(worldX, y, worldZ, floorY, prof) <= 0f) return y;
             return y;
+        }
+
+        // ── BakeSdfSetup: Phase 0 noise bake, extracted for reuse in precompute pass ─
+        // Caller must have already run BakeBlendedProfiles so _blendedProfs is current.
+        // Populates all _bk2d*, _noiseBuf, _tunBuf*, _tunWBuf, _bkWarpedH statics.
+        static void BakeSdfSetup(
+            int ox, int oz, int overlap, float s, int extLo, int bh, int bw, int cw4,
+            WorldGenerator? wg, List<Vector2> nearbyLocs,
+            out bool bakeC, out bool bakeA, out bool anyMbActive)
+        {
+            bakeC = false; bakeA = false; anyMbActive = false;
+            int nb4Size = cw4 * cw4 * bh;
+            int nb2Size = cw4 * cw4;
+            if (_noiseBuf  == null || _noiseBuf.Length  < nb4Size) _noiseBuf  = new float[nb4Size];
+            if (_tunBuf    == null || _tunBuf.Length    < nb4Size) _tunBuf    = new float[nb4Size];
+            if (_tunBuf2   == null || _tunBuf2.Length   < nb4Size) _tunBuf2   = new float[nb4Size];
+            if (_tunWBuf   == null || _tunWBuf.Length   < nb4Size) _tunWBuf   = new float[nb4Size];
+            if (_bk2dAddH  == null || _bk2dAddH.Length  < nb2Size) _bk2dAddH  = new float[nb2Size];
+            if (_bk2dLAmp  == null || _bk2dLAmp.Length  < nb2Size) _bk2dLAmp  = new float[nb2Size];
+            if (_bk2dMcS   == null || _bk2dMcS.Length   < nb2Size) _bk2dMcS   = new float[nb2Size];
+            if (_bk2dMcT   == null || _bk2dMcT.Length   < nb2Size) _bk2dMcT   = new float[nb2Size];
+            if (_bk2dFlD   == null || _bk2dFlD.Length   < nb2Size) _bk2dFlD   = new float[nb2Size];
+            if (_bk2dMbwf  == null || _bk2dMbwf.Length  < nb2Size) _bk2dMbwf  = new float[nb2Size];
+            if (_bk2dMbwa  == null || _bk2dMbwa.Length  < nb2Size) _bk2dMbwa  = new float[nb2Size];
+            if (_bk2dMbr   == null || _bk2dMbr.Length   < nb2Size) _bk2dMbr   = new float[nb2Size];
+            if (_bk2dMbvs  == null || _bk2dMbvs.Length  < nb2Size) _bk2dMbvs  = new float[nb2Size];
+            if (_bk2dMbna  == null || _bk2dMbna.Length  < nb2Size) _bk2dMbna  = new float[nb2Size];
+            if (_bk2dMbyo    == null || _bk2dMbyo.Length    < nb2Size) _bk2dMbyo    = new float[nb2Size];
+            if (_bk2dMbtwist == null || _bk2dMbtwist.Length < nb2Size) _bk2dMbtwist = new float[nb2Size];
+            if (_bk2dMawf  == null || _bk2dMawf.Length  < nb2Size) _bk2dMawf  = new float[nb2Size];
+            if (_bk2dMawa  == null || _bk2dMawa.Length  < nb2Size) _bk2dMawa  = new float[nb2Size];
+            if (_bk2dMaf   == null || _bk2dMaf.Length   < nb2Size) _bk2dMaf   = new float[nb2Size];
+            if (_bk2dMavs  == null || _bk2dMavs.Length  < nb2Size) _bk2dMavs  = new float[nb2Size];
+            if (_bk2dMaw   == null || _bk2dMaw.Length   < nb2Size) _bk2dMaw   = new float[nb2Size];
+            if (_bk2dMawv  == null || _bk2dMawv.Length  < nb2Size) _bk2dMawv  = new float[nb2Size];
+            if (_bk2dMawvf == null || _bk2dMawvf.Length < nb2Size) _bk2dMawvf = new float[nb2Size];
+            if (_bk2dMayo  == null || _bk2dMayo.Length  < nb2Size) _bk2dMayo  = new float[nb2Size];
+
+            if (_blendedProfs != null)
+            {
+                for (int i = 0; i < nb2Size && i < _blendedProfs.Length; i++)
+                {
+                    if (_blendedProfs[i].modeC_noiseAmp > 0f) bakeC = true;
+                    if (_blendedProfs[i].modeA_width    > 0f) bakeA = true;
+                    if (_blendedProfs[i].modeB_radius   > 0f) anyMbActive = true;
+                    if (bakeC && bakeA && anyMbActive) break;
+                }
+            }
+
+            for (int cx4 = 0; cx4 < cw4; cx4++)
+            for (int cz4 = 0; cz4 < cw4; cz4++)
+            {
+                int   cx4w  = Math.Min(cx4 * 4, bw - 1);
+                int   cz4w  = Math.Min(cz4 * 4, bw - 1);
+                int   gx4   = ox - overlap + cx4w, gz4 = oz - overlap + cz4w;
+                float wx4   = gx4 * s, wz4 = gz4 * s;
+                int   idx2  = cx4 * cw4 + cz4;
+                var   p4    = (wg != null && _blendedProfs != null && idx2 < _blendedProfs.Length)
+                              ? _blendedProfs[idx2] : CaveProfile.Default;
+
+                _bk2dMcS! [idx2] = p4.modeC_noiseAmp;
+                _bk2dMcT! [idx2] = p4.modeC_threshold;
+                _bk2dFlD! [idx2] = p4.floorDepth;
+                _bk2dMbwf![idx2] = p4.modeB_warpFrequency;
+                _bk2dMbwa![idx2] = p4.modeB_warpAmp;
+                _bk2dMbr! [idx2] = p4.modeB_radius;
+                _bk2dMbvs![idx2] = p4.modeB_vScale;
+                _bk2dMbna![idx2] = p4.modeB_noiseAmp;
+                _bk2dMbyo![idx2]    = p4.modeB_yOffset;
+                _bk2dMbtwist![idx2] = p4.modeB_twist;
+                _bk2dMawf![idx2] = p4.modeA_warpFrequency;
+                _bk2dMawa![idx2] = p4.modeA_warpAmp;
+                _bk2dMaf! [idx2] = p4.modeA_frequency;
+                _bk2dMavs![idx2] = p4.modeA_vScale;
+                _bk2dMaw! [idx2] = p4.modeA_width;
+                _bk2dMawv![idx2] = p4.modeA_widthVary;
+                _bk2dMawvf![idx2]= p4.modeA_widthFrequency;
+                _bk2dMayo! [idx2]= p4.modeA_yOffset;
+
+                if (bakeC && p4.modeC_noiseAmp > 0f)
+                {
+                    float awf4  = p4.modeC_warpFrequency;
+                    float awx4  = _hmAddWarpX!.GetNoise(wx4 * awf4, wz4 * awf4) * p4.modeC_warpAmp;
+                    float awz4  = _hmAddWarpZ!.GetNoise(wx4 * awf4, wz4 * awf4) * p4.modeC_warpAmp;
+                    float addH4    = wg!.GetHeight(wx4 + awx4, wz4 + awz4) - p4.modeC_yOffset;
+                    float avf4  = p4.modeC_ampFrequency;
+                    _bk2dAddH![idx2] = addH4;
+                    _bk2dLAmp![idx2] = Mathf.Max(p4.modeC_noiseAmp * (1f + p4.modeC_ampVary
+                                           * _addVaryNoise!.GetNoise(wx4 * avf4, wz4 * avf4)), 0f);
+                    float ts4 = 1f + p4.modeC_twistVary
+                        * _twistVaryNoise!.GetNoise(wx4 * p4.modeC_twistFrequency, wz4 * p4.modeC_twistFrequency);
+                    float af4 = p4.modeC_frequency, vs4 = p4.modeC_vScale, tw4 = p4.modeC_twist;
+                    int baseIdx = cx4 * cw4 * bh + cz4 * bh;
+                    for (int cy = 0; cy < bh; cy++)
+                    {
+                        float wy4  = (extLo + cy) * s;
+                        float sy4  = (wy4 - addH4) * vs4;
+                        float ang4 = wy4 * tw4 * ts4;
+                        float cos4 = Mathf.Cos(ang4), sin4 = Mathf.Sin(ang4);
+                        float tx4  = wx4 * cos4 - wz4 * sin4;
+                        float tz4  = wx4 * sin4 + wz4 * cos4;
+                        _noiseBuf[baseIdx + cy] = _addNoise!.GetNoise(tx4 * af4, sy4 * af4, tz4 * af4);
+                    }
+                }
+                else if (bakeC)
+                {
+                    _bk2dAddH![idx2] = wg!.GetHeight(wx4, wz4);
+                    _bk2dLAmp![idx2] = 0f;
+                    int baseIdx = cx4 * cw4 * bh + cz4 * bh;
+                    for (int cy = 0; cy < bh; cy++) _noiseBuf[baseIdx + cy] = 0f;
+                }
+
+                if (bakeA && p4.modeA_width > 0f)
+                {
+                    float mawf4  = _bk2dMawf! [idx2];
+                    float mawa4  = _bk2dMawa! [idx2];
+                    float maf4   = _bk2dMaf!  [idx2];
+                    float mavs4  = _bk2dMavs! [idx2];
+                    float mawvf4 = _bk2dMawvf![idx2];
+                    float mayo4  = p4.modeA_yOffset;
+                    float addHA4 = mayo4 > 0f ? wg!.GetHeight(wx4, wz4) : 0f;
+                    int baseIdxA = cx4 * cw4 * bh + cz4 * bh;
+                    for (int cy = 0; cy < bh; cy++)
+                    {
+                        float sy4   = ((extLo + cy) * s - addHA4 + mayo4) * mavs4;
+                        float awx4  = _warpX! .GetNoise(wx4 * mawf4, sy4 * mawf4, wz4 * mawf4) * mawa4;
+                        float awz4  = _warpZ! .GetNoise(wx4 * mawf4, sy4 * mawf4, wz4 * mawf4) * mawa4;
+                        float awx4b = _warpX2!.GetNoise(wx4 * mawf4, sy4 * mawf4, wz4 * mawf4) * mawa4;
+                        float awz4b = _warpZ2!.GetNoise(wx4 * mawf4, sy4 * mawf4, wz4 * mawf4) * mawa4;
+                        _tunBuf! [baseIdxA + cy] = _caveNoise! .GetNoise((wx4 + awx4)  * maf4, sy4 * maf4, (wz4 + awz4)  * maf4);
+                        _tunBuf2![baseIdxA + cy] = _caveNoise2!.GetNoise((wx4 + awx4b) * maf4, sy4 * maf4, (wz4 + awz4b) * maf4);
+                        _tunWBuf![baseIdxA + cy] = _widthNoise!.GetNoise(wx4 * mawvf4, sy4 * mawvf4, wz4 * mawvf4);
+                    }
+                }
+                else if (bakeA)
+                {
+                    int baseIdxA = cx4 * cw4 * bh + cz4 * bh;
+                    for (int cy = 0; cy < bh; cy++) { _tunBuf![baseIdxA + cy] = 0f; _tunBuf2![baseIdxA + cy] = 0f; _tunWBuf![baseIdxA + cy] = 0f; }
+                }
+            }
+
+            if (anyMbActive && wg != null)
+            {
+                int fullSz = bw * bw;
+                if (_bkWarpedH == null || _bkWarpedH.Length < fullSz) _bkWarpedH = new float[fullSz];
+                for (int cx = 0; cx < bw; cx++)
+                for (int cz = 0; cz < bw; cz++)
+                {
+                    float wx = (ox - overlap + cx) * s, wz = (oz - overlap + cz) * s;
+                    int cx4  = cx / 4, cz4  = cz / 4;
+                    int cx4b = Math.Min(cx4 + 1, cw4 - 1), cz4b = Math.Min(cz4 + 1, cw4 - 1);
+                    float bfx2 = (cx & 3) * 0.25f, bfz2 = (cz & 3) * 0.25f;
+                    int b00 = cx4 * cw4 + cz4, b10 = cx4b * cw4 + cz4;
+                    int b01 = cx4 * cw4 + cz4b, b11 = cx4b * cw4 + cz4b;
+                    static float BL2(float[] a, int i00, int i10, int i01, int i11, float fx, float fz) =>
+                        Mathf.Lerp(Mathf.Lerp(a[i00], a[i10], fx),
+                                   Mathf.Lerp(a[i01], a[i11], fx), fz);
+                    float wf    = BL2(_bk2dMbwf!, b00, b10, b01, b11, bfx2, bfz2);
+                    float wa    = BL2(_bk2dMbwa!, b00, b10, b01, b11, bfx2, bfz2);
+                    float yo    = BL2(_bk2dMbyo!, b00, b10, b01, b11, bfx2, bfz2);
+                    float locF2 = LocationFactor(wx, wz, nearbyLocs);
+                    float dx    = _hmWarpX!.GetNoise(wx * wf, wz * wf) * (wa * locF2);
+                    float dz2   = _hmWarpZ!.GetNoise(wx * wf, wz * wf) * (wa * locF2);
+                    _bkWarpedH![cx * bw + cz] = wg.GetHeight(wx + dx, wz + dz2) - yo;
+                }
+            }
+        }
+
+        // ── Cross-zone face cache helpers ─────────────────────────────────────────
+
+        static int CountGroundedFaceVoxels(ZoneFaceCache c)
+        {
+            int n = 0;
+            if (c.negX != null) foreach (var b in c.negX) if (b) n++;
+            if (c.posX != null) foreach (var b in c.posX) if (b) n++;
+            if (c.negZ != null) foreach (var b in c.negZ) if (b) n++;
+            if (c.posZ != null) foreach (var b in c.posZ) if (b) n++;
+            return n;
+        }
+
+        static (int yLo, int yHi) ComputeYBounds(int ox, int oz, int w, float s, WorldGenerator wg)
+        {
+            float minH = float.MaxValue, maxH = float.MinValue;
+            for (int gx = 0; gx <= w; gx++)
+            for (int gz = 0; gz <= w; gz++)
+            {
+                float h = wg.GetHeight((ox + gx) * s, (oz + gz) * s) / s;
+                if (h < minH) minH = h;
+                if (h > maxH) maxH = h;
+            }
+            return ((int)Math.Floor(minH) - 2, (int)Math.Ceiling(maxH) + 2);
+        }
+
+        // On-demand fixpoint: seeds with the faces that the pre-pass BFS found to have
+        // ungrounded solid (ungNX/PX/NZ/PZ).  Expands outward via chain hops until every
+        // zone in the worklist is terminal (no ungrounded solid touching an uncached face).
+        // Re-queues zones whose caches improved so multi-hop chains resolve correctly.
+        const int FixpointMaxZones = 64; // safety cap; logged if hit
+
+        static void EnsureFixpoint(int ox, int oz, int w,
+                                   bool ungNX, bool ungPX, bool ungNZ, bool ungPZ)
+        {
+            float s  = _scale ?? 1f;
+            var   wg = WorldGenerator.instance;
+            if (wg == null) return;
+
+            var worklist = new Queue<(int ox, int oz)>();
+            var seen     = new HashSet<(int, int)> { (ox, oz) };
+            int computed = 0;
+
+            void MaybeEnqueue(int nox, int noz, bool faceUngrounded)
+            {
+                if (!faceUngrounded) return;
+                if (_zoneFaceCache.ContainsKey((nox, noz))) return;
+                if (!seen.Add((nox, noz))) return;
+                worklist.Enqueue((nox, noz));
+            }
+
+            MaybeEnqueue(ox - w, oz, ungNX);
+            MaybeEnqueue(ox + w, oz, ungPX);
+            MaybeEnqueue(ox, oz - w, ungNZ);
+            MaybeEnqueue(ox, oz + w, ungPZ);
+
+            while (worklist.Count > 0)
+            {
+                if (computed >= FixpointMaxZones)
+                {
+                    Log.LogWarning($"[VoxCaves] EnsureFixpoint ({ox},{oz}): hit cap ({FixpointMaxZones}), {worklist.Count} zones skipped");
+                    break;
+                }
+
+                var (zox, zoz) = worklist.Dequeue();
+
+                int beforeCount = _zoneFaceCache.TryGetValue((zox, zoz), out var oldC)
+                    ? CountGroundedFaceVoxels(oldC) : -1;
+
+                var (zyLo, zyHi) = ComputeYBounds(zox, zoz, w, s, wg);
+                ComputeZoneFaceCache(zox, zoz, w, zyLo, zyHi);
+                computed++;
+
+                if (!_zoneFaceCache.TryGetValue((zox, zoz), out var nc)) continue;
+                int afterCount = CountGroundedFaceVoxels(nc);
+                bool improved  = afterCount > beforeCount;
+
+                void HopIfNeeded(bool needsFlag, int nnox, int nnoz)
+                {
+                    if (!needsFlag) return;
+                    if (_zoneFaceCache.ContainsKey((nnox, nnoz))) return;
+                    if (!seen.Add((nnox, nnoz))) return;
+                    worklist.Enqueue((nnox, nnoz));
+                }
+                HopIfNeeded(nc.needsNegX, zox - w, zoz);
+                HopIfNeeded(nc.needsPosX, zox + w, zoz);
+                HopIfNeeded(nc.needsNegZ, zox, zoz - w);
+                HopIfNeeded(nc.needsPosZ, zox, zoz + w);
+
+                if (improved)
+                {
+                    void RequeueIfCached(int nnox, int nnoz)
+                    {
+                        if ((nnox, nnoz) == (ox, oz)) return;
+                        if (!_zoneFaceCache.ContainsKey((nnox, nnoz))) return;
+                        if (!seen.Add((nnox, nnoz))) return;
+                        worklist.Enqueue((nnox, nnoz));
+                    }
+                    RequeueIfCached(zox - w, zoz);
+                    RequeueIfCached(zox + w, zoz);
+                    RequeueIfCached(zox, zoz - w);
+                    RequeueIfCached(zox, zoz + w);
+                }
+            }
+
+            if (computed > 0)
+                Log.LogInfo($"[VoxCaves] EnsureFixpoint ({ox},{oz}): {computed} neighbor zone(s) computed");
+        }
+
+        // ── Cross-zone face cache precompute ──────────────────────────────────────
+        // Runs SDF+BFS for one zone, using any already-available neighbor face caches
+        // as extra grounding seeds.  Populates _zoneFaceCache[(ox,oz)].
+        static void ComputeZoneFaceCache(int ox, int oz, int w, int yLo, int yHi)
+        {
+            const int overlap = 4;
+            float s  = _scale ?? 1f;
+            var   wg = WorldGenerator.instance;
+
+            int bwZ = w + 2 * overlap;
+            int cw4 = (bwZ + 3) / 4;
+
+            if (wg != null) BakeBlendedProfiles(cw4, ox, oz, overlap, s, wg);
+
+            // Compute hiMargin from blended corner profiles (mirrors Carve logic)
+            int hiMargin = 24;
+            if (_blendedProfs != null)
+            {
+                float maxExtM = 0f;
+                int   lastC   = cw4 - 1;
+                void CheckCP(int ci, int cj) {
+                    int idx = ci * cw4 + cj;
+                    if (idx >= _blendedProfs.Length) return;
+                    var cp = _blendedProfs[idx];
+                    if (cp.modeC_noiseAmp <= 0f) return;
+                    float a = cp.modeC_noiseAmp * Mathf.Max(1f, 1f + cp.modeC_ampVary);
+                    float e = Mathf.Max(0f, 1f - cp.modeC_threshold) * a + cp.modeC_warpAmp;
+                    if (e > maxExtM) maxExtM = e;
+                }
+                CheckCP(cw4/2, cw4/2);
+                CheckCP(0, 0); CheckCP(lastC, 0); CheckCP(0, lastC); CheckCP(lastC, lastC);
+                if (maxExtM > 0f) hiMargin = Mathf.Max(24, (int)Mathf.Ceil(maxExtM / s) + 8);
+            }
+
+            int extLo  = yLo - 24;
+            int extHi  = yHi + hiMargin;
+            int bhZ    = extHi - extLo + 1;
+            int bufSz  = bwZ * bhZ * bwZ;
+
+            if (_precomputeBuf == null || _precomputeBuf.Length < bufSz) _precomputeBuf = new float[bufSz];
+            float[] buf = _precomputeBuf;
+
+            InitNoise();
+
+            // Build nearby-location list (same as Carve)
+            float zoneX   = (ox + w * 0.5f) * s;
+            float zoneZ   = (oz + w * 0.5f) * s;
+            float searchR = w * s * 0.5f + LocProtectR + LocFadeR;
+            var   nearby  = new List<Vector2>();
+            foreach (var loc in _locationPositions)
+            {
+                float dx = loc.x - zoneX, dz = loc.y - zoneZ;
+                if (dx * dx + dz * dz < searchR * searchR) nearby.Add(loc);
+            }
+
+            BakeSdfSetup(ox, oz, overlap, s, extLo, bhZ, bwZ, cw4, wg, nearby,
+                out bool bakeC, out bool bakeA, out bool anyMbActive);
+            FillPhase1(buf, bwZ, bhZ, extLo, s, ox, oz, overlap, bakeC, bakeA, anyMbActive, wg, cw4, nearby);
+
+            // BFS: seed from cy=0 (bedrock) + neighbor-grounded face voxels
+            int stX   = bhZ * bwZ;    // stride in X
+            int bufSz2 = bwZ * bhZ * bwZ;
+            if (_visitedBuf  == null || _visitedBuf.Length  < bufSz2) _visitedBuf  = new bool[bufSz2];
+            if (_islandQueue == null || _islandQueue.Length < bufSz2) _islandQueue = new int[bufSz2];
+            Array.Clear(_visitedBuf, 0, bufSz2);
+            int qHead = 0, qTail = 0;
+
+            // Seed 1: cy=0 across full buffer
+            for (int cx = 0; cx < bwZ; cx++)
+            for (int cz = 0; cz < bwZ; cz++)
+            {
+                int idx = cx * stX + cz; // cy=0
+                if (buf[idx] < 0f && !_visitedBuf[idx])
+                { _visitedBuf[idx] = true; _islandQueue[qTail++] = idx; }
+            }
+
+            // Seed 2: voxels adjacent to a neighbor's grounded face
+            // Face alignment: both zones share the same bw, same cz/cy coordinate space
+            // (territories tile without gap; cy matched via world-Y = extLo + cy).
+            void SeedFromNeighborFace(bool[]? nFace, int nExtLo, int nBh, int nBw,
+                                      int ourCx, bool iterateCz)
+            {
+                if (nFace == null) return;
+                int maxCperp = iterateCz ? bwZ : bwZ; // both axes use bwZ
+                for (int cperp = 0; cperp < maxCperp; cperp++)
+                for (int cy = 0; cy < bhZ; cy++)
+                {
+                    int worldY = extLo + cy;
+                    int ncy    = worldY - nExtLo;
+                    if (ncy < 0 || ncy >= nBh) continue;
+                    int nIdx = ncy * nBw + cperp;
+                    if (nIdx >= nFace.Length || !nFace[nIdx]) continue;
+                    int bufIdx = iterateCz
+                        ? ourCx * stX + cy * bwZ + cperp   // X face: (ourCx, cy, cperp=cz)
+                        : cperp * stX + cy * bwZ + ourCx;  // Z face: (cperp=cx, cy, ourCz)
+                    if (buf[bufIdx] < 0f && !_visitedBuf[bufIdx])
+                    { _visitedBuf[bufIdx] = true; _islandQueue[qTail++] = bufIdx; }
+                }
+            }
+
+            int terNegX = overlap;
+            int terPosX = overlap + w - 1;
+            int terNegZ = overlap;
+            int terPosZ = overlap + w - 1;
+
+            if (_zoneFaceCache.TryGetValue((ox - w, oz), out var negXN))
+                SeedFromNeighborFace(negXN.posX, negXN.extLo, negXN.bh, negXN.bw, terNegX, true);
+            if (_zoneFaceCache.TryGetValue((ox + w, oz), out var posXN))
+                SeedFromNeighborFace(posXN.negX, posXN.extLo, posXN.bh, posXN.bw, terPosX, true);
+            if (_zoneFaceCache.TryGetValue((ox, oz - w), out var negZN))
+                SeedFromNeighborFace(negZN.posZ, negZN.extLo, negZN.bh, negZN.bw, terNegZ, false);
+            if (_zoneFaceCache.TryGetValue((ox, oz + w), out var posZN))
+                SeedFromNeighborFace(posZN.negZ, posZN.extLo, posZN.bh, posZN.bw, terPosZ, false);
+
+            // BFS flood
+            while (qHead < qTail)
+            {
+                int idx = _islandQueue[qHead++];
+                int cx  = idx / stX;
+                int rem = idx % stX;
+                int cy  = rem / bwZ;
+                int cz  = rem % bwZ;
+                int ni;
+                if (cx > 0)     { ni = idx - stX;  if (!_visitedBuf[ni] && buf[ni] < 0f) { _visitedBuf[ni] = true; _islandQueue[qTail++] = ni; } }
+                if (cx < bwZ-1) { ni = idx + stX;  if (!_visitedBuf[ni] && buf[ni] < 0f) { _visitedBuf[ni] = true; _islandQueue[qTail++] = ni; } }
+                if (cy > 0)     { ni = idx - bwZ;  if (!_visitedBuf[ni] && buf[ni] < 0f) { _visitedBuf[ni] = true; _islandQueue[qTail++] = ni; } }
+                if (cy < bhZ-1) { ni = idx + bwZ;  if (!_visitedBuf[ni] && buf[ni] < 0f) { _visitedBuf[ni] = true; _islandQueue[qTail++] = ni; } }
+                if (cz > 0)     { ni = idx - 1;    if (!_visitedBuf[ni] && buf[ni] < 0f) { _visitedBuf[ni] = true; _islandQueue[qTail++] = ni; } }
+                if (cz < bwZ-1) { ni = idx + 1;    if (!_visitedBuf[ni] && buf[ni] < 0f) { _visitedBuf[ni] = true; _islandQueue[qTail++] = ni; } }
+            }
+
+            // Build solid face cache from BFS result
+            int faceSz = bhZ * bwZ;
+            var cache  = new ZoneFaceCache {
+                extLo = extLo, bh = bhZ, bw = bwZ,
+                negX    = new bool[faceSz], posX    = new bool[faceSz],
+                negZ    = new bool[faceSz], posZ    = new bool[faceSz],
+                negXAir = new bool[faceSz], posXAir = new bool[faceSz],
+                negZAir = new bool[faceSz], posZAir = new bool[faceSz],
+            };
+            for (int cy = 0; cy < bhZ; cy++)
+            for (int cz = 0; cz < bwZ; cz++)
+            {
+                int fIdx = cy * bwZ + cz;
+                cache.negX[fIdx] = _visitedBuf[terNegX * stX + cy * bwZ + cz];
+                cache.posX[fIdx] = _visitedBuf[terPosX * stX + cy * bwZ + cz];
+            }
+            for (int cy = 0; cy < bhZ; cy++)
+            for (int cx = 0; cx < bwZ; cx++)
+            {
+                int fIdx = cy * bwZ + cx;
+                cache.negZ[fIdx] = _visitedBuf[cx * stX + cy * bwZ + terNegZ];
+                cache.posZ[fIdx] = _visitedBuf[cx * stX + cy * bwZ + terPosZ];
+            }
+
+            // Air-connectivity BFS: seed from buffer boundary air, flood through air.
+            // Records which territory face voxels connect to the open world —
+            // used to prevent pocket removal from filling caves that exit through a neighbor.
+            Array.Clear(_visitedBuf, 0, bufSz2);
+            qHead = 0; qTail = 0;
+
+            void TryEnqueueAirSeed(int idx) {
+                if (!_visitedBuf[idx] && buf[idx] >= 0f)
+                { _visitedBuf[idx] = true; _islandQueue![qTail++] = idx; }
+            }
+
+            // Top face (cy = bhZ-1)
+            for (int cx = 0; cx < bwZ; cx++)
+            for (int cz = 0; cz < bwZ; cz++)
+                TryEnqueueAirSeed(cx * stX + (bhZ - 1) * bwZ + cz);
+            // Buffer side faces (cx=0, cx=bwZ-1, cz=0, cz=bwZ-1), all cy
+            for (int cy = 0; cy < bhZ; cy++)
+            for (int cz = 0; cz < bwZ; cz++)
+            {
+                TryEnqueueAirSeed(0          * stX + cy * bwZ + cz);
+                TryEnqueueAirSeed((bwZ - 1)  * stX + cy * bwZ + cz);
+            }
+            for (int cx = 0; cx < bwZ; cx++)
+            for (int cy = 0; cy < bhZ; cy++)
+            {
+                TryEnqueueAirSeed(cx * stX + cy * bwZ + 0);
+                TryEnqueueAirSeed(cx * stX + cy * bwZ + (bwZ - 1));
+            }
+
+            while (qHead < qTail)
+            {
+                int idx = _islandQueue[qHead++];
+                int cx  = idx / stX;
+                int rem = idx % stX;
+                int cy  = rem / bwZ;
+                int cz  = rem % bwZ;
+                int ni;
+                if (cx > 0)     { ni = idx - stX;  if (!_visitedBuf[ni] && buf[ni] >= 0f) { _visitedBuf[ni] = true; _islandQueue[qTail++] = ni; } }
+                if (cx < bwZ-1) { ni = idx + stX;  if (!_visitedBuf[ni] && buf[ni] >= 0f) { _visitedBuf[ni] = true; _islandQueue[qTail++] = ni; } }
+                if (cy > 0)     { ni = idx - bwZ;  if (!_visitedBuf[ni] && buf[ni] >= 0f) { _visitedBuf[ni] = true; _islandQueue[qTail++] = ni; } }
+                if (cy < bhZ-1) { ni = idx + bwZ;  if (!_visitedBuf[ni] && buf[ni] >= 0f) { _visitedBuf[ni] = true; _islandQueue[qTail++] = ni; } }
+                if (cz > 0)     { ni = idx - 1;    if (!_visitedBuf[ni] && buf[ni] >= 0f) { _visitedBuf[ni] = true; _islandQueue[qTail++] = ni; } }
+                if (cz < bwZ-1) { ni = idx + 1;    if (!_visitedBuf[ni] && buf[ni] >= 0f) { _visitedBuf[ni] = true; _islandQueue[qTail++] = ni; } }
+            }
+
+            for (int cy = 0; cy < bhZ; cy++)
+            for (int cz = 0; cz < bwZ; cz++)
+            {
+                int fIdx = cy * bwZ + cz;
+                cache.negXAir[fIdx] = _visitedBuf[terNegX * stX + cy * bwZ + cz];
+                cache.posXAir[fIdx] = _visitedBuf[terPosX * stX + cy * bwZ + cz];
+            }
+            for (int cy = 0; cy < bhZ; cy++)
+            for (int cx = 0; cx < bwZ; cx++)
+            {
+                int fIdx = cy * bwZ + cx;
+                cache.negZAir[fIdx] = _visitedBuf[cx * stX + cy * bwZ + terNegZ];
+                cache.posZAir[fIdx] = _visitedBuf[cx * stX + cy * bwZ + terPosZ];
+            }
+
+            // Set needs* flags: face has ungrounded solid AND the corresponding neighbor is uncached.
+            // EnsureFixpoint uses these to expand the worklist toward zones that could resolve the blob.
+            bool anyNegXUng = false, anyPosXUng = false, anyNegZUng = false, anyPosZUng = false;
+            for (int cy = 0; cy < bhZ; cy++)
+            for (int cz = 0; cz < bwZ; cz++)
+            {
+                int iNX = terNegX * stX + cy * bwZ + cz;
+                int iPX = terPosX * stX + cy * bwZ + cz;
+                if (!anyNegXUng && buf[iNX] < 0f && !_visitedBuf[iNX]) anyNegXUng = true;
+                if (!anyPosXUng && buf[iPX] < 0f && !_visitedBuf[iPX]) anyPosXUng = true;
+            }
+            for (int cy = 0; cy < bhZ; cy++)
+            for (int cx = 0; cx < bwZ; cx++)
+            {
+                int iNZ = cx * stX + cy * bwZ + terNegZ;
+                int iPZ = cx * stX + cy * bwZ + terPosZ;
+                if (!anyNegZUng && buf[iNZ] < 0f && !_visitedBuf[iNZ]) anyNegZUng = true;
+                if (!anyPosZUng && buf[iPZ] < 0f && !_visitedBuf[iPZ]) anyPosZUng = true;
+            }
+            cache.needsNegX = anyNegXUng && !_zoneFaceCache.ContainsKey((ox - w, oz));
+            cache.needsPosX = anyPosXUng && !_zoneFaceCache.ContainsKey((ox + w, oz));
+            cache.needsNegZ = anyNegZUng && !_zoneFaceCache.ContainsKey((ox, oz - w));
+            cache.needsPosZ = anyPosZUng && !_zoneFaceCache.ContainsKey((ox, oz + w));
+
+            _zoneFaceCache[(ox, oz)] = cache;
+        }
+
+        // Worklist fixpoint: runs ComputeZoneFaceCache for all known zones in FIFO order.
+        // Each zone is re-queued until fully resolved (all 4 neighbors cached).
+        // Terminates when a full pass produces no new resolutions.
+        static void PrecomputeFaceCaches()
+        {
+            if (_zoneParams.Count == 0) return;
+            _zoneFaceCache.Clear();
+
+            var queue = new Queue<(int ox, int oz, int w, int yLo, int yHi)>();
+            foreach (var kv in _zoneParams)
+                queue.Enqueue((kv.Value.ox, kv.Value.oz, kv.Value.w, kv.Value.yLo, kv.Value.yHi));
+
+            int total     = queue.Count;
+            int totalDone = 0;
+            var sw        = System.Diagnostics.Stopwatch.StartNew();
+            Log.LogInfo($"[VoxCaves] PrecomputeFaceCaches: starting {total} zones");
+
+            while (queue.Count > 0)
+            {
+                int passSize   = queue.Count;
+                int passResolved = 0;
+
+                for (int i = 0; i < passSize; i++)
+                {
+                    var (ox, oz, w, yLo, yHi) = queue.Dequeue();
+                    int beforeCount = _zoneFaceCache.TryGetValue((ox, oz), out var oldCachePC)
+                        ? CountGroundedFaceVoxels(oldCachePC) : -1;
+                    ComputeZoneFaceCache(ox, oz, w, yLo, yHi);
+                    int afterCount = _zoneFaceCache.TryGetValue((ox, oz), out var newCachePC)
+                        ? CountGroundedFaceVoxels(newCachePC) : -1;
+                    bool resolved = !(newCachePC.needsNegX || newCachePC.needsPosX ||
+                                      newCachePC.needsNegZ || newCachePC.needsPosZ);
+                    bool improved = afterCount > beforeCount;
+                    if (resolved || !improved)
+                    {
+                        totalDone++;
+                        passResolved++;
+                    }
+                    else
+                    {
+                        queue.Enqueue((ox, oz, w, yLo, yHi));
+                    }
+                }
+
+                Log.LogInfo($"[VoxCaves] PrecomputeFaceCaches: pass complete — resolved {passResolved}/{passSize}, total {totalDone}/{total}, {sw.ElapsedMilliseconds}ms elapsed");
+
+                if (passResolved == 0)
+                {
+                    // Fixpoint: remaining zones have mutually unresolvable ambiguity (circular
+                    // floating-island chains with no bedrock anywhere in the loop).
+                    // Mark them done with their current (partial) face cache — Carve() will
+                    // cull the genuinely floating blobs during its own island removal pass.
+                    Log.LogInfo($"[VoxCaves] PrecomputeFaceCaches: fixpoint — {queue.Count} zones remain ambiguous, treating as floating");
+                    break;
+                }
+            }
+
+            Log.LogInfo($"[VoxCaves] PrecomputeFaceCaches: done in {sw.ElapsedMilliseconds}ms, {totalDone}/{total} fully resolved");
         }
 
         static void FillYColumn(float[] buf, int bw, int bh, int extLo, float s, int cx, int cz,
