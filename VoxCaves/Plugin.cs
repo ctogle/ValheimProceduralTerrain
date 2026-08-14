@@ -88,7 +88,6 @@ namespace VoxCaves
 
         // ── Debug flags ───────────────────────────────────────────────────────────
         internal static volatile bool _disableVegetation;
-        internal static volatile bool _pendingVegCleanup;
 
         // ── Biome profiles ────────────────────────────────────────────────────────
         static volatile Dictionary<string, CaveProfile> _namedProfiles
@@ -184,6 +183,11 @@ namespace VoxCaves
         // Per-zone SDF cache: filled by Phase 3, queried by FallbackDensityPatch.
         // Layout: data[(ci * bh + cy) * width + ri]  (ci=zoneX, ri=zoneZ, cy=Y-extLo)
         internal static readonly Dictionary<string, (int extLo, int bh, int width, sbyte[] data)> _sdfCache = new();
+
+        // Per-zone surface height cache: filled after Phase 2, queried by GetWorldHeight patch.
+        // Layout: surfH[cx * bw + cz] = world-Y of topmost solid voxel (NaN = no solid in column).
+        // Includes overlap region so border columns near zone edges are correct.
+        internal static readonly Dictionary<(int ox, int oz), (int bw, int extLo, float s, float[] surfH)> _surfHCache = new();
 
         // Int3 field accessors — used by FallbackDensityPatch to extract X/Y/Z from boxed struct.
         internal static FieldInfo? _int3FieldX, _int3FieldY, _int3FieldZ;
@@ -305,26 +309,12 @@ namespace VoxCaves
         static int _diagFrame;
 
         static int _pollFrame;
-        static int _vegCleanupDelay;
         void Update()
         {
-            if (_pendingVegCleanup && ZNetScene.instance != null && ZoneSystem.instance != null)
-            {
-                // Wait ~3 s after conditions are met so voxel meshes are built before the physics check
-                if (++_vegCleanupDelay > 90)
-                {
-                    _pendingVegCleanup = false;
-                    _vegCleanupDelay   = 0;
-                    CleanupVegetation();
-                }
-            }
-            else _vegCleanupDelay = 0;
-
             if (_hotReloadPending)
             {
                 _hotReloadPending = false;
                 RecarveAll();
-                _pendingVegCleanup = true;
             }
 
             // Voxheim mesh queue diagnostic — log every ~10 s
@@ -382,38 +372,6 @@ namespace VoxCaves
             _configLastWrite = t;
             LoadBiomeConfig();
             RecarveAll();
-            _pendingVegCleanup = true; // remove vegetation that may now be floating after terrain reset
-        }
-
-        static void CleanupVegetation()
-        {
-            var zns = ZNetScene.instance;
-            var zs  = ZoneSystem.instance;
-            if (zns == null || zs == null) return;
-            var vegNames = new HashSet<string>();
-            foreach (var veg in zs.m_vegetation)
-                if (veg.m_prefab != null) vegNames.Add(veg.m_prefab.name);
-            if (vegNames.Count == 0) return;
-            int count = 0;
-            foreach (var nv in UnityEngine.Object.FindObjectsOfType<ZNetView>())
-            {
-                if (nv == null) continue;
-                string nm = nv.gameObject.name;
-                if (nm.EndsWith("(Clone)")) nm = nm.Substring(0, nm.Length - 7).TrimEnd();
-                if (!vegNames.Contains(nm)) continue;
-
-                if (!_disableVegetation)
-                {
-                    // Keep vegetation that has solid ground within 1.5 m directly below —
-                    // removes trees on carved cliff faces where no horizontal surface exists.
-                    Vector3 pos = nv.transform.position;
-                    if (Physics.Raycast(pos + Vector3.up * 0.5f, Vector3.down, 2f))
-                        continue;
-                }
-
-                zns.Destroy(nv.gameObject); count++;
-            }
-            Log.LogInfo($"[VoxCaves] Removed {count} vegetation objects.");
         }
 
         // ── Type lookup ───────────────────────────────────────────────────────────
@@ -665,7 +623,6 @@ namespace VoxCaves
                         if (k == "disablevegetation")
                         {
                             _disableVegetation = v == "1" || v == "true";
-                            if (_disableVegetation) _pendingVegCleanup = true;
                         }
                         if (k == "protectlocations")
                             _protectLocations = !(v == "0" || v == "false");
@@ -1783,6 +1740,28 @@ namespace VoxCaves
                 Log.LogInfo($"[VoxCaves] pocket-fill zone ({ox},{oz}): filled={filled}");
             }
 
+            // ── Surface height cache (for vegetation placement) ───────────────────────
+            // Scan each XZ column top-down and record the world-Y of the first solid voxel.
+            // Covers the full buffer including overlap so border trees land correctly.
+            {
+                var surfH = new float[bw * bw];
+                for (int cx = 0; cx < bw; cx++)
+                for (int cz = 0; cz < bw; cz++)
+                {
+                    float sh = float.NaN;
+                    for (int cy = bh - 1; cy >= 0; cy--)
+                    {
+                        if (buf[(cx * bh + cy) * bw + cz] < 0f)
+                        {
+                            sh = (extLo + cy) * s;
+                            break;
+                        }
+                    }
+                    surfH[cx * bw + cz] = sh;
+                }
+                lock (_surfHCache) _surfHCache[(ox, oz)] = (bw, extLo, s, surfH);
+            }
+
             // ── Phase 3: Write SDF directly to VoxelField via the 'field' parameter ────
             // Writing to the same object VoxelizeColumns used (not _voxelZoneFieldField)
             // ensures RebuildBrick reads the correct SDF regardless of Voxheim's internal
@@ -1853,8 +1832,6 @@ namespace VoxCaves
                 if (!_zoneExtHi.TryGetValue(zoneKey, out int prevHiMark) || hiMark > prevHiMark)
                     _zoneExtHi[zoneKey] = hiMark;
             }
-
-            if (_disableVegetation) _pendingVegCleanup = true;
 
             long _t3 = _sw.ElapsedMilliseconds;
 
@@ -1955,7 +1932,6 @@ namespace VoxCaves
         internal static void ResetWorldState()
         {
             LoadBiomeConfig();
-            _pendingVegCleanup = true;
             _zoneObjects.Clear();
             _zoneParams.Clear();
             _zoneMaxY.Clear();
@@ -1963,6 +1939,7 @@ namespace VoxCaves
             _sdfCache.Clear();
             _profileCache.Clear();
             _heightCache.Clear();
+            lock (_surfHCache) _surfHCache.Clear();
             _zoneFaceCache.Clear();
             _locationPositions.Clear();
             _locationsCached = false;
@@ -1995,6 +1972,7 @@ namespace VoxCaves
             _sdfCache.Clear();
             _profileCache.Clear();
             _heightCache.Clear();
+            lock (_surfHCache) _surfHCache.Clear();
             _zoneMaxY.Clear();
             _zoneExtHi.Clear();
             _zoneFaceCache.Clear();
@@ -2105,18 +2083,26 @@ namespace VoxCaves
         }
 
         // ── Placement height ──────────────────────────────────────────────────────
+        // Returns the world-Y of the highest VoxCaves solid surface at (worldX, worldZ),
+        // or originalY if no cached surface exists or if it is lower than originalY.
         internal static float FindCarvedSurfaceY(float worldX, float originalY, float worldZ)
         {
             float s = _scale is { } v && v > 0f ? v
                     : _scaleField != null && _scaleField.GetValue(null) is float sf && sf > 0f ? sf
                     : 1f;
-            var wg = WorldGenerator.instance;
-            float floorY = ComputeColumnFloor(worldX, worldZ, wg);
-            var prof = wg != null ? PointBlendProfile(worldX, worldZ, wg, s) : CaveProfile.Default;
-            float y = originalY;
-            for (int i = 0; i < 256; i++, y -= s)
-                if (TunnelDensity(worldX, y, worldZ, floorY, prof) <= 0f) return y;
-            return y;
+            const int overlap = 4, width = 64;
+            int gx = Mathf.RoundToInt(worldX / s);
+            int gz = Mathf.RoundToInt(worldZ / s);
+            // Zone origin (in voxel coords) — same formula as Carve() line that derives ox.
+            int ox = gx - ((gx % width + width) % width);
+            int oz = gz - ((gz % width + width) % width);
+            (int bw, int extLo, float zs, float[] surfH) entry;
+            lock (_surfHCache)
+                if (!_surfHCache.TryGetValue((ox, oz), out entry)) return originalY;
+            int cx = Mathf.Clamp(gx - (ox - overlap), 0, entry.bw - 1);
+            int cz = Mathf.Clamp(gz - (oz - overlap), 0, entry.bw - 1);
+            float sh = entry.surfH[cx * entry.bw + cz];
+            return float.IsNaN(sh) ? originalY : Mathf.Max(originalY, sh);
         }
 
         // ── BakeSdfSetup: Phase 0 noise bake, extracted for reuse in precompute pass ─
@@ -3161,6 +3147,21 @@ namespace VoxCaves
         }
     }
 
+    // Raises vegetation/location ground height to the top of VoxCaves-carved terrain.
+    // Heightmap.GetWorldHeight is what ZoneSystem.GetGroundData calls to set p.y before
+    // spawning each vegetation object. We look up our post-blur SDF surface in _surfHCache
+    // and return the higher of the vanilla height and the VoxCaves surface.
+    [HarmonyPatch(typeof(Heightmap), "GetWorldHeight")]
+    static class HeightmapGetWorldHeightPatch
+    {
+        static void Postfix(Vector3 worldPos, ref float height, bool __result)
+        {
+            if (!__result) return;
+            float sh = Plugin.FindCarvedSurfaceY(worldPos.x, height, worldPos.z);
+            if (sh > height) height = sh;
+        }
+    }
+
     [HarmonyPatch(typeof(ZNet), nameof(ZNet.SetServer))]
     static class WorldLoadPatch
     {
@@ -3196,6 +3197,7 @@ namespace VoxCaves
             Plugin._zoneObjects.Remove(key);
             Plugin._zoneMaxY.Remove(key);
             Plugin._zoneExtHi.Remove(key);
+            lock (Plugin._surfHCache) Plugin._surfHCache.Remove((ox, oz));
         }
     }
 
