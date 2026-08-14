@@ -41,6 +41,7 @@ namespace VoxCaves
         public float modeC_twistFrequency; // spatial frequency of twist variation noise
         public float modeC_ampVary;        // amplitude of spatial noise-amplitude modulation (0=uniform)
         public float modeC_ampFrequency;   // spatial frequency of amplitude modulation noise
+        public float modeC_flare;          // widens feature toward top (positive) or narrows (negative)
         public float modeC_yOffset;        // shift density field anchor this many units below the heightmap (0=surface)
 
         public float modeB_vScale;      // Y scale when sampling 3D wall-noise (low=flat, high=vertical)
@@ -66,7 +67,7 @@ namespace VoxCaves
             modeC_threshold     = 0f,     modeC_noiseAmp      = 0f,     modeC_frequency    = 0.015f,
             modeC_warpAmp      = 8f,     modeC_warpFrequency = 0.005f, modeC_vScale       = 0.4f,
             modeC_twist        = 0f,     modeC_twistVary     = 0f,     modeC_twistFrequency = 0.003f,
-            modeC_ampVary      = 0f,     modeC_ampFrequency  = 0.003f,
+            modeC_ampVary      = 0f,     modeC_ampFrequency  = 0.003f, modeC_flare          = 0f,
             floorDepth      = 8f,
         };
     }
@@ -106,6 +107,7 @@ namespace VoxCaves
         internal static float _biomeBlendRadius    = 192f;
         internal static bool  _biomeBlendSmooth    = true;   // false=linear, true=smoothstep
         internal static int   _transitionBlurPasses = 3;     // min blur passes for any active zone
+        internal static int   _fixpointMaxZones     = 8;     // EnsureFixpoint hop cap
         internal static float _coastFade           = 0f;     // world units above sea level over which Ocean inflates into blend (0=off)
         const float LocProtectR = 30f;
         const float LocFadeR    = 40f;
@@ -204,6 +206,7 @@ namespace VoxCaves
         // Reused across Carve() calls to avoid per-zone GC pressure.
         internal static float[]? _bufA;
         internal static float[]? _bufB;
+        internal static float[]? _bufC; // orig snapshot for Taubin λ/μ steps
         // Dedicated buffer for ComputeZoneFaceCache so it never clobbers Carve()'s active buf.
         internal static float[]? _precomputeBuf;
 
@@ -216,6 +219,7 @@ namespace VoxCaves
         internal static float[]? _bk2dLAmp;  // Mode C local amplitude
         internal static float[]? _bk2dMcS;   // modeC_noiseAmp (post-bake, for bakeC gate)
         internal static float[]? _bk2dMcT;   // modeC_threshold
+        internal static float[]? _bk2dMcFlare; // modeC_flare
         internal static float[]? _bk2dFlD;   // floorDepth
         internal static float[]? _bk2dFlFade; // floorFade
         // 2D coarse bake — Mode B shape params
@@ -596,6 +600,7 @@ namespace VoxCaves
                     case "modec_twistfrequency":  p.modeC_twistFrequency  = v; break;
                     case "modec_ampvary":         p.modeC_ampVary         = v; break;
                     case "modec_ampfrequency":    p.modeC_ampFrequency    = v; break;
+                    case "modec_flare":           p.modeC_flare           = v; break;
                     case "modec_yoffset":         p.modeC_yOffset         = v; break;
                     case "blur_passes":            p.blur_passes            = v; break;
                     case "perona_k":              p.perona_k              = v; break;
@@ -674,6 +679,8 @@ namespace VoxCaves
                             _biomeBlendSmooth = !(v == "0" || v == "false");
                         if (k == "transitionblurpasses" && int.TryParse(v, out int tbp))
                             _transitionBlurPasses = Mathf.Max(0, tbp);
+                        if (k == "fixpointmaxzones" && int.TryParse(v, out int fmz))
+                            _fixpointMaxZones = Mathf.Max(1, fmz);
                         if (k == "coastfade" && float.TryParse(v, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float cf))
                             _coastFade = Mathf.Max(0f, cf);
                     }
@@ -1057,7 +1064,7 @@ namespace VoxCaves
                 result.modeC_warpFrequency  += w*prof.modeC_warpFrequency; result.modeC_vScale    += w*prof.modeC_vScale;
                 result.modeC_twist          += w*prof.modeC_twist;     result.modeC_twistVary     += w*prof.modeC_twistVary;
                 result.modeC_twistFrequency += w*prof.modeC_twistFrequency; result.modeC_ampVary  += w*prof.modeC_ampVary;
-                result.modeC_ampFrequency   += w*prof.modeC_ampFrequency;
+                result.modeC_ampFrequency   += w*prof.modeC_ampFrequency;  result.modeC_flare    += w*prof.modeC_flare;
                 result.modeC_yOffset        += w*prof.modeC_yOffset;
                 result.blur_passes          += w*prof.blur_passes;     result.perona_k            += w*prof.perona_k;
                 result.perona_lambda        += w*prof.perona_lambda;   result.floorDepth          += w*prof.floorDepth;
@@ -1073,7 +1080,7 @@ namespace VoxCaves
                 result.modeC_threshold*=rcp; result.modeC_noiseAmp*=rcp; result.modeC_frequency*=rcp;
                 result.modeC_warpAmp*=rcp; result.modeC_warpFrequency*=rcp; result.modeC_vScale*=rcp;
                 result.modeC_twist*=rcp; result.modeC_twistVary*=rcp; result.modeC_twistFrequency*=rcp;
-                result.modeC_ampVary*=rcp; result.modeC_ampFrequency*=rcp; result.modeC_yOffset*=rcp;
+                result.modeC_ampVary*=rcp; result.modeC_ampFrequency*=rcp; result.modeC_flare*=rcp; result.modeC_yOffset*=rcp;
                 result.blur_passes*=rcp; result.perona_k*=rcp; result.perona_lambda*=rcp; result.floorDepth*=rcp;
             }
             return result;
@@ -1211,6 +1218,7 @@ namespace VoxCaves
                     acc.modeC_twistFrequency  += w * prof.modeC_twistFrequency;
                     acc.modeC_ampVary         += w * prof.modeC_ampVary;
                     acc.modeC_ampFrequency    += w * prof.modeC_ampFrequency;
+                    acc.modeC_flare           += w * prof.modeC_flare;
                     acc.modeC_yOffset         += w * prof.modeC_yOffset;
                     acc.blur_passes           += w * prof.blur_passes;
                     acc.perona_k              += w * prof.perona_k;
@@ -1266,6 +1274,7 @@ namespace VoxCaves
                     acc.modeC_twistFrequency  += coastW * oceanProf.modeC_twistFrequency;
                     acc.modeC_ampVary         += coastW * oceanProf.modeC_ampVary;
                     acc.modeC_ampFrequency    += coastW * oceanProf.modeC_ampFrequency;
+                    acc.modeC_flare           += coastW * oceanProf.modeC_flare;
                     acc.modeC_yOffset         += coastW * oceanProf.modeC_yOffset;
                     acc.blur_passes           += coastW * oceanProf.blur_passes;
                     acc.perona_k              += coastW * oceanProf.perona_k;
@@ -1291,7 +1300,7 @@ namespace VoxCaves
                 p.modeC_frequency       *= rcp; p.modeC_warpAmp       *= rcp;
                 p.modeC_warpFrequency   *= rcp; p.modeC_vScale        *= rcp;
                 p.modeC_twist           *= rcp; p.modeC_twistVary     *= rcp; p.modeC_twistFrequency *= rcp;
-                p.modeC_ampVary         *= rcp; p.modeC_ampFrequency  *= rcp; p.modeC_yOffset *= rcp;
+                p.modeC_ampVary         *= rcp; p.modeC_ampFrequency  *= rcp; p.modeC_flare *= rcp; p.modeC_yOffset *= rcp;
                 p.blur_passes           *= rcp; p.perona_k            *= rcp;
                 p.perona_lambda         *= rcp; p.floorDepth          *= rcp; p.floorFade *= rcp;
             }
@@ -1394,7 +1403,7 @@ namespace VoxCaves
             var centerProf = ProfAt(cw4Early / 2, cw4Early / 2);
 
             var centerBiome = wg?.GetBiome(zoneX, zoneZ) ?? Heightmap.Biome.None;
-            Log.LogInfo($"[VoxCaves] zone ({ox},{oz}) biome={centerBiome} mB_r={centerProf.modeB_radius:F1} mA_w={centerProf.modeA_width:F2} mC_amp={centerProf.modeC_noiseAmp:F1}");
+            Log.LogInfo($"[VoxCaves] zone ({ox},{oz}) biome={centerBiome} mB_r={centerProf.modeB_radius:F1} mA_w={centerProf.modeA_width:F2} mC_amp={centerProf.modeC_noiseAmp:F1} mC_flare={centerProf.modeC_flare:F3}");
 
             // Build nearby-location list for the location-protection fade.
             float searchR = width * s * 0.5f + LocProtectR + LocFadeR;
@@ -1430,7 +1439,8 @@ namespace VoxCaves
 
             if (_bufA == null || _bufA.Length < bufSize) _bufA = new float[bufSize];
             if (_bufB == null || _bufB.Length < bufSize) _bufB = new float[bufSize];
-            float[] buf = _bufA, tmp = _bufB;
+            if (_bufC == null || _bufC.Length < bufSize) _bufC = new float[bufSize];
+            float[] buf = _bufA, tmp = _bufB, orig = _bufC;
 
             InitNoise();
 
@@ -1463,19 +1473,24 @@ namespace VoxCaves
                 ? Mathf.Max(Mathf.CeilToInt(blurProf.blur_passes), _transitionBlurPasses)
                 : 0;
 
-            // ── Phase 2: Blur / smooth the SDF buffer ────────────────────────────────
-            // Two modes selectable per profile via perona_k:
+            // ── Phase 2: Taubin smoothing of the SDF buffer ──────────────────────────
+            // Each iteration = one λ-step (forward blur) + one μ-step (backward blur).
+            // λ=0.5, μ=-0.53: high-frequency noise damps while volume is preserved.
+            // Two kernel modes via perona_k:
             //   perona_k = 0  → separable 5-tap Gaussian [1/16,4/16,6/16,4/16,1/16]
-            //   perona_k > 0  → Perona-Malik anisotropic diffusion (preserves edges)
-            if (blurProf.perona_k > 0f)
+            //   perona_k > 0  → Perona-Malik anisotropic diffusion (edge-preserving)
+            const float taubinLambda = 0.5f;
+            const float taubinMu    = -0.53f;
+            int   pbSz = bw * bh * bw;
+
+            // Applies one Taubin half-step: smooths buf into tmp via kernel, then
+            // writes buf[i] = orig[i] + weight*(smoothed[i] - orig[i]).
+            void TaubinStep(float weight)
             {
-                // Perona-Malik: d_new = d + λ * Σ exp(-(Δ/K)²) * Δ  for 6 face neighbours.
-                // Smooths homogeneous regions aggressively; slows at SDF gradients ≥ K.
-                float invK2 = 1f / (blurProf.perona_k * blurProf.perona_k);
-                float lam   = blurProf.perona_lambda;
-                int   pbSz  = bw * bh * bw;
-                for (int pass = 0; pass < blurPasses; pass++)
+                if (blurProf.perona_k > 0f)
                 {
+                    float invK2 = 1f / (blurProf.perona_k * blurProf.perona_k);
+                    float lam   = blurProf.perona_lambda;
                     for (int cx = 0; cx < bw; cx++)
                     for (int cy = 0; cy < bh; cy++)
                     for (int cz = 0; cz < bw; cz++)
@@ -1490,58 +1505,60 @@ namespace VoxCaves
                         if (cz < bw-1) { float d = buf[(cx*bh+cy)*bw+(cz+1)] - v; flux += Mathf.Exp(-d*d*invK2) * d; }
                         tmp[i] = v + lam * flux;
                     }
-                    Array.Copy(tmp, buf, pbSz);
                 }
-            }
-            else
-            for (int pass = 0; pass < blurPasses; pass++)
-            {
-                // X pass: buf → tmp (branch hoisted to cx level)
-                for (int cx = 0; cx < bw; cx++)
+                else
                 {
-                    bool full = cx >= 2 && cx <= bw - 3;
+                    // X pass: buf → tmp
+                    for (int cx = 0; cx < bw; cx++)
+                    {
+                        bool full = cx >= 2 && cx <= bw - 3;
+                        for (int cy = 0; cy < bh; cy++)
+                        for (int cz = 0; cz < bw; cz++)
+                        {
+                            int i = (cx * bh + cy) * bw + cz;
+                            tmp[i] = full
+                                ? buf[((cx-2)*bh+cy)*bw+cz]*0.0625f + buf[((cx-1)*bh+cy)*bw+cz]*0.25f
+                                  + buf[i]*0.375f
+                                  + buf[((cx+1)*bh+cy)*bw+cz]*0.25f + buf[((cx+2)*bh+cy)*bw+cz]*0.0625f
+                                : buf[i];
+                        }
+                    }
+                    // Z pass: tmp → buf
+                    for (int cx = 0; cx < bw; cx++)
                     for (int cy = 0; cy < bh; cy++)
                     for (int cz = 0; cz < bw; cz++)
                     {
                         int i = (cx * bh + cy) * bw + cz;
-                        tmp[i] = full
-                            ? buf[((cx-2)*bh+cy)*bw+cz]*0.0625f + buf[((cx-1)*bh+cy)*bw+cz]*0.25f
+                        buf[i] = (cz >= 2 && cz <= bw - 3)
+                            ? tmp[(cx*bh+cy)*bw+(cz-2)]*0.0625f + tmp[(cx*bh+cy)*bw+(cz-1)]*0.25f
+                              + tmp[i]*0.375f
+                              + tmp[(cx*bh+cy)*bw+(cz+1)]*0.25f + tmp[(cx*bh+cy)*bw+(cz+2)]*0.0625f
+                            : tmp[i];
+                    }
+                    // Y pass: buf → tmp
+                    for (int cx = 0; cx < bw; cx++)
+                    for (int cy = 0; cy < bh; cy++)
+                    for (int cz = 0; cz < bw; cz++)
+                    {
+                        int i = (cx * bh + cy) * bw + cz;
+                        tmp[i] = (cy >= 2 && cy <= bh - 3)
+                            ? buf[(cx*bh+(cy-2))*bw+cz]*0.0625f + buf[(cx*bh+(cy-1))*bw+cz]*0.25f
                               + buf[i]*0.375f
-                              + buf[((cx+1)*bh+cy)*bw+cz]*0.25f + buf[((cx+2)*bh+cy)*bw+cz]*0.0625f
+                              + buf[(cx*bh+(cy+1))*bw+cz]*0.25f + buf[(cx*bh+(cy+2))*bw+cz]*0.0625f
                             : buf[i];
                     }
                 }
-                // Z pass: tmp → buf
-                for (int cx = 0; cx < bw; cx++)
-                for (int cy = 0; cy < bh; cy++)
-                for (int cz = 0; cz < bw; cz++)
-                {
-                    int i = (cx * bh + cy) * bw + cz;
-                    buf[i] = (cz >= 2 && cz <= bw - 3)
-                        ? tmp[(cx*bh+cy)*bw+(cz-2)]*0.0625f + tmp[(cx*bh+cy)*bw+(cz-1)]*0.25f
-                          + tmp[i]*0.375f
-                          + tmp[(cx*bh+cy)*bw+(cz+1)]*0.25f + tmp[(cx*bh+cy)*bw+(cz+2)]*0.0625f
-                        : tmp[i];
-                }
-                // Y pass: buf → tmp → buf
-                for (int cx = 0; cx < bw; cx++)
-                for (int cy = 0; cy < bh; cy++)
-                for (int cz = 0; cz < bw; cz++)
-                {
-                    int i = (cx * bh + cy) * bw + cz;
-                    tmp[i] = (cy >= 2 && cy <= bh - 3)
-                        ? buf[(cx*bh+(cy-2))*bw+cz]*0.0625f + buf[(cx*bh+(cy-1))*bw+cz]*0.25f
-                          + buf[i]*0.375f
-                          + buf[(cx*bh+(cy+1))*bw+cz]*0.25f + buf[(cx*bh+(cy+2))*bw+cz]*0.0625f
-                        : buf[i];
-                }
-                for (int cx = 0; cx < bw; cx++)
-                for (int cy = 0; cy < bh; cy++)
-                for (int cz = 0; cz < bw; cz++)
-                {
-                    int i = (cx * bh + cy) * bw + cz;
-                    buf[i] = tmp[i];
-                }
+                // Apply displacement scaled by weight relative to pre-step snapshot.
+                for (int i = 0; i < pbSz; i++)
+                    buf[i] = orig[i] + weight * (tmp[i] - orig[i]);
+            }
+
+            for (int pass = 0; pass < blurPasses; pass++)
+            {
+                Array.Copy(buf, orig, pbSz);
+                TaubinStep(taubinLambda);   // forward: shrinks slightly
+                Array.Copy(buf, orig, pbSz);
+                TaubinStep(taubinMu);       // backward: restores volume
             }
 
             long _t2 = _sw.ElapsedMilliseconds;
@@ -2119,8 +2136,9 @@ namespace VoxCaves
             if (_tunWBuf   == null || _tunWBuf.Length   < nb4Size) _tunWBuf   = new float[nb4Size];
             if (_bk2dAddH  == null || _bk2dAddH.Length  < nb2Size) _bk2dAddH  = new float[nb2Size];
             if (_bk2dLAmp  == null || _bk2dLAmp.Length  < nb2Size) _bk2dLAmp  = new float[nb2Size];
-            if (_bk2dMcS   == null || _bk2dMcS.Length   < nb2Size) _bk2dMcS   = new float[nb2Size];
-            if (_bk2dMcT   == null || _bk2dMcT.Length   < nb2Size) _bk2dMcT   = new float[nb2Size];
+            if (_bk2dMcS     == null || _bk2dMcS.Length     < nb2Size) _bk2dMcS     = new float[nb2Size];
+            if (_bk2dMcT     == null || _bk2dMcT.Length     < nb2Size) _bk2dMcT     = new float[nb2Size];
+            if (_bk2dMcFlare == null || _bk2dMcFlare.Length < nb2Size) _bk2dMcFlare = new float[nb2Size];
             if (_bk2dFlD    == null || _bk2dFlD.Length    < nb2Size) _bk2dFlD    = new float[nb2Size];
             if (_bk2dFlFade == null || _bk2dFlFade.Length < nb2Size) _bk2dFlFade = new float[nb2Size];
             if (_bk2dMbwf  == null || _bk2dMbwf.Length  < nb2Size) _bk2dMbwf  = new float[nb2Size];
@@ -2162,8 +2180,9 @@ namespace VoxCaves
                 var   p4    = (wg != null && _blendedProfs != null && idx2 < _blendedProfs.Length)
                               ? _blendedProfs[idx2] : CaveProfile.Default;
 
-                _bk2dMcS! [idx2] = p4.modeC_noiseAmp;
-                _bk2dMcT! [idx2] = p4.modeC_threshold;
+                _bk2dMcS!    [idx2] = p4.modeC_noiseAmp;
+                _bk2dMcT!    [idx2] = p4.modeC_threshold;
+                _bk2dMcFlare![idx2] = p4.modeC_flare;
                 _bk2dFlD!   [idx2] = p4.floorDepth;
                 _bk2dFlFade![idx2] = p4.floorFade;
                 _bk2dMbwf![idx2] = p4.modeB_warpFrequency;
@@ -2302,7 +2321,6 @@ namespace VoxCaves
         // Only hops into a neighbor zone if the specific ungrounded blob at the shared face
         // percolates through that zone to another face (via percol[inFace, toFace]).
         // Unrelated ungrounded blobs in the neighbor do NOT trigger further expansion.
-        const int FixpointMaxZones = 8; // safety cap; logged if hit
         static int _lastFixpointHops = 0; // set by EnsureFixpoint, read by Carve's final log
 
         // Face indices used by percol and hop logic: 0=NegX 1=PosX 2=NegZ 3=PosZ
@@ -2319,6 +2337,7 @@ namespace VoxCaves
             float s  = _scale ?? 1f;
             var   wg = WorldGenerator.instance;
             if (wg == null) return;
+            int FixpointMaxZones = _fixpointMaxZones;
 
             // Worklist items: (zone origin, incoming face index into that zone)
             var worklist = new Queue<(int ox, int oz, int inFace)>();
@@ -2720,7 +2739,7 @@ namespace VoxCaves
         }
 
         static void FillYColumn(float[] buf, int bw, int bh, int extLo, float s, int cx, int cz,
-            float h, float addH, float profMcT, float localAmp, bool mcActive,
+            float h, float addH, float profMcT, float profMcFlare, float localAmp, bool mcActive,
             float locFac, float floorY, float floorFade,
             float mbWarpedH, float mbR, float mbNA, float mbVS, float mbWF, float mbTwist,
             int bb00, int bb10, int bb01, int bb11, float bfx, float bfz,
@@ -2758,7 +2777,9 @@ namespace VoxCaves
                         float n1 = _noiseBuf![bb01+cy] + (_noiseBuf[bb11+cy] - _noiseBuf![bb01+cy]) * bfx;
                         n = n0 + (n1-n0) * bfz;
                     }
-                    float sdf = relY - (n - profMcT) * localAmp;
+                    float _ft = Mathf.Clamp01(relY / localAmp);
+                    float effMcT = profMcT - profMcFlare * (4f * _ft * (1f - _ft));
+                    float sdf = relY - (n - effMcT) * localAmp;
                     combined = combined < sdf ? combined : sdf;
                 }
 
@@ -2803,25 +2824,12 @@ namespace VoxCaves
                 buf[(cx * bh + cy) * bw + cz] = baseSDF + (combined - baseSDF) * locFac * _fade;
             }
 
-            // Segment 2: inside Mode B range — Mode B + Mode C + Mode A.
+            // Segment 2: inside Mode B range — B carves first, then C fills back in, then A punches through.
             for (int cy = cyMbLo; cy <= cyMbHi; cy++)
             {
                 float worldY   = (extLo + cy) * s;
                 float baseSDF  = worldY - h;
                 float combined = baseSDF;
-
-                if (mcActive)
-                {
-                    float relY = worldY - addH;
-                    float n;
-                    {
-                        float n0 = _noiseBuf![bb00+cy] + (_noiseBuf[bb10+cy] - _noiseBuf![bb00+cy]) * bfx;
-                        float n1 = _noiseBuf![bb01+cy] + (_noiseBuf[bb11+cy] - _noiseBuf![bb01+cy]) * bfx;
-                        n = n0 + (n1-n0) * bfz;
-                    }
-                    float sdf = relY - (n - profMcT) * localAmp;
-                    combined = combined < sdf ? combined : sdf;
-                }
 
                 {
                     float bandSDF = mbR - Mathf.Abs(worldY - mbWarpedH);
@@ -2841,6 +2849,21 @@ namespace VoxCaves
                     float fd = worldY - floorY;
                     float sdf = bandSDF < fd ? bandSDF : fd;
                     if (sdf > combined) combined = sdf;
+                }
+
+                if (mcActive)
+                {
+                    float relY = worldY - addH;
+                    float n;
+                    {
+                        float n0 = _noiseBuf![bb00+cy] + (_noiseBuf[bb10+cy] - _noiseBuf![bb00+cy]) * bfx;
+                        float n1 = _noiseBuf![bb01+cy] + (_noiseBuf[bb11+cy] - _noiseBuf![bb01+cy]) * bfx;
+                        n = n0 + (n1-n0) * bfz;
+                    }
+                    float _ft = Mathf.Clamp01(relY / localAmp);
+                    float effMcT = profMcT - profMcFlare * (4f * _ft * (1f - _ft));
+                    float sdf = relY - (n - effMcT) * localAmp;
+                    combined = combined < sdf ? combined : sdf;
                 }
 
                 if (mAw > 0f)
@@ -2901,7 +2924,9 @@ namespace VoxCaves
                         float n1 = _noiseBuf![bb01+cy] + (_noiseBuf[bb11+cy] - _noiseBuf![bb01+cy]) * bfx;
                         n = n0 + (n1-n0) * bfz;
                     }
-                    float sdf = relY - (n - profMcT) * localAmp;
+                    float _ft = Mathf.Clamp01(relY / localAmp);
+                    float effMcT = profMcT - profMcFlare * (4f * _ft * (1f - _ft));
+                    float sdf = relY - (n - effMcT) * localAmp;
                     combined = combined < sdf ? combined : sdf;
                 }
 
@@ -2996,7 +3021,8 @@ namespace VoxCaves
                 static float BL(float[] a, int i00, int i10, int i01, int i11, float fx, float fz) =>
                     Mathf.Lerp(Mathf.Lerp(a[i00], a[i10], fx), Mathf.Lerp(a[i01], a[i11], fx), fz);
 
-                float profMcT  = BL(_bk2dMcT!, b200, b210, b201, b211, bfx, bfz);
+                float profMcT    = BL(_bk2dMcT!,     b200, b210, b201, b211, bfx, bfz);
+                float profMcFlare= BL(_bk2dMcFlare!, b200, b210, b201, b211, bfx, bfz);
                 float profFlD    = BL(_bk2dFlD!,    b200, b210, b201, b211, bfx, bfz);
                 float profFlFade = BL(_bk2dFlFade!, b200, b210, b201, b211, bfx, bfz);
                 float addH     = bakeC ? BL(_bk2dAddH!, b200, b210, b201, b211, bfx, bfz) : 0f;
@@ -3039,7 +3065,7 @@ namespace VoxCaves
                 long _tb = System.Diagnostics.Stopwatch.GetTimestamp();
                 _setupTicks += _tb - _ta;
                 FillYColumn(buf, bw, bh, extLo, s, cx, cz,
-                    h, addH, profMcT, localAmp, localAmp > 0f && bakeC,
+                    h, addH, profMcT, profMcFlare, localAmp, localAmp > 0f && bakeC,
                     locFac, floorY, profFlFade,
                     mbWarpedH, mbR, mbNA, mbVS, mbWF, mbTwist,
                     bb00, bb10, bb01, bb11, bfx, bfz,
