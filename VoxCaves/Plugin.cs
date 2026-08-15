@@ -4,6 +4,7 @@ using HarmonyLib;
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.IO.Compression;
 using System.Linq;
 using System.Reflection;
 using System.Reflection.Emit;
@@ -88,6 +89,7 @@ namespace VoxCaves
 
         // ── Debug flags ───────────────────────────────────────────────────────────
         internal static volatile bool _disableVegetation;
+        internal static bool _compressBake = false;
 
         // ── Biome profiles ────────────────────────────────────────────────────────
         static volatile Dictionary<string, CaveProfile> _namedProfiles
@@ -108,6 +110,17 @@ namespace VoxCaves
         internal static int   _transitionBlurPasses = 3;     // min blur passes for any active zone
         internal static int   _fixpointMaxZones     = 8;     // EnsureFixpoint hop cap
         internal static float _coastFade           = 0f;     // world units above sea level over which Ocean inflates into blend (0=off)
+
+        // ── SDF bake ─────────────────────────────────────────────────────────────
+        static float _bakeRadius = 0f;
+        static int   _bakeStep   = 8;
+        // Staged: subsampled SDF written by Carve() when within bakeRadius.
+        static readonly Dictionary<(int, int), (int extLo, int bh, int bw, sbyte[] data)> _bakePending = new();
+        // Loaded from disk: populated at world load; null if no valid file exists.
+        static Dictionary<(int, int), (int extLo, int bh, int bw, sbyte[] data)>? _bakeData;
+        static int _bakeFileStep = 8;
+        static bool _bakeLoadAttempted = false;
+
         const float LocProtectR = 30f;
         const float LocFadeR    = 40f;
 
@@ -294,6 +307,13 @@ namespace VoxCaves
                 }
                 catch (Exception e) { Log.LogError($"[VoxCaves] probe exception: {e}"); }
             });
+            new Terminal.ConsoleCommand("voxcaves_bake", "voxcaves_bake [radius] — write baked SDF to disk for all staged zones (optionally filtered to radius)", args =>
+            {
+                float radius = _bakeRadius;
+                if (args.Length >= 2 && float.TryParse(args[1], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float r))
+                    radius = r;
+                WriteBakeFile(radius);
+            });
             Log.LogInfo("[VoxCaves] Ready.");
         }
 
@@ -352,7 +372,7 @@ namespace VoxCaves
                                     if (ia) active++; else if (ip) pend++; else stale++;
                                 }
                         }
-                        Log.LogInfo($"[VoxCaves] Voxheim queues: pending={pending?.Count ?? -1} deferred={deferred?.Count ?? -1} zones(active={active} pending={pend} stale={stale})");
+                        Log.LogDebug($"[VoxCaves] Voxheim queues: pending={pending?.Count ?? -1} deferred={deferred?.Count ?? -1} zones(active={active} pending={pend} stale={stale})");
                     }
                 }
                 catch (System.Exception e) { Log.LogWarning($"[VoxCaves] diag error: {e.Message}"); }
@@ -638,6 +658,19 @@ namespace VoxCaves
                             _fixpointMaxZones = Mathf.Max(1, fmz);
                         if (k == "coastfade" && float.TryParse(v, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float cf))
                             _coastFade = Mathf.Max(0f, cf);
+                    }
+                    continue;
+                }
+                if (name.Equals("Bake", StringComparison.OrdinalIgnoreCase))
+                {
+                    foreach (var (k, v) in kvs)
+                    {
+                        if (k == "bakeradius" && float.TryParse(v, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float br))
+                            _bakeRadius = Mathf.Max(0f, br);
+                        if (k == "bakestep" && int.TryParse(v, out int bs))
+                            _bakeStep = Mathf.Clamp(bs, 1, 64);
+                        if (k == "compressbake")
+                            _compressBake = !(v == "0" || v == "false");
                     }
                     continue;
                 }
@@ -1214,15 +1247,19 @@ namespace VoxCaves
         //
         // Combination order: base → max(B) → min(C) → max(A).
         // Mode A (tunnels) runs last so it punches through Mode C solid.
-        internal static void Carve(object field, object grid, int ox, int oz, int width, int yLo, int yHi)
+        // field==null means bake-only: run Phase 1+2, stage result, skip Phase 3 voxel writes.
+        internal static void Carve(object? field, object? grid, int ox, int oz, int width, int yLo, int yHi)
         {
             if (_scale == null)
             {
                 _scale = _scaleField != null ? (float)_scaleField.GetValue(null)! : 1f;
                 Log.LogInfo($"[VoxCaves] s_scale resolved to {_scale}");
             }
-            float s  = _scale.Value;
+            float s      = _scale.Value;
+            bool bakeOnly = field == null;
             var   wg = WorldGenerator.instance;
+
+            if (!_bakeLoadAttempted) { _bakeLoadAttempted = true; LoadBakeFile(); }
 
             BuildLocationCache();
 
@@ -1230,12 +1267,12 @@ namespace VoxCaves
             float zoneZ = (oz + width * 0.5f) * s;
 
             string zoneKey = $"{ox},{oz}";
-            _zoneParams[zoneKey] = (field, grid, ox, oz, width, yLo, yHi);
+            if (!bakeOnly) _zoneParams[zoneKey] = (field!, grid!, ox, oz, width, yLo, yHi);
 
             // If location data isn't ready yet, leave the zone vanilla.
-            if (!_locationsCached)
+            if (!bakeOnly && !_locationsCached)
             {
-                Log.LogInfo($"[VoxCaves] zone ({ox},{oz}) skip=no-locations");
+                Log.LogDebug($"[VoxCaves] zone ({ox},{oz}) skip=no-locations");
                 return;
             }
 
@@ -1255,7 +1292,7 @@ namespace VoxCaves
             var centerProf = ProfAt(cw4Early / 2, cw4Early / 2);
 
             var centerBiome = wg?.GetBiome(zoneX, zoneZ) ?? Heightmap.Biome.None;
-            Log.LogInfo($"[VoxCaves] zone ({ox},{oz}) biome={centerBiome} mB_r={centerProf.modeB_radius:F1} mA_w={centerProf.modeA_width:F2} mC_amp={centerProf.modeC_noiseAmp:F1} mC_flare={centerProf.modeC_flare:F3}");
+            Log.LogDebug($"[VoxCaves] zone ({ox},{oz}) biome={centerBiome} mB_r={centerProf.modeB_radius:F1} mA_w={centerProf.modeA_width:F2} mC_amp={centerProf.modeC_noiseAmp:F1} mC_flare={centerProf.modeC_flare:F3}");
 
             // Build nearby-location list for the location-protection fade.
             float searchR = width * s * 0.5f + LocProtectR + LocFadeR;
@@ -1294,21 +1331,26 @@ namespace VoxCaves
             if (_bufC == null || _bufC.Length < bufSize) _bufC = new float[bufSize];
             float[] buf = _bufA, tmp = _bufB, orig = _bufC;
 
-            InitNoise();
-
+            bool bakeC = false, bakeA = false, anyMbActive = false;
+            bool fromBake = _bakeData != null && TryPopulateFromBake(ox, oz, bw, bh, extLo, s, buf);
+            long _t0 = 0, _t1 = 0, _t1b = 0, _t2 = 0;
             var _sw = System.Diagnostics.Stopwatch.StartNew();
+
+            if (!fromBake)
+            {
+            InitNoise();
 
             int   cw4     = cw4Early;  // already computed above for BakeBlendedProfiles
             BakeSdfSetup(ox, oz, overlap, s, extLo, bh, bw, cw4, wg, nearbyLocs,
-                out bool bakeC, out bool bakeA, out bool anyMbActive);
+                out bakeC, out bakeA, out anyMbActive);
 
-            long _t0 = _sw.ElapsedMilliseconds;
+            _t0 = _sw.ElapsedMilliseconds;
 
             // ── Phase 1 ───────────────────────────────────────────────────────────
             FillPhase1(buf, bw, bh, extLo, s, ox, oz, overlap, bakeC, bakeA, anyMbActive, wg, cw4, nearbyLocs);
-            long _t1 = _sw.ElapsedMilliseconds;
+            _t1 = _sw.ElapsedMilliseconds;
 
-            long _t1b = _sw.ElapsedMilliseconds;
+            _t1b = _sw.ElapsedMilliseconds;
 
             // Read blur params from the blended center coarse cell so the distance-based
             // weights govern blur behaviour, not the old 5×5 kernel centerProf.
@@ -1413,7 +1455,7 @@ namespace VoxCaves
                 TaubinStep(taubinMu);       // backward: restores volume
             }
 
-            long _t2 = _sw.ElapsedMilliseconds;
+            _t2 = _sw.ElapsedMilliseconds;
 
             // ── Phase 2.5: Floating-island removal (after blur) ───────────────────────
             // BFS from cy=0 (bedrock); any solid voxel unreachable from the bottom is a
@@ -1576,7 +1618,7 @@ namespace VoxCaves
                 for (int i = 0; i < islandBufSize; i++)
                     if (!_visitedBuf[i] && buf[i] < 0f) { buf[i] = s; removed++; }
 
-                Log.LogInfo($"[VoxCaves] island-fill zone ({ox},{oz}): pre={!needsFullPass} seeds={qTail} removed={removed}");
+                Log.LogDebug($"[VoxCaves] island-fill zone ({ox},{oz}): pre={!needsFullPass} seeds={qTail} removed={removed}");
             }
 
             // ── Phase 2.6: Sealed underground pocket removal ──────────────────────────
@@ -1633,7 +1675,16 @@ namespace VoxCaves
                 for (int i = 0; i < total; i++)
                     if (!_visitedBuf![i] && buf[i] >= 0f) { buf[i] = -s; filled++; }
 
-                Log.LogInfo($"[VoxCaves] pocket-fill zone ({ox},{oz}): filled={filled}");
+                Log.LogDebug($"[VoxCaves] pocket-fill zone ({ox},{oz}): filled={filled}");
+            }
+
+            } // end if (!fromBake)
+
+            // ── Bake staging: subsample buf[] into _bakePending ───────────────────────
+            if (!fromBake && (bakeOnly || _bakeRadius > 0f))
+            {
+                if (bakeOnly || (ox * s) * (ox * s) + (oz * s) * (oz * s) <= _bakeRadius * _bakeRadius)
+                    StageBakeEntry(ox, oz, bw, bh, extLo, s, buf);
             }
 
             // ── Surface height cache (for vegetation placement) ───────────────────────
@@ -1659,12 +1710,12 @@ namespace VoxCaves
             }
 
             // ── Phase 3: Write SDF directly to VoxelField via the 'field' parameter ────
-            // Writing to the same object VoxelizeColumns used (not _voxelZoneFieldField)
-            // ensures RebuildBrick reads the correct SDF regardless of Voxheim's internal
-            // field architecture.  FinishSkinNow is NOT called; bricks mesh async.
+            // Skipped when bakeOnly (field==null); only staging into _bakePending is needed.
             int carved = 0;
             int maxYC  = yHi;
-            int maxYAny = yHi; // highest Y touched by any write (solid or air); sizes hot-reload reset range
+            int maxYAny = yHi;
+            if (!bakeOnly)
+            {
             var transBytes  = new sbyte[bh];
             var transHasOvr = new bool[bh];
             var cacheData   = new sbyte[width * bh * width]; // (ci*bh + cy)*width + ri
@@ -1728,6 +1779,7 @@ namespace VoxCaves
                 if (!_zoneExtHi.TryGetValue(zoneKey, out int prevHiMark) || hiMark > prevHiMark)
                     _zoneExtHi[zoneKey] = hiMark;
             }
+            } // end if (!bakeOnly)
 
             long _t3 = _sw.ElapsedMilliseconds;
 
@@ -1738,7 +1790,7 @@ namespace VoxCaves
             }
 
             var _centerBiome = WorldGenerator.instance?.GetBiome((ox + width / 2) * (float)(_scale ?? 1f), (oz + width / 2) * (float)(_scale ?? 1f)) ?? Heightmap.Biome.None;
-            Log.LogInfo($"[VoxCaves] zone ({ox},{oz}) biome={_centerBiome} bakeC={bakeC} bakeA={bakeA} voxels={bw}x{bh}x{bw} fixHops={_lastFixpointHops} Ph0={_t0}ms Ph1={_t1-_t0}ms blur={_t1b-_t1}ms Ph2={_t2-_t1b}ms Ph3={_t3-_t2}ms total={_t3}ms carved={carved}");
+            Log.LogDebug($"[VoxCaves] zone ({ox},{oz}) biome={_centerBiome} bakeC={bakeC} bakeA={bakeA} voxels={bw}x{bh}x{bw} fixHops={_lastFixpointHops} Ph0={_t0}ms Ph1={_t1-_t0}ms blur={_t1b-_t1}ms Ph2={_t2-_t1b}ms Ph3={_t3-_t2}ms total={_t3}ms carved={carved}");
         }
 
         // ── Zone data dump (voxcaves_dump command) ───────────────────────────────
@@ -1824,10 +1876,249 @@ namespace VoxCaves
             catch (Exception ex) { Log.LogError($"[VoxCaves] Dump failed: {ex.Message}"); }
         }
 
+        // ── SDF bake helpers ─────────────────────────────────────────────────────
+
+        static uint ComputeCfgHash()
+        {
+            string path = ConfigPath;
+            if (!File.Exists(path)) return 0u;
+            byte[] bytes = File.ReadAllBytes(path);
+            uint hash = 2166136261u;
+            foreach (byte b in bytes) hash = (hash ^ b) * 16777619u;
+            return hash;
+        }
+
+        static string BakeFilePath(int seed, uint cfgHash) =>
+            Path.Combine(BepInEx.Paths.ConfigPath, $"voxcaves_bake_{seed:X8}_{cfgHash:X8}.bin");
+
+        static void LoadBakeFile()
+        {
+            var wg = WorldGenerator.instance;
+            if (wg == null) { _bakeData = null; return; }
+            int seed = wg.GetSeed();
+            uint cfgHash = ComputeCfgHash();
+            string path = BakeFilePath(seed, cfgHash);
+            if (!File.Exists(path)) { _bakeData = null; return; }
+            try
+            {
+                using var fs  = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+                // Detect gzip by magic bytes (0x1f 0x8b) without consuming the stream.
+                bool isGzip = fs.ReadByte() == 0x1f && fs.ReadByte() == 0x8b;
+                fs.Seek(0, SeekOrigin.Begin);
+                Stream inStream = isGzip ? new GZipStream(fs, CompressionMode.Decompress) : fs;
+                using var br  = new BinaryReader(inStream);
+                if (br.ReadUInt32() != 0x564F5846u) { Log.LogWarning("[VoxCaves] bake: invalid magic."); _bakeData = null; return; }
+                ushort ver = br.ReadUInt16();
+                if (ver != 1 && ver != 2) { Log.LogWarning($"[VoxCaves] bake: unsupported version {ver}."); _bakeData = null; return; }
+                if (br.ReadUInt64() != (ulong)(uint)seed || br.ReadUInt32() != cfgHash)
+                    { Log.LogWarning("[VoxCaves] bake: seed/cfg mismatch."); _bakeData = null; return; }
+                _bakeFileStep = br.ReadUInt16();
+                int count = (int)br.ReadUInt32();
+                var data = new Dictionary<(int, int), (int extLo, int bh, int bw, sbyte[] data)>(count);
+                for (int i = 0; i < count; i++)
+                {
+                    int eox = br.ReadInt32(), eoz = br.ReadInt32(), extLo = br.ReadInt32();
+                    int bh = br.ReadUInt16(), ebw = br.ReadUInt16();
+                    int nsx = br.ReadInt32(), nsy = br.ReadInt32(), nsz = br.ReadInt32();
+                    int len   = nsx * nsy * nsz;
+                    var raw   = new sbyte[len];
+                    var bytes = br.ReadBytes(len);
+                    Buffer.BlockCopy(bytes, 0, raw, 0, len);
+                    data[(eox, eoz)] = (extLo, bh, ebw, raw);
+                }
+                _bakeData = data;
+                Log.LogInfo($"[VoxCaves] Bake loaded: {count} zones, step={_bakeFileStep} from {path}");
+            }
+            catch (Exception ex) { Log.LogWarning($"[VoxCaves] bake: load failed: {ex.GetType().Name}: {ex.Message}\n{ex.StackTrace}"); _bakeData = null; }
+        }
+
+        static bool TryPopulateFromBake(int ox, int oz, int bw, int bh, int extLo, float s, float[] buf)
+        {
+            if (_bakeData == null) { Log.LogInfo($"[VoxCaves] bake miss ({ox},{oz}): no bake data loaded"); return false; }
+            if (!_bakeData.TryGetValue((ox, oz), out var e)) { Log.LogInfo($"[VoxCaves] bake miss ({ox},{oz}): zone not in file"); return false; }
+            if (e.bw != bw) { Log.LogInfo($"[VoxCaves] bake miss ({ox},{oz}): bw mismatch baked={e.bw} live={bw}"); return false; }
+            int step = _bakeFileStep;
+            int nsx  = (bw   + step - 1) / step;
+            int nsy  = (e.bh + step - 1) / step;
+            int nsz  = (bw   + step - 1) / step;
+            sbyte[] raw = e.data;
+            if (raw.Length != nsx * nsy * nsz) { Log.LogInfo($"[VoxCaves] bake miss ({ox},{oz}): data length mismatch"); return false; }
+            // Wide quantization range (32 voxels) prevents clamping on steep terrain where
+            // adjacent sample columns can be many voxels from the surface.
+            float scale = 32f * s / 127f;
+
+            for (int cx = 0; cx < bw; cx++)
+            {
+                float xf = (float)cx / step;
+                int xs   = (int)xf; if (xs > nsx - 2) xs = nsx - 2; if (xs < 0) xs = 0;
+                int xs1  = xs + 1; if (nsx == 1) { xs = xs1 = 0; }
+                float tx = xf - xs;
+                for (int cy = 0; cy < bh; cy++)
+                {
+                    int bakCy = (extLo + cy) - e.extLo;
+                    float defaultVal = (bakCy < 0) ? -s : s;
+                    if (bakCy < 0 || bakCy >= e.bh)
+                    {
+                        for (int cz = 0; cz < bw; cz++) buf[(cx * bh + cy) * bw + cz] = defaultVal;
+                        continue;
+                    }
+                    float yf = (float)bakCy / step;
+                    int ys   = (int)yf; if (ys > nsy - 2) ys = nsy - 2; if (ys < 0) ys = 0;
+                    int ys1  = ys + 1; if (nsy == 1) { ys = ys1 = 0; }
+                    float ty = yf - ys;
+                    for (int cz = 0; cz < bw; cz++)
+                    {
+                        float zf = (float)cz / step;
+                        int zs   = (int)zf; if (zs > nsz - 2) zs = nsz - 2; if (zs < 0) zs = 0;
+                        int zs1  = zs + 1; if (nsz == 1) { zs = zs1 = 0; }
+                        float tz = zf - zs;
+                        float c000 = raw[(xs  * nsy + ys ) * nsz + zs ];
+                        float c001 = raw[(xs  * nsy + ys ) * nsz + zs1];
+                        float c010 = raw[(xs  * nsy + ys1) * nsz + zs ];
+                        float c011 = raw[(xs  * nsy + ys1) * nsz + zs1];
+                        float c100 = raw[(xs1 * nsy + ys ) * nsz + zs ];
+                        float c101 = raw[(xs1 * nsy + ys ) * nsz + zs1];
+                        float c110 = raw[(xs1 * nsy + ys1) * nsz + zs ];
+                        float c111 = raw[(xs1 * nsy + ys1) * nsz + zs1];
+                        float v    = c000*(1-tx)*(1-ty)*(1-tz) + c001*(1-tx)*(1-ty)*tz
+                                   + c010*(1-tx)*ty*(1-tz)     + c011*(1-tx)*ty*tz
+                                   + c100*tx*(1-ty)*(1-tz)     + c101*tx*(1-ty)*tz
+                                   + c110*tx*ty*(1-tz)         + c111*tx*ty*tz;
+                        buf[(cx * bh + cy) * bw + cz] = v * scale;
+                    }
+                }
+            }
+            return true;
+        }
+
+        static void StageBakeEntry(int ox, int oz, int bw, int bh, int extLo, float s, float[] buf)
+        {
+            int step = _bakeStep;
+            int nsx  = (bw + step - 1) / step;
+            int nsy  = (bh + step - 1) / step;
+            int nsz  = (bw + step - 1) / step;
+            var raw  = new sbyte[nsx * nsy * nsz];
+            for (int xs = 0; xs < nsx; xs++)
+            for (int ys = 0; ys < nsy; ys++)
+            for (int zs = 0; zs < nsz; zs++)
+            {
+                int cx = Math.Min(xs * step, bw - 1);
+                int cy = Math.Min(ys * step, bh - 1);
+                int cz = Math.Min(zs * step, bw - 1);
+                raw[(xs * nsy + ys) * nsz + zs] = ToSDFByte(buf[(cx * bh + cy) * bw + cz], 32f * s);
+            }
+            _bakePending[(ox, oz)] = (extLo, bh, bw, raw);
+        }
+
+        static void WriteBakeFile(float radius)
+        {
+            var wg = WorldGenerator.instance;
+            if (wg == null) { Log.LogWarning("[VoxCaves] bake: WorldGenerator not ready."); return; }
+            if (_scale == null) { Log.LogWarning("[VoxCaves] bake: scale not resolved yet."); return; }
+            float s = _scale.Value;
+            int seed = wg.GetSeed();
+            uint cfgHash = ComputeCfgHash();
+
+            // Enumerate every zone origin within radius and ensure it's staged.
+            const int zoneW = 64;
+            int zoneR = radius > 0f ? (int)Math.Ceiling(radius / (zoneW * s)) : 0;
+
+            // Valheim zone grid: zone at index 0 is centered at world origin,
+            // so its XZ origin (lower-left corner) is at -zoneSize/2 = -32 world units.
+            // In voxel coords: gridOffset = -(int)(32f / s), mod zoneW to get positive form.
+            int gridOffset = ((-(int)(32f / s)) % zoneW + zoneW) % zoneW;
+            Log.LogDebug($"[VoxCaves] bake: zone grid offset={gridOffset}");
+
+            // Discard any pending entries staged at a different step so they get re-carved below.
+            _bakePending.Clear();
+
+            // Collect zones to carve (not already loaded from file at current step).
+            var toCarve = new List<(int ox, int oz)>();
+            for (int dox = -zoneR; dox <= zoneR; dox++)
+            for (int doz = -zoneR; doz <= zoneR; doz++)
+            {
+                int ox = dox * zoneW + gridOffset;
+                int oz = doz * zoneW + gridOffset;
+                float wx = ox * s, wz = oz * s;
+                if (radius > 0f && wx * wx + wz * wz > radius * radius) continue;
+                if (_bakeData != null && _bakeFileStep == _bakeStep && _bakeData.ContainsKey((ox, oz))) continue;
+                toCarve.Add((ox, oz));
+            }
+            Log.LogInfo($"[VoxCaves] bake: {toCarve.Count} zones to carve (radius={radius:F0}m)...");
+            var bakeSw = System.Diagnostics.Stopwatch.StartNew();
+            for (int i = 0; i < toCarve.Count; i++)
+            {
+                var (zox, zoz) = toCarve[i];
+                var (yLo, yHi) = ComputeYBounds(zox, zoz, zoneW, s, wg);
+                Carve(null, null, zox, zoz, zoneW, yLo, yHi);
+                if ((i + 1) % 10 == 0 || i + 1 == toCarve.Count)
+                {
+                    float elapsed = bakeSw.ElapsedMilliseconds / 1000f;
+                    float eta = elapsed > 0f ? (toCarve.Count - i - 1) / ((i + 1) / elapsed) : 0f;
+                    Log.LogInfo($"[VoxCaves] bake: {i + 1}/{toCarve.Count} zones — {eta:F0}s remaining");
+                }
+            }
+
+            // Merge staged + existing bake data (staged takes priority).
+            var toWrite = new Dictionary<(int, int), (int extLo, int bh, int bw, sbyte[] data)>();
+            if (_bakeData != null)
+                foreach (var kv in _bakeData) toWrite[kv.Key] = kv.Value;
+            foreach (var kv in _bakePending)
+                toWrite[kv.Key] = kv.Value;
+
+            string path = BakeFilePath(seed, cfgHash);
+            using var fs  = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None);
+            Stream outStream = _compressBake ? new GZipStream(fs, System.IO.Compression.CompressionLevel.Optimal) : fs;
+            using var bw2 = new BinaryWriter(outStream);
+            bw2.Write(0x564F5846u);          // magic
+            bw2.Write((ushort)(_compressBake ? 2 : 1)); // version: 1=raw, 2=gzip
+            bw2.Write((ulong)(uint)seed);
+            bw2.Write(cfgHash);
+            bw2.Write((ushort)_bakeStep);
+            // Only write entries whose raw data is consistent with the current step.
+            // Stale entries (different step) are dropped so the file stays self-consistent.
+            var validEntries = new List<((int, int) key, (int extLo, int bh, int bw, sbyte[] data) entry)>();
+            foreach (var kv in toWrite)
+            {
+                var (extLo, bh, ebw, raw) = kv.Value;
+                int nsx = (ebw + _bakeStep - 1) / _bakeStep;
+                int nsy = (bh  + _bakeStep - 1) / _bakeStep;
+                int nsz = (ebw + _bakeStep - 1) / _bakeStep;
+                if (raw.Length != nsx * nsy * nsz)
+                {
+                    Log.LogInfo($"[VoxCaves] bake: dropping zone {kv.Key} — raw size {raw.Length} != expected {nsx*nsy*nsz} (stale step?)");
+                    continue;
+                }
+                validEntries.Add((kv.Key, kv.Value));
+            }
+            bw2.Write((uint)validEntries.Count);
+            foreach (var (key, entry) in validEntries)
+            {
+                var (eox, eoz) = key;
+                var (extLo, bh, ebw, raw) = entry;
+                int nsx = (ebw + _bakeStep - 1) / _bakeStep;
+                int nsy = (bh  + _bakeStep - 1) / _bakeStep;
+                int nsz = (ebw + _bakeStep - 1) / _bakeStep;
+                bw2.Write(eox); bw2.Write(eoz); bw2.Write(extLo);
+                bw2.Write((ushort)bh); bw2.Write((ushort)ebw);
+                bw2.Write(nsx); bw2.Write(nsy); bw2.Write(nsz);
+                var bytes = new byte[raw.Length];
+                Buffer.BlockCopy(raw, 0, bytes, 0, raw.Length);
+                bw2.Write(bytes);
+            }
+            _bakeData = toWrite;
+            _bakeFileStep = _bakeStep;
+            _bakePending.Clear();
+            Log.LogInfo($"[VoxCaves] Bake written: {validEntries.Count} zones (dropped {toWrite.Count - validEntries.Count} stale), radius={radius:F0}m, step={_bakeStep} → {path}");
+        }
+
         // ── Hot-reload: re-run the full voxel pipeline on every loaded zone ───────
         internal static void ResetWorldState()
         {
             LoadBiomeConfig();
+            _bakePending.Clear();
+            _bakeData = null;
+            _bakeLoadAttempted = false;
             _zoneObjects.Clear();
             _zoneParams.Clear();
             _zoneMaxY.Clear();
@@ -1969,7 +2260,7 @@ namespace VoxCaves
                     }
                     catch (Exception e) { Log.LogWarning($"[VoxCaves] EnqueueMesh {key}: {e.Message}"); break; }
                 }
-                Log.LogInfo($"[VoxCaves] Queued {queued} bricks for zone {key}.");
+                Log.LogDebug($"[VoxCaves] Queued {queued} bricks for zone {key}.");
 
                 try { _finishSkinNowMethod!.Invoke(zoneObj, null); }
                 catch (Exception e) { Log.LogWarning($"[VoxCaves] FinishSkinNow {key}: {e.Message}"); }
@@ -2175,9 +2466,11 @@ namespace VoxCaves
 
         static (int yLo, int yHi) ComputeYBounds(int ox, int oz, int w, float s, WorldGenerator wg)
         {
+            // Include the overlap region — same buffer footprint Voxheim scans for yLo/yHi.
+            const int overlap = 4;
             float minH = float.MaxValue, maxH = float.MinValue;
-            for (int gx = 0; gx <= w; gx++)
-            for (int gz = 0; gz <= w; gz++)
+            for (int gx = -overlap; gx <= w + overlap; gx++)
+            for (int gz = -overlap; gz <= w + overlap; gz++)
             {
                 float h = wg.GetHeight((ox + gx) * s, (oz + gz) * s) / s;
                 if (h < minH) minH = h;
@@ -2969,21 +3262,6 @@ namespace VoxCaves
         }
     }
 
-    // Raises vegetation/location ground height to the top of VoxCaves-carved terrain.
-    // Heightmap.GetWorldHeight is what ZoneSystem.GetGroundData calls to set p.y before
-    // spawning each vegetation object. We look up our post-blur SDF surface in _surfHCache
-    // and return the higher of the vanilla height and the VoxCaves surface.
-    [HarmonyPatch(typeof(Heightmap), "GetWorldHeight")]
-    static class HeightmapGetWorldHeightPatch
-    {
-        static void Postfix(Vector3 worldPos, ref float height, bool __result)
-        {
-            if (!__result) return;
-            float sh = Plugin.FindCarvedSurfaceY(worldPos.x, height, worldPos.z);
-            if (sh > height) height = sh;
-        }
-    }
-
     [HarmonyPatch(typeof(ZNet), nameof(ZNet.SetServer))]
     static class WorldLoadPatch
     {
@@ -3058,32 +3336,11 @@ namespace VoxCaves
     [HarmonyPatch]
     static class PlaceVegetationPatch
     {
-        static FieldInfo? _zdoPosField;
-
         static MethodBase? TargetMethod() =>
             typeof(ZoneSystem).GetMethod("PlaceVegetation",
                 BindingFlags.NonPublic | BindingFlags.Instance);
 
         static bool Prefix() => !Plugin._disableVegetation;
-
-        static void Postfix(List<GameObject> spawnedObjects)
-        {
-            foreach (var go in spawnedObjects)
-            {
-                if (go == null) continue;
-                var pos = go.transform.position;
-                float newY = Plugin.FindCarvedSurfaceY(pos.x, pos.y, pos.z);
-                if (Mathf.Abs(newY - pos.y) < 0.05f) continue;
-                pos.y = newY;
-                go.transform.position = pos;
-                var zdo = go.GetComponent<ZNetView>()?.GetZDO();
-                if (zdo == null) continue;
-                if (_zdoPosField == null)
-                    _zdoPosField = typeof(ZDO).GetField("m_position",
-                        BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-                _zdoPosField?.SetValue(zdo, pos);
-            }
-        }
     }
 
     [HarmonyPatch]
