@@ -117,7 +117,7 @@ namespace VoxCaves
         // Staged: subsampled SDF written by Carve() when within bakeRadius.
         static readonly Dictionary<(int, int), (int extLo, int bh, int bw, sbyte[] data)> _bakePending = new();
         // Loaded from disk: populated at world load; null if no valid file exists.
-        static Dictionary<(int, int), (int extLo, int bh, int bw, sbyte[] data)>? _bakeData;
+        internal static Dictionary<(int, int), (int extLo, int bh, int bw, sbyte[] data)>? _bakeData;
         static int _bakeFileStep = 8;
         static bool _bakeLoadAttempted = false;
 
@@ -160,6 +160,21 @@ namespace VoxCaves
         internal static FieldInfo?       _zoneOriginZ;
         internal static FieldInfo?       _yScanHiField;
         internal static FieldInfo?       _voxelZoneFieldField;  // VoxelZone._field → VoxelField
+
+        // ── Direct brick write (Option C fast path) ──────────────────────────────
+        // Bypasses per-voxel VoxelField.Set() overhead: ~80 dict lookups per zone
+        // instead of ~327K, plus direct sbyte[] writes into Brick._data.
+        internal static Type?            _brickType;
+        internal static FieldInfo?       _vfBricksField;       // VoxelField._bricks
+        internal static FieldInfo?       _vfMaxBrickYField;    // VoxelField._maxBrickY
+        internal static MethodInfo?      _vfSetFloorMethod;    // VoxelField.SetFloor(SolidFloorRule)
+        internal static FieldInfo?       _brickDataField;      // Brick._data
+        internal static Type?            _solidFloorRuleType;
+        internal static ConstructorInfo? _solidFloorCtor;      // SolidFloorRule(int y,x0,x1,z0,z1)
+        // Compiled delegate: _bricks[Int3(bx,by,bz)] = brick
+        internal static Action<object, int, int, int, object>? _addBrick;
+        // Set when prefix skips VoxelizeColumns so Phase 3 knows to set the floor rule
+        internal static bool _voxelizeColumnsSkipped;
 
         // VoxelBounds fields — used to construct the changed-bounds arg for PokeNeighbors
         internal static Type?       _voxelBoundsType;
@@ -478,6 +493,39 @@ namespace VoxCaves
                     BindingFlags.Public    | BindingFlags.Instance);
             if (_locationInstancesField == null)
                 Log.LogWarning("[VoxCaves] m_locationInstances not found — location protection off.");
+
+            // ── Direct brick write reflection ─────────────────────────────────────
+            _brickType        = FindType("Voxheim.Core.Brick", "Voxheim.Core");
+            _solidFloorRuleType = FindType("Voxheim.Core.SolidFloorRule", "Voxheim.Core");
+            _vfBricksField    = fieldT?.GetField("_bricks",    BindingFlags.NonPublic | BindingFlags.Instance);
+            _vfMaxBrickYField = fieldT?.GetField("_maxBrickY", BindingFlags.NonPublic | BindingFlags.Instance);
+            _vfSetFloorMethod = fieldT?.GetMethod("SetFloor",  BindingFlags.Public | BindingFlags.Instance);
+            _brickDataField   = _brickType?.GetField("_data",  BindingFlags.NonPublic | BindingFlags.Instance);
+            _solidFloorCtor   = _solidFloorRuleType?.GetConstructor(
+                new[] { typeof(int), typeof(int), typeof(int), typeof(int), typeof(int) });
+
+            if (_brickType != null && _vfBricksField != null && _int3Ctor != null && fieldT != null)
+            {
+                // Emit: void(object field, int bx, int by, int bz, object brick)
+                //       → ((VoxelField)field)._bricks[new Int3(bx,by,bz)] = (Brick)brick
+                var dictType = typeof(Dictionary<,>).MakeGenericType(int3T, _brickType);
+                var setItem  = dictType.GetMethod("set_Item")!;
+                var abDm = new DynamicMethod("VC_AddBrick", typeof(void),
+                    new[] { typeof(object), typeof(int), typeof(int), typeof(int), typeof(object) },
+                    typeof(Plugin).Module, skipVisibility: true);
+                var abIl = abDm.GetILGenerator();
+                abIl.Emit(OpCodes.Ldarg_0); abIl.Emit(OpCodes.Castclass, fieldT);
+                abIl.Emit(OpCodes.Ldfld, _vfBricksField);
+                abIl.Emit(OpCodes.Ldarg_1); abIl.Emit(OpCodes.Ldarg_2); abIl.Emit(OpCodes.Ldarg_3);
+                abIl.Emit(OpCodes.Newobj, _int3Ctor);
+                abIl.Emit(OpCodes.Ldarg_S, (byte)4); abIl.Emit(OpCodes.Castclass, _brickType);
+                abIl.Emit(OpCodes.Callvirt, setItem);
+                abIl.Emit(OpCodes.Ret);
+                _addBrick = (Action<object, int, int, int, object>)
+                    abDm.CreateDelegate(typeof(Action<object, int, int, int, object>));
+                Log.LogInfo("[VoxCaves] Direct brick write path ready.");
+            }
+            else Log.LogWarning("[VoxCaves] Direct brick write unavailable — falling back to per-voxel Set.");
 
             _int3FieldX = int3T.GetField("X", BindingFlags.Public | BindingFlags.Instance)
                           ?? int3T.GetField("x", BindingFlags.Public | BindingFlags.Instance);
@@ -1720,48 +1768,65 @@ namespace VoxCaves
             var transHasOvr = new bool[bh];
             var cacheData   = new sbyte[width * bh * width]; // (ci*bh + cy)*width + ri
 
+            // Encode transition bytes and cacheData for all columns (common to both write paths)
             for (int ci = 0; ci < width; ci++)
             for (int ri = 0; ri < width; ri++)
             {
                 int cx = ci + overlap, cz = ri + overlap;
-                int gx = ox + ci,      gz = oz + ri;
-
                 Array.Clear(transHasOvr, 0, bh);
+                float av = buf[(cx * bh + (bh - 1)) * bw + cz];
+                for (int cy = bh - 2; cy >= 0; cy--)
                 {
-                    float av = buf[(cx * bh + (bh - 1)) * bw + cz];
-                    for (int cy = bh - 2; cy >= 0; cy--)
+                    float bv = buf[(cx * bh + cy) * bw + cz];
+                    bool topSurf = av > 0f && bv <= 0f;
+                    bool botSurf = av <= 0f && bv > 0f;
+                    if (topSurf || botSurf)
                     {
-                        float bv = buf[(cx * bh + cy) * bw + cz];
-                        bool topSurf = av > 0f && bv <= 0f;
-                        bool botSurf = av <= 0f && bv > 0f;
-                        if (topSurf || botSurf)
-                        {
-                            float d = av - bv;
-                            float t = Mathf.Clamp01(d != 0f ? (-bv) / d : 0.5f);
-                            sbyte lo, hi;
-                            if (topSurf) { lo = (sbyte)(int)Math.Round(-t * 127f);  hi = (sbyte)(int)Math.Round((1f - t) * 127f);  }
-                            else         { lo = (sbyte)(int)Math.Round(t * 127f);   hi = (sbyte)(int)Math.Round(-(1f - t) * 127f); }
-                            transBytes[cy]     = lo; transHasOvr[cy]     = true;
-                            transBytes[cy + 1] = hi; transHasOvr[cy + 1] = true;
-                        }
-                        av = bv;
+                        float d = av - bv;
+                        float t = Mathf.Clamp01(d != 0f ? (-bv) / d : 0.5f);
+                        sbyte lo, hi;
+                        if (topSurf) { lo = (sbyte)(int)Math.Round(-t * 127f);  hi = (sbyte)(int)Math.Round((1f - t) * 127f);  }
+                        else         { lo = (sbyte)(int)Math.Round(t * 127f);   hi = (sbyte)(int)Math.Round(-(1f - t) * 127f); }
+                        transBytes[cy]     = lo; transHasOvr[cy]     = true;
+                        transBytes[cy + 1] = hi; transHasOvr[cy + 1] = true;
                     }
+                    av = bv;
                 }
-
-                for (int gy = extLo; gy <= extHi; gy++)
+                for (int cy = 0; cy < bh; cy++)
                 {
-                    int   cy       = gy - extLo;
                     float finalSDF = buf[(cx * bh + cy) * bw + cz];
-                    sbyte newByte  = transHasOvr[cy] ? transBytes[cy] : ToSDFByte(finalSDF, s);
-                    cacheData[(ci * bh + cy) * width + ri] = newByte;
-                    sbyte curByte  = _get!(field, gx, gy, gz);
-                    if (newByte == curByte) continue;
-                    _set!(field, gx, gy, gz, newByte);
+                    sbyte v = transHasOvr[cy] ? transBytes[cy] : ToSDFByte(finalSDF, s);
+                    cacheData[(ci * bh + cy) * width + ri] = v;
+                    int gy = extLo + cy;
                     if (gy > maxYAny) maxYAny = gy;
-                    if (newByte < 0 && gy > maxYC) maxYC = gy;
-                    carved++;
+                    if (v < 0 && gy > maxYC) maxYC = gy;
                 }
             }
+
+            // Fast path: write directly into Brick._data arrays (no per-voxel dict lookup)
+            bool wroteViaBricks = _addBrick != null && _brickDataField != null &&
+                WriteCacheDataToBricks(field!, ox, oz, width, extLo, bh, cacheData, _voxelizeColumnsSkipped);
+            _voxelizeColumnsSkipped = false;
+
+            if (!wroteViaBricks)
+            {
+                // Slow path: per-voxel VoxelField.Set via reflection delegate
+                for (int ci = 0; ci < width; ci++)
+                for (int ri = 0; ri < width; ri++)
+                {
+                    int gx = ox + ci, gz = oz + ri;
+                    for (int gy = extLo; gy <= extHi; gy++)
+                    {
+                        int   cy      = gy - extLo;
+                        sbyte newByte = cacheData[(ci * bh + cy) * width + ri];
+                        sbyte curByte = _get!(field, gx, gy, gz);
+                        if (newByte == curByte) continue;
+                        _set!(field, gx, gy, gz, newByte);
+                        carved++;
+                    }
+                }
+            }
+
             _sdfCache[zoneKey] = (extLo, bh, width, cacheData);
 
             // _zoneMaxY tracks highest solid voxel (for _yScanHi extension on mode C terrain)
@@ -1791,6 +1856,69 @@ namespace VoxCaves
 
             var _centerBiome = WorldGenerator.instance?.GetBiome((ox + width / 2) * (float)(_scale ?? 1f), (oz + width / 2) * (float)(_scale ?? 1f)) ?? Heightmap.Biome.None;
             Log.LogDebug($"[VoxCaves] zone ({ox},{oz}) biome={_centerBiome} bakeC={bakeC} bakeA={bakeA} voxels={bw}x{bh}x{bw} fixHops={_lastFixpointHops} Ph0={_t0}ms Ph1={_t1-_t0}ms blur={_t1b-_t1}ms Ph2={_t2-_t1b}ms Ph3={_t3-_t2}ms total={_t3}ms carved={carved}");
+        }
+
+        // ── Direct brick write ────────────────────────────────────────────────────
+        // Writes cacheData directly into VoxelField._bricks, bypassing per-voxel
+        // VoxelField.Set() overhead. One dict lookup per brick (~80) instead of per
+        // voxel (~327K). setFloor=true when VoxelizeColumns was skipped and the
+        // field needs its floor rule initialized before bricks are added.
+        static bool WriteCacheDataToBricks(object field, int ox, int oz, int width,
+                                           int extLo, int bh, sbyte[] cacheData, bool setFloor)
+        {
+            if (_addBrick == null || _brickDataField == null || _brickType == null ||
+                _vfMaxBrickYField == null) return false;
+
+            if (setFloor)
+            {
+                if (_solidFloorCtor == null || _vfSetFloorMethod == null) return false;
+                var floorRule = _solidFloorCtor.Invoke(
+                    new object[] { extLo - 1, ox, ox + width - 1, oz, oz + width - 1 });
+                _vfSetFloorMethod.Invoke(field, new object[] { floorRule });
+            }
+
+            int maxBrickY = (int)_vfMaxBrickYField.GetValue(field)!;
+
+            int brickXMin = ox >> 4,          brickXMax = (ox + width - 1) >> 4;
+            int brickYMin = extLo >> 4,       brickYMax = (extLo + bh - 1) >> 4;
+            int brickZMin = oz >> 4,          brickZMax = (oz + width - 1) >> 4;
+
+            for (int brickX = brickXMin; brickX <= brickXMax; brickX++)
+            for (int brickY = brickYMin; brickY <= brickYMax; brickY++)
+            for (int brickZ = brickZMin; brickZ <= brickZMax; brickZ++)
+            {
+                int vx0 = brickX << 4, vy0 = brickY << 4, vz0 = brickZ << 4;
+
+                // Determine fill: below our range → solid (-127), otherwise air (+127)
+                sbyte fill = (vy0 + 15 < extLo) ? (sbyte)-127 : (sbyte)127;
+                var brick  = Activator.CreateInstance(_brickType, fill)!;
+                var data   = new sbyte[4096];
+                // Initialise data with fill
+                if (fill != 0) { for (int i = 0; i < 4096; i++) data[i] = fill; }
+
+                // Write the voxels that fall within our cacheData range
+                for (int lx = 0; lx < 16; lx++)
+                for (int lz = 0; lz < 16; lz++)
+                {
+                    int gx = vx0 + lx, gz = vz0 + lz;
+                    if (gx < ox || gx >= ox + width || gz < oz || gz >= oz + width) continue;
+                    int ci = gx - ox, ri = gz - oz;
+                    for (int ly = 0; ly < 16; ly++)
+                    {
+                        int gy = vy0 + ly;
+                        if (gy < extLo || gy >= extLo + bh) continue;
+                        int cy = gy - extLo;
+                        data[lx + 16 * (ly + 16 * lz)] = cacheData[(ci * bh + cy) * width + ri];
+                    }
+                }
+
+                _brickDataField.SetValue(brick, data);
+                _addBrick(field, brickX, brickY, brickZ, brick);
+                if (brickY > maxBrickY) maxBrickY = brickY;
+            }
+
+            _vfMaxBrickYField.SetValue(field, maxBrickY);
+            return true;
         }
 
         // ── Zone data dump (voxcaves_dump command) ───────────────────────────────
@@ -3190,6 +3318,18 @@ namespace VoxCaves
             Plugin._voxelizeColumnsMethod = m;
             if (m == null) Plugin.Log.LogError("[VoxCaves] VoxelizeColumns not found.");
             return m;
+        }
+
+        // Skip VoxelizeColumns entirely for bake-hit zones: saves ~5ms of wasted
+        // vanilla SDF computation; Phase 3 will set the floor rule and create bricks.
+        static bool Prefix(object field, object grid, int originX, int originZ,
+                            int gx0, int gx1, int gz0, int gz1, int yLo, int yHi)
+        {
+            if (gx0 != 0 || gz0 != 0) return true;
+            if (Plugin._addBrick == null) return true;
+            if (Plugin._bakeData == null || !Plugin._bakeData.ContainsKey((originX, originZ))) return true;
+            Plugin._voxelizeColumnsSkipped = true;
+            return false; // skip VoxelizeColumns
         }
 
         static void Postfix(object field, object grid, int originX, int originZ,
