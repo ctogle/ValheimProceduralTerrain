@@ -3301,6 +3301,146 @@ namespace VoxCaves
         }
     }
 
+    // After Voxheim's authority system installs a snapshot or delta, re-establish caves:
+    //   1. Write our SDF into the field (replaces vanilla baseline in the authority data)
+    //   2. Re-apply the authority bricks on top (player edits win over caves)
+    // For delta: removed bricks are already gone (floor-rule default), so our SDF fills them.
+    //            upserted bricks are re-applied after our SDF.
+    static class AuthorityInstallHelper
+    {
+        // Cached reflection for VoxelSnapshotBrick — resolved on first use
+        static PropertyInfo? _brickCoordProp;
+        static PropertyInfo? _brickDensProp;
+
+        static void EnsureBrickProps(object brick)
+        {
+            if (_brickCoordProp != null) return;
+            var t = brick.GetType();
+            _brickCoordProp = t.GetProperty("Coordinate");
+            _brickDensProp  = t.GetProperty("Densities");
+        }
+
+        // Write our cached SDF (or re-run Carve if cache is cold) into field.
+        static void WriteSDF(object field, int ox, int oz)
+        {
+            if (Plugin._get == null || Plugin._set == null) return;
+            string zoneKey = $"{ox},{oz}";
+            if (Plugin._sdfCache.TryGetValue(zoneKey, out var c))
+            {
+                var (extLo, bh, width, cacheData) = c;
+                for (int ci = 0; ci < width; ci++)
+                for (int ri = 0; ri < width; ri++)
+                {
+                    int gx = ox + ci, gz = oz + ri;
+                    for (int cy = 0; cy < bh; cy++)
+                    {
+                        sbyte v = cacheData[(ci * bh + cy) * width + ri];
+                        if (Plugin._get(field, gx, extLo + cy, gz) != v)
+                            Plugin._set(field, gx, extLo + cy, gz, v);
+                    }
+                }
+            }
+            else if (Plugin._zoneParams.TryGetValue(zoneKey, out var zp))
+            {
+                Plugin._zoneParams[zoneKey] = (field, zp.grid, zp.ox, zp.oz, zp.w, zp.yLo, zp.yHi);
+                Plugin.Carve(field, zp.grid, zp.ox, zp.oz, zp.w, zp.yLo, zp.yHi);
+            }
+        }
+
+        // Write authority brick densities back into field so player edits win over our SDF.
+        static void WriteBricks(object field, System.Collections.IEnumerable bricks)
+        {
+            if (Plugin._set == null || Plugin._int3FieldX == null ||
+                Plugin._int3FieldY == null || Plugin._int3FieldZ == null) return;
+            foreach (object brick in bricks)
+            {
+                EnsureBrickProps(brick);
+                object? coord     = _brickCoordProp?.GetValue(brick);
+                var     densities = _brickDensProp?.GetValue(brick) as IReadOnlyList<sbyte>;
+                if (coord == null || densities == null) continue;
+                int bx = (int)Plugin._int3FieldX.GetValue(coord)! << 4;
+                int by = (int)Plugin._int3FieldY!.GetValue(coord)! << 4;
+                int bz = (int)Plugin._int3FieldZ!.GetValue(coord)! << 4;
+                for (int x = 0; x < 16; x++)
+                for (int y = 0; y < 16; y++)
+                for (int z = 0; z < 16; z++)
+                    Plugin._set(field, bx + x, by + y, bz + z, densities[x + 16 * (y + 16 * z)]);
+            }
+        }
+
+        static (object? field, int ox, int oz) GetZoneState(object zoneInstance)
+        {
+            if (Plugin._zoneOriginX == null || Plugin._zoneOriginZ == null ||
+                Plugin._voxelZoneFieldField == null) return (null, 0, 0);
+            int ox = (int)Plugin._zoneOriginX.GetValue(zoneInstance)!;
+            int oz = (int)Plugin._zoneOriginZ.GetValue(zoneInstance)!;
+            return (Plugin._voxelZoneFieldField.GetValue(zoneInstance), ox, oz);
+        }
+
+        internal static void OnSnapshot(object zoneInstance, object? snapshotObj)
+        {
+            var (field, ox, oz) = GetZoneState(zoneInstance);
+            if (field == null) return;
+            WriteSDF(field, ox, oz);
+            // Re-apply authority bricks (player edits) on top of our SDF
+            var bricks = GetBricksFromSnapshot(snapshotObj);
+            if (bricks != null) WriteBricks(field, bricks);
+        }
+
+        internal static void OnDelta(object zoneInstance, object? patchObj)
+        {
+            var (field, ox, oz) = GetZoneState(zoneInstance);
+            if (field == null) return;
+            WriteSDF(field, ox, oz);
+            // Re-apply only the upserted bricks (removed bricks are now floor-default, our SDF already covers them)
+            var upserted = GetProp(patchObj, "UpsertedBricks") as System.Collections.IEnumerable;
+            if (upserted != null) WriteBricks(field, upserted);
+        }
+
+        static System.Collections.IEnumerable? GetBricksFromSnapshot(object? snapshotObj)
+        {
+            var fieldDoc = GetProp(snapshotObj, "Field");
+            return GetProp(fieldDoc, "Bricks") as System.Collections.IEnumerable;
+        }
+
+        static object? GetProp(object? obj, string name) =>
+            obj?.GetType().GetProperty(name)?.GetValue(obj);
+    }
+
+    [HarmonyPatch]
+    static class AuthoritySnapshotPatch
+    {
+        static MethodBase? TargetMethod()
+        {
+            var t = Plugin.FindType("Voxheim.Unity.VoxelZone", "Voxheim");
+            var m = t?.GetMethod("TryInstallAuthoritySnapshot",
+                BindingFlags.NonPublic | BindingFlags.Instance);
+            if (m == null) Plugin.Log.LogWarning("[VoxCaves] TryInstallAuthoritySnapshot not found — caves may disappear in player-edited zones.");
+            return m;
+        }
+        static void Postfix(object __instance, bool __result, object __0)
+        {
+            if (__result) AuthorityInstallHelper.OnSnapshot(__instance, __0);
+        }
+    }
+
+    [HarmonyPatch]
+    static class AuthorityDeltaPatch
+    {
+        static MethodBase? TargetMethod()
+        {
+            var t = Plugin.FindType("Voxheim.Unity.VoxelZone", "Voxheim");
+            var m = t?.GetMethod("TryInstallAuthorityDelta",
+                BindingFlags.NonPublic | BindingFlags.Instance);
+            if (m == null) Plugin.Log.LogWarning("[VoxCaves] TryInstallAuthorityDelta not found — caves may disappear after live terrain edits.");
+            return m;
+        }
+        static void Postfix(object __instance, bool __result, object __1)
+        {
+            if (__result) AuthorityInstallHelper.OnDelta(__instance, __1);
+        }
+    }
+
     // Patches StitchedSource.FallbackDensity (private nested class inside VoxelZone).
     // FallbackDensity is called when a boundary voxel's zone is absent or inactive in s_zones.
     // We return our own SDF so boundary bricks are built correctly on first mesh — no post-hoc repair needed.
