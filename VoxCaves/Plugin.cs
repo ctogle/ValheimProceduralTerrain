@@ -115,7 +115,7 @@ namespace VoxCaves
         static float _bakeRadius = 0f;
         static int   _bakeStep   = 8;
         // Staged: subsampled SDF written by Carve() when within bakeRadius.
-        static readonly Dictionary<(int, int), (int extLo, int bh, int bw, sbyte[] data)> _bakePending = new();
+        static readonly System.Collections.Concurrent.ConcurrentDictionary<(int, int), (int extLo, int bh, int bw, sbyte[] data)> _bakePending = new();
         // Loaded from disk: populated at world load; null if no valid file exists.
         internal static Dictionary<(int, int), (int extLo, int bh, int bw, sbyte[] data)>? _bakeData;
         static int _bakeFileStep = 8;
@@ -190,20 +190,22 @@ namespace VoxCaves
         //   Slot mapping built fresh each zone (biomeSlot dict in BakeBlendedProfiles).
         const int SuperN        = 2;   // NxN sub-samples per coarse cell (2→4 samples, 9x smoother boundary)
         const int MaxBiomeSlots = 16;  // Valheim has ~9 biomes; 16 is safe headroom
-        static float[]?       _biomeFrac    = null;  // [pgSize * MaxBiomeSlots]
-        static int[]?         _biomeDist    = null;  // BFS distance map scratch (per-biome)
-        static int[]?         _biomeBfsQ    = null;  // BFS queue scratch
-        static float[]?       _biomeTotW    = null;  // per-cell weight accumulator
-        static CaveProfile[]? _blendedProfs = null;  // blended profile at each coarse cell
+        // All per-zone scratch buffers are [ThreadStatic] so parallel bake workers
+        // each get their own copies without allocation conflicts.
+        [ThreadStatic] static float[]?       _biomeFrac;
+        [ThreadStatic] static int[]?         _biomeDist;
+        [ThreadStatic] static int[]?         _biomeBfsQ;
+        [ThreadStatic] static float[]?       _biomeTotW;
+        [ThreadStatic] static CaveProfile[]? _blendedProfs;
 
         // Scratch buffers for floating-island BFS (Phase 1.5). Pre-allocated, resized on demand.
-        static bool[]? _visitedBuf;
-        static bool[]? _percolVisited;
-        static int[]?  _islandQueue;
+        [ThreadStatic] static bool[]? _visitedBuf;
+        [ThreadStatic] static bool[]? _percolVisited;
+        [ThreadStatic] static int[]?  _islandQueue;
 
         // wg.GetHeight is a pure function of (worldX, worldZ) for a given world seed.
         // Cache it keyed by integer coarse voxel coords — cleared on world load only.
-        internal static readonly Dictionary<long, float> _heightCache = new();
+        internal static readonly System.Collections.Concurrent.ConcurrentDictionary<long, float> _heightCache = new();
 
         // Per-zone SDF cache: filled by Phase 3, queried by FallbackDensityPatch.
         // Layout: data[(ci * bh + cy) * width + ri]  (ci=zoneX, ri=zoneZ, cy=Y-extLo)
@@ -232,52 +234,54 @@ namespace VoxCaves
             public bool percolValid;
             public bool[,] percol;
         }
-        internal static readonly Dictionary<(int, int), ZoneFaceCache> _zoneFaceCache = new();
+        internal static readonly System.Collections.Concurrent.ConcurrentDictionary<(int, int), ZoneFaceCache> _zoneFaceCache = new();
+
+        // Set true during parallel bake to suppress main-thread-only side effects.
+        static volatile bool _parallelBakeActive;
 
         // Reused across Carve() calls to avoid per-zone GC pressure.
-        internal static float[]? _bufA;
-        internal static float[]? _bufB;
-        // CR reconstruction temp buffers — sized for bw=72, bh≤300, step≥2
+        [ThreadStatic] internal static float[]? _bufA;
+        [ThreadStatic] internal static float[]? _bufB;
+        // CR reconstruction temp buffers — main thread only, not [ThreadStatic].
         static float[] _crTemp1 = new float[72 * 150 * 36]; // [bw * nsy * nsz]
         static float[] _crTemp2 = new float[72 * 300 * 36]; // [bw * bh  * nsz]
 
-        internal static float[]? _bufC; // orig snapshot for Taubin λ/μ steps
+        [ThreadStatic] internal static float[]? _bufC;
         // Dedicated buffer for ComputeZoneFaceCache so it never clobbers Carve()'s active buf.
-        internal static float[]? _precomputeBuf;
+        [ThreadStatic] internal static float[]? _precomputeBuf;
 
-        internal static float[]? _noiseBuf;  // coarse Mode C bake: [cx4*(cw4*bh) + cz4*bh + cy]
-        internal static float[]? _tunBuf;   // coarse Mode A: tunnel noise field 1 (after warp)
-        internal static float[]? _tunBuf2;  // coarse Mode A: tunnel noise field 2 (after warp)
-        internal static float[]? _tunWBuf;  // coarse Mode A: width modulation noise
+        [ThreadStatic] internal static float[]? _noiseBuf;
+        [ThreadStatic] internal static float[]? _tunBuf;
+        [ThreadStatic] internal static float[]? _tunBuf2;
+        [ThreadStatic] internal static float[]? _tunWBuf;
         // 2D coarse bake (same XZ grid as _noiseBuf): [cx4*cw4 + cz4]
-        internal static float[]? _bk2dAddH;  // Mode C anchor height
-        internal static float[]? _bk2dLAmp;  // Mode C local amplitude
-        internal static float[]? _bk2dMcS;   // modeC_noiseAmp (post-bake, for bakeC gate)
-        internal static float[]? _bk2dMcT;   // modeC_threshold
-        internal static float[]? _bk2dMcFlare; // modeC_flare
-        internal static float[]? _bk2dFlD;   // floorDepth
-        internal static float[]? _bk2dFlFade; // floorFade
+        [ThreadStatic] internal static float[]? _bk2dAddH;
+        [ThreadStatic] internal static float[]? _bk2dLAmp;
+        [ThreadStatic] internal static float[]? _bk2dMcS;
+        [ThreadStatic] internal static float[]? _bk2dMcT;
+        [ThreadStatic] internal static float[]? _bk2dMcFlare;
+        [ThreadStatic] internal static float[]? _bk2dFlD;
+        [ThreadStatic] internal static float[]? _bk2dFlFade;
         // 2D coarse bake — Mode B shape params
-        internal static float[]? _bk2dMbwf;  // modeB_warpFrequency
-        internal static float[]? _bk2dMbwa;  // modeB_warpAmp
-        internal static float[]? _bk2dMbr;   // modeB_radius
-        internal static float[]? _bk2dMbvs;  // modeB_vScale
-        internal static float[]? _bk2dMbna;  // modeB_noiseAmp
-        internal static float[]? _bk2dMbyo;  // modeB_yOffset
-        internal static float[]? _bk2dMbtwist; // modeB_twist
-        // 2D coarse bake — terrain geometry (used by Mode A to orient noise in surface space)
+        [ThreadStatic] internal static float[]? _bk2dMbwf;
+        [ThreadStatic] internal static float[]? _bk2dMbwa;
+        [ThreadStatic] internal static float[]? _bk2dMbr;
+        [ThreadStatic] internal static float[]? _bk2dMbvs;
+        [ThreadStatic] internal static float[]? _bk2dMbna;
+        [ThreadStatic] internal static float[]? _bk2dMbyo;
+        [ThreadStatic] internal static float[]? _bk2dMbtwist;
         // 2D coarse bake — Mode A shape params
-        internal static float[]? _bk2dMawf;   // modeA_warpFrequency
-        internal static float[]? _bk2dMawa;   // modeA_warpAmp
-        internal static float[]? _bk2dMaway;  // modeA_warpAmpY
-        internal static float[]? _bk2dMaf;   // modeA_frequency
-        internal static float[]? _bk2dMavs;  // modeA_vScale
-        internal static float[]? _bk2dMaw;   // modeA_width
-        internal static float[]? _bk2dMawv;  // modeA_widthVary
-        internal static float[]? _bk2dMawvf; // modeA_widthFrequency
-        internal static float[]? _bk2dMayo;  // modeA_yOffset
+        [ThreadStatic] internal static float[]? _bk2dMawf;
+        [ThreadStatic] internal static float[]? _bk2dMawa;
+        [ThreadStatic] internal static float[]? _bk2dMaway;
+        [ThreadStatic] internal static float[]? _bk2dMaf;
+        [ThreadStatic] internal static float[]? _bk2dMavs;
+        [ThreadStatic] internal static float[]? _bk2dMaw;
+        [ThreadStatic] internal static float[]? _bk2dMawv;
+        [ThreadStatic] internal static float[]? _bk2dMawvf;
+        [ThreadStatic] internal static float[]? _bk2dMayo;
         // Full-res (bw×bw) — Mode B warped heightmap (wg.GetHeight after XZ warp)
-        internal static float[]? _bkWarpedH;
+        [ThreadStatic] internal static float[]? _bkWarpedH;
 
         static FieldInfo? _locationInstancesField;
 
@@ -1760,7 +1764,8 @@ namespace VoxCaves
                     }
                     surfH[cx * bw + cz] = sh;
                 }
-                lock (_surfHCache) _surfHCache[(ox, oz)] = (bw, extLo, s, surfH);
+                if (!_parallelBakeActive)
+                    lock (_surfHCache) _surfHCache[(ox, oz)] = (bw, extLo, s, surfH);
             }
 
             // ── Phase 3: Write SDF directly to VoxelField via the 'field' parameter ────
@@ -1833,7 +1838,7 @@ namespace VoxCaves
                 }
             }
 
-            _sdfCache[zoneKey] = (extLo, bh, width, cacheData);
+            if (!_parallelBakeActive) _sdfCache[zoneKey] = (extLo, bh, width, cacheData);
 
             // _zoneMaxY tracks highest solid voxel (for _yScanHi extension on mode C terrain)
             // _zoneExtHi tracks highest ANY write (solid or air) so hot-reload VoxelizeColumns
@@ -2180,8 +2185,9 @@ namespace VoxCaves
             int gridOffset = ((-(int)(32f / s)) % zoneW + zoneW) % zoneW;
             Log.LogDebug($"[VoxCaves] bake: zone grid offset={gridOffset}");
 
-            // Discard any pending entries staged at a different step so they get re-carved below.
+            // Discard all cached bake data so every zone gets re-carved fresh.
             _bakePending.Clear();
+            _bakeData = null;
 
             // Collect zones to carve (not already loaded from file at current step).
             var toCarve = new List<(int ox, int oz)>();
@@ -2195,20 +2201,30 @@ namespace VoxCaves
                 if (_bakeData != null && _bakeFileStep == _bakeStep && _bakeData.ContainsKey((ox, oz))) continue;
                 toCarve.Add((ox, oz));
             }
-            Log.LogInfo($"[VoxCaves] bake: {toCarve.Count} zones to carve (radius={radius:F0}m)...");
+            int threads = Math.Max(1, Environment.ProcessorCount - 1);
+            Log.LogInfo($"[VoxCaves] bake: {toCarve.Count} zones to carve (radius={radius:F0}m, threads={threads})...");
             var bakeSw = System.Diagnostics.Stopwatch.StartNew();
-            for (int i = 0; i < toCarve.Count; i++)
+            int doneCount = 0;
+            _parallelBakeActive = true;
+            try
             {
-                var (zox, zoz) = toCarve[i];
-                var (yLo, yHi) = ComputeYBounds(zox, zoz, zoneW, s, wg);
-                Carve(null, null, zox, zoz, zoneW, yLo, yHi);
-                if ((i + 1) % 10 == 0 || i + 1 == toCarve.Count)
-                {
-                    float elapsed = bakeSw.ElapsedMilliseconds / 1000f;
-                    float eta = elapsed > 0f ? (toCarve.Count - i - 1) / ((i + 1) / elapsed) : 0f;
-                    Log.LogInfo($"[VoxCaves] bake: {i + 1}/{toCarve.Count} zones — {eta:F0}s remaining");
-                }
+                System.Threading.Tasks.Parallel.ForEach(toCarve,
+                    new System.Threading.Tasks.ParallelOptions { MaxDegreeOfParallelism = threads },
+                    zone =>
+                    {
+                        var (zox, zoz) = zone;
+                        var (yLo, yHi) = ComputeYBounds(zox, zoz, zoneW, s, wg);
+                        Carve(null, null, zox, zoz, zoneW, yLo, yHi);
+                        int n = System.Threading.Interlocked.Increment(ref doneCount);
+                        if (n % 50 == 0 || n == toCarve.Count)
+                        {
+                            float elapsed = bakeSw.ElapsedMilliseconds / 1000f;
+                            float eta = elapsed > 0f ? (toCarve.Count - n) / (n / elapsed) : 0f;
+                            Log.LogInfo($"[VoxCaves] bake: {n}/{toCarve.Count} zones — {eta:F0}s remaining");
+                        }
+                    });
             }
+            finally { _parallelBakeActive = false; }
 
             // Merge staged + existing bake data (staged takes priority).
             var toWrite = new Dictionary<(int, int), (int extLo, int bh, int bw, sbyte[] data)>();
@@ -3285,7 +3301,10 @@ namespace VoxCaves
                 {
                     long hKey = (long)gx << 32 | (uint)gz;
                     if (!_heightCache.TryGetValue(hKey, out h))
-                        _heightCache[hKey] = h = wg.GetHeight(worldX, worldZ);
+                    {
+                        h = wg.GetHeight(worldX, worldZ);
+                        if (!_parallelBakeActive) _heightCache[hKey] = h;
+                    }
                 }
                 float floorY   = h - profFlD;
                 float locFac   = LocationFactor(worldX, worldZ, nearbyLocs);
