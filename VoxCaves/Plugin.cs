@@ -1381,7 +1381,7 @@ namespace VoxCaves
 
             bool bakeC = false, bakeA = false, anyMbActive = false;
             bool fromBake = _bakeData != null && TryPopulateFromBake(ox, oz, bw, bh, extLo, s, buf);
-            long _t0 = 0, _t1 = 0, _t1b = 0, _t2 = 0;
+            long _t0 = 0, _t1 = 0, _t1b = 0, _t2 = 0, _tFix = 0;
             var _sw = System.Diagnostics.Stopwatch.StartNew();
 
             if (!fromBake)
@@ -1572,7 +1572,9 @@ namespace VoxCaves
                 bool needsFullPass = ungNX || ungPX || ungNZ || ungPZ;
                 if (needsFullPass)
                 {
+                    long _fixStart = _sw.ElapsedMilliseconds;
                     EnsureFixpoint(ox, oz, width, ungNX, ungPX, ungNZ, ungPZ);
+                    _tFix = _sw.ElapsedMilliseconds - _fixStart;
 
                     Array.Clear(_visitedBuf, 0, islandBufSize);
                     qHead = 0; qTail = 0;
@@ -1855,7 +1857,7 @@ namespace VoxCaves
             }
 
             var _centerBiome = WorldGenerator.instance?.GetBiome((ox + width / 2) * (float)(_scale ?? 1f), (oz + width / 2) * (float)(_scale ?? 1f)) ?? Heightmap.Biome.None;
-            Log.LogDebug($"[VoxCaves] zone ({ox},{oz}) biome={_centerBiome} bakeC={bakeC} bakeA={bakeA} voxels={bw}x{bh}x{bw} fixHops={_lastFixpointHops} Ph0={_t0}ms Ph1={_t1-_t0}ms blur={_t1b-_t1}ms Ph2={_t2-_t1b}ms Ph3={_t3-_t2}ms total={_t3}ms carved={carved}");
+            Log.LogDebug($"[VoxCaves] zone ({ox},{oz}) biome={_centerBiome} bakeC={bakeC} bakeA={bakeA} voxels={bw}x{bh}x{bw} fixHops={_lastFixpointHops} Ph0={_t0}ms Ph1={_t1-_t0}ms blur={_t1b-_t1}ms Ph2={_t2-_t1b}ms fix={_tFix}ms Ph3={_t3-_t2}ms total={_t3}ms carved={carved}");
         }
 
         // ── Direct brick write ────────────────────────────────────────────────────
