@@ -237,6 +237,10 @@ namespace VoxCaves
         // Reused across Carve() calls to avoid per-zone GC pressure.
         internal static float[]? _bufA;
         internal static float[]? _bufB;
+        // CR reconstruction temp buffers — sized for bw=72, bh≤300, step≥2
+        static float[] _crTemp1 = new float[72 * 150 * 36]; // [bw * nsy * nsz]
+        static float[] _crTemp2 = new float[72 * 300 * 36]; // [bw * bh  * nsz]
+
         internal static float[]? _bufC; // orig snapshot for Taubin λ/μ steps
         // Dedicated buffer for ComputeZoneFaceCache so it never clobbers Carve()'s active buf.
         internal static float[]? _precomputeBuf;
@@ -2062,6 +2066,12 @@ namespace VoxCaves
             catch (Exception ex) { Log.LogWarning($"[VoxCaves] bake: load failed: {ex.GetType().Name}: {ex.Message}\n{ex.StackTrace}"); _bakeData = null; }
         }
 
+        static float CatmullRom(float p0, float p1, float p2, float p3, float t)
+        {
+            float t2 = t * t, t3 = t2 * t;
+            return 0.5f * ((2*p1) + (-p0+p2)*t + (2*p0-5*p1+4*p2-p3)*t2 + (-p0+3*p1-3*p2+p3)*t3);
+        }
+
         static bool TryPopulateFromBake(int ox, int oz, int bw, int bh, int extLo, float s, float[] buf)
         {
             if (_bakeData == null) { Log.LogInfo($"[VoxCaves] bake miss ({ox},{oz}): no bake data loaded"); return false; }
@@ -2073,50 +2083,61 @@ namespace VoxCaves
             int nsz  = (bw   + step - 1) / step;
             sbyte[] raw = e.data;
             if (raw.Length != nsx * nsy * nsz) { Log.LogInfo($"[VoxCaves] bake miss ({ox},{oz}): data length mismatch"); return false; }
-            // Wide quantization range (32 voxels) prevents clamping on steep terrain where
-            // adjacent sample columns can be many voxels from the surface.
             float scale = 32f * s / 127f;
 
+            // Separable tricubic Catmull-Rom reconstruction: three axis passes through
+            // temporary buffers. O(bw*bh*bw*4) reads vs O(bw*bh*bw*64) for naive 3D CR.
+            // Pass 1: expand X — raw[xs,ys,zs] → temp1[cx,ys,zs]
+            int t1Len = bw * nsy * nsz, t2Len = bw * bh * nsz;
+            if (_crTemp1.Length < t1Len) _crTemp1 = new float[t1Len];
+            if (_crTemp2.Length < t2Len) _crTemp2 = new float[t2Len];
+            var temp1 = _crTemp1;
+            var temp2 = _crTemp2;
+            for (int ys = 0; ys < nsy; ys++)
+            for (int zs = 0; zs < nsz; zs++)
             for (int cx = 0; cx < bw; cx++)
             {
                 float xf = (float)cx / step;
-                int xs   = (int)xf; if (xs > nsx - 2) xs = nsx - 2; if (xs < 0) xs = 0;
-                int xs1  = xs + 1; if (nsx == 1) { xs = xs1 = 0; }
+                int xs = Math.Min((int)xf, nsx - 2); if (xs < 0) xs = 0;
                 float tx = xf - xs;
-                for (int cy = 0; cy < bh; cy++)
+                int xA = Math.Max(xs-1,0), xB=xs, xC=Math.Min(xs+1,nsx-1), xD=Math.Min(xs+2,nsx-1);
+                temp1[(cx * nsy + ys) * nsz + zs] = CatmullRom(
+                    raw[(xA*nsy+ys)*nsz+zs], raw[(xB*nsy+ys)*nsz+zs],
+                    raw[(xC*nsy+ys)*nsz+zs], raw[(xD*nsy+ys)*nsz+zs], tx);
+            }
+
+            // Pass 2: expand Y — temp1[cx,ys,zs] → temp2[cx,cy,zs]
+            for (int cx = 0; cx < bw; cx++)
+            for (int zs = 0; zs < nsz; zs++)
+            for (int cy = 0; cy < bh; cy++)
+            {
+                int bakCy = (extLo + cy) - e.extLo;
+                if (bakCy < 0 || bakCy >= e.bh)
                 {
-                    int bakCy = (extLo + cy) - e.extLo;
-                    float defaultVal = (bakCy < 0) ? -s : s;
-                    if (bakCy < 0 || bakCy >= e.bh)
-                    {
-                        for (int cz = 0; cz < bw; cz++) buf[(cx * bh + cy) * bw + cz] = defaultVal;
-                        continue;
-                    }
-                    float yf = (float)bakCy / step;
-                    int ys   = (int)yf; if (ys > nsy - 2) ys = nsy - 2; if (ys < 0) ys = 0;
-                    int ys1  = ys + 1; if (nsy == 1) { ys = ys1 = 0; }
-                    float ty = yf - ys;
-                    for (int cz = 0; cz < bw; cz++)
-                    {
-                        float zf = (float)cz / step;
-                        int zs   = (int)zf; if (zs > nsz - 2) zs = nsz - 2; if (zs < 0) zs = 0;
-                        int zs1  = zs + 1; if (nsz == 1) { zs = zs1 = 0; }
-                        float tz = zf - zs;
-                        float c000 = raw[(xs  * nsy + ys ) * nsz + zs ];
-                        float c001 = raw[(xs  * nsy + ys ) * nsz + zs1];
-                        float c010 = raw[(xs  * nsy + ys1) * nsz + zs ];
-                        float c011 = raw[(xs  * nsy + ys1) * nsz + zs1];
-                        float c100 = raw[(xs1 * nsy + ys ) * nsz + zs ];
-                        float c101 = raw[(xs1 * nsy + ys ) * nsz + zs1];
-                        float c110 = raw[(xs1 * nsy + ys1) * nsz + zs ];
-                        float c111 = raw[(xs1 * nsy + ys1) * nsz + zs1];
-                        float v    = c000*(1-tx)*(1-ty)*(1-tz) + c001*(1-tx)*(1-ty)*tz
-                                   + c010*(1-tx)*ty*(1-tz)     + c011*(1-tx)*ty*tz
-                                   + c100*tx*(1-ty)*(1-tz)     + c101*tx*(1-ty)*tz
-                                   + c110*tx*ty*(1-tz)         + c111*tx*ty*tz;
-                        buf[(cx * bh + cy) * bw + cz] = v * scale;
-                    }
+                    temp2[(cx * bh + cy) * nsz + zs] = (bakCy < 0) ? -127f : 127f;
+                    continue;
                 }
+                float yf = (float)bakCy / step;
+                int ys = Math.Min((int)yf, nsy - 2); if (ys < 0) ys = 0;
+                float ty = yf - ys;
+                int yA=Math.Max(ys-1,0), yB=ys, yC=Math.Min(ys+1,nsy-1), yD=Math.Min(ys+2,nsy-1);
+                temp2[(cx * bh + cy) * nsz + zs] = CatmullRom(
+                    temp1[(cx*nsy+yA)*nsz+zs], temp1[(cx*nsy+yB)*nsz+zs],
+                    temp1[(cx*nsy+yC)*nsz+zs], temp1[(cx*nsy+yD)*nsz+zs], ty);
+            }
+
+            // Pass 3: expand Z — temp2[cx,cy,zs] → buf[cx,cy,cz]
+            for (int cx = 0; cx < bw; cx++)
+            for (int cy = 0; cy < bh; cy++)
+            for (int cz = 0; cz < bw; cz++)
+            {
+                float zf = (float)cz / step;
+                int zs = Math.Min((int)zf, nsz - 2); if (zs < 0) zs = 0;
+                float tz = zf - zs;
+                int zA=Math.Max(zs-1,0), zB=zs, zC=Math.Min(zs+1,nsz-1), zD=Math.Min(zs+2,nsz-1);
+                buf[(cx * bh + cy) * bw + cz] = CatmullRom(
+                    temp2[(cx*bh+cy)*nsz+zA], temp2[(cx*bh+cy)*nsz+zB],
+                    temp2[(cx*bh+cy)*nsz+zC], temp2[(cx*bh+cy)*nsz+zD], tz) * scale;
             }
             return true;
         }
