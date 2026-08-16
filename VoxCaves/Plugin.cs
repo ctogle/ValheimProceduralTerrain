@@ -10,7 +10,7 @@ using System.Reflection;
 using System.Reflection.Emit;
 using UnityEngine;
 
-namespace VoxCaves
+namespace ProceduralTerrain
 {
     struct CaveProfile
     {
@@ -73,7 +73,7 @@ namespace VoxCaves
         };
     }
 
-    [BepInPlugin("com.ctogle.voxcaves", "VoxCaves", "0.2.0")]
+    [BepInPlugin("com.ctogle.procedural_terrain", "ProceduralTerrain", "0.1.0")]
     [BepInDependency("com.bogey.voxheim", BepInDependency.DependencyFlags.SoftDependency)]
     public class Plugin : BaseUnityPlugin
     {
@@ -292,28 +292,28 @@ namespace VoxCaves
             Log = Logger;
             if (!BepInEx.Bootstrap.Chainloader.PluginInfos.ContainsKey("com.bogey.voxheim"))
             {
-                Log.LogInfo("[VoxCaves] Voxheim absent — disabled.");
+                Log.LogInfo("[ProceduralTerrain] Voxheim absent — disabled.");
                 return;
             }
             if (!BuildDelegates())
             {
-                Log.LogError("[VoxCaves] Reflection failed — disabled.");
+                Log.LogError("[ProceduralTerrain] Reflection failed — disabled.");
                 return;
             }
             LoadBiomeConfig();
             WatchBiomeConfig();
-            new Harmony("com.ctogle.voxcaves").PatchAll();
+            new Harmony("com.ctogle.procedural_terrain").PatchAll();
             new Terminal.ConsoleCommand("voxcaves_dump", "dump SDF + biome blend data for the next 9 zones processed to BepInEx/config/voxcaves_dump_*.json", _ =>
             {
                 _dumpZonesRemaining = 9;
-                Log.LogInfo("[VoxCaves] Will dump next 9 zones to voxcaves_dump_*.json");
+                Log.LogInfo("[ProceduralTerrain] Will dump next 9 zones to voxcaves_dump_*.json");
             });
             new Terminal.ConsoleCommand("voxcaves_probe", "voxcaves_probe [x z] — print biome blend breakdown + profile params at world pos (default: player pos)", args =>
             {
                 try
                 {
                     var wg = WorldGenerator.instance;
-                    if (wg == null) { Log.LogWarning("[VoxCaves] probe: WorldGenerator not ready."); return; }
+                    if (wg == null) { Log.LogWarning("[ProceduralTerrain] probe: WorldGenerator not ready."); return; }
                     float s = _scale is { } sv && sv > 0f ? sv : 1f;
                     float wx, wz;
                     if (args.Length >= 3 && float.TryParse(args[1], out float ax) && float.TryParse(args[2], out float az))
@@ -321,14 +321,14 @@ namespace VoxCaves
                     else
                     {
                         var player = Player.m_localPlayer;
-                        if (player == null) { Log.LogWarning("[VoxCaves] probe: no player; pass x z args."); return; }
+                        if (player == null) { Log.LogWarning("[ProceduralTerrain] probe: no player; pass x z args."); return; }
                         wx = player.transform.position.x;
                         wz = player.transform.position.z;
                     }
-                    Log.LogInfo($"[VoxCaves] Probing biome blend at world ({wx:F1}, {wz:F1}):");
+                    Log.LogInfo($"[ProceduralTerrain] Probing biome blend at world ({wx:F1}, {wz:F1}):");
                     ProbeBlend(wx, wz, wg, s);
                 }
-                catch (Exception e) { Log.LogError($"[VoxCaves] probe exception: {e}"); }
+                catch (Exception e) { Log.LogError($"[ProceduralTerrain] probe exception: {e}"); }
             });
             new Terminal.ConsoleCommand("voxcaves_bake", "voxcaves_bake [radius] — write baked SDF to disk for all staged zones (optionally filtered to radius)", args =>
             {
@@ -337,7 +337,7 @@ namespace VoxCaves
                     radius = r;
                 WriteBakeFile(radius);
             });
-            Log.LogInfo("[VoxCaves] Ready.");
+            Log.LogInfo("[ProceduralTerrain] Ready.");
         }
 
         internal static int _dumpZonesRemaining = 0;
@@ -395,10 +395,10 @@ namespace VoxCaves
                                     if (ia) active++; else if (ip) pend++; else stale++;
                                 }
                         }
-                        Log.LogDebug($"[VoxCaves] Voxheim queues: pending={pending?.Count ?? -1} deferred={deferred?.Count ?? -1} zones(active={active} pending={pend} stale={stale})");
+                        Log.LogDebug($"[ProceduralTerrain] Voxheim queues: pending={pending?.Count ?? -1} deferred={deferred?.Count ?? -1} zones(active={active} pending={pend} stale={stale})");
                     }
                 }
-                catch (System.Exception e) { Log.LogWarning($"[VoxCaves] diag error: {e.Message}"); }
+                catch (System.Exception e) { Log.LogWarning($"[ProceduralTerrain] diag error: {e.Message}"); }
             }
 
             // Fast-poll while waiting for location data (zone modifications are deferred
@@ -437,7 +437,7 @@ namespace VoxCaves
 
             if (fieldT == null || int3T == null)
             {
-                Log.LogError("[VoxCaves] VoxelField or Int3 type not found.");
+                Log.LogError("[ProceduralTerrain] VoxelField or Int3 type not found.");
                 return false;
             }
 
@@ -449,13 +449,13 @@ namespace VoxCaves
 
             if (_int3Ctor == null || get == null || set == null)
             {
-                Log.LogError("[VoxCaves] Int3 ctor / Get / Set not found.");
+                Log.LogError("[ProceduralTerrain] Int3 ctor / Get / Set not found.");
                 return false;
             }
 
             _scaleField = zoneT?.GetField("s_scale",
                 BindingFlags.NonPublic | BindingFlags.Static);
-            if (_scaleField == null) Log.LogWarning("[VoxCaves] s_scale not found, will assume 1.");
+            if (_scaleField == null) Log.LogWarning("[ProceduralTerrain] s_scale not found, will assume 1.");
 
             _enqueueMeshMethod   = zoneT?.GetMethod("EnqueueMesh",
                 BindingFlags.NonPublic | BindingFlags.Instance);
@@ -466,9 +466,9 @@ namespace VoxCaves
             _pokeNeighborsMethod = zoneT?.GetMethods(BindingFlags.NonPublic | BindingFlags.Instance)
                 .FirstOrDefault(m => m.Name == "PokeNeighbors" && m.GetParameters().Length == 2
                                      && m.GetParameters()[1].ParameterType == typeof(bool));
-            if (_enqueueMeshMethod   == null) Log.LogWarning("[VoxCaves] EnqueueMesh not found.");
-            if (_finishSkinNowMethod == null) Log.LogWarning("[VoxCaves] FinishSkinNow not found.");
-            if (_pokeNeighborsMethod == null) Log.LogWarning("[VoxCaves] PokeNeighbors not found — neighbor seam repair disabled.");
+            if (_enqueueMeshMethod   == null) Log.LogWarning("[ProceduralTerrain] EnqueueMesh not found.");
+            if (_finishSkinNowMethod == null) Log.LogWarning("[ProceduralTerrain] FinishSkinNow not found.");
+            if (_pokeNeighborsMethod == null) Log.LogWarning("[ProceduralTerrain] PokeNeighbors not found — neighbor seam repair disabled.");
 
             var boundsT = AppDomain.CurrentDomain.GetAssemblies()
                 .SelectMany(a => { try { return a.GetTypes(); } catch { return Array.Empty<Type>(); } })
@@ -477,7 +477,7 @@ namespace VoxCaves
             _vbMinField = boundsT?.GetField("Min", BindingFlags.Public | BindingFlags.Instance);
             _vbMaxField = boundsT?.GetField("Max", BindingFlags.Public | BindingFlags.Instance);
             _vbAnyField = boundsT?.GetField("Any", BindingFlags.Public | BindingFlags.Instance);
-            if (_voxelBoundsType == null) Log.LogWarning("[VoxCaves] VoxelBounds type not found — neighbor seam repair disabled.");
+            if (_voxelBoundsType == null) Log.LogWarning("[ProceduralTerrain] VoxelBounds type not found — neighbor seam repair disabled.");
 
             _zoneOriginX         = zoneT?.GetField("_originX",
                 BindingFlags.NonPublic | BindingFlags.Instance);
@@ -488,11 +488,11 @@ namespace VoxCaves
             _yScanHiField        = zoneT?.GetField("_yScanHi",
                 BindingFlags.NonPublic | BindingFlags.Instance);
             if (_zoneOriginX == null || _zoneOriginZ == null)
-                Log.LogWarning("[VoxCaves] Zone origin fields missing — per-brick SDF disabled.");
+                Log.LogWarning("[ProceduralTerrain] Zone origin fields missing — per-brick SDF disabled.");
             if (_voxelZoneFieldField == null)
-                Log.LogWarning("[VoxCaves] VoxelZone._field not found — per-brick SDF disabled.");
+                Log.LogWarning("[ProceduralTerrain] VoxelZone._field not found — per-brick SDF disabled.");
             if (_yScanHiField == null)
-                Log.LogWarning("[VoxCaves] _yScanHi not found — Mode C ceiling extension disabled.");
+                Log.LogWarning("[ProceduralTerrain] _yScanHi not found — Mode C ceiling extension disabled.");
 
             _locationInstancesField =
                 typeof(ZoneSystem).GetField("m_locationInstances",
@@ -500,7 +500,7 @@ namespace VoxCaves
                 typeof(ZoneSystem).GetField("m_locationInstances",
                     BindingFlags.Public    | BindingFlags.Instance);
             if (_locationInstancesField == null)
-                Log.LogWarning("[VoxCaves] m_locationInstances not found — location protection off.");
+                Log.LogWarning("[ProceduralTerrain] m_locationInstances not found — location protection off.");
 
             // ── Direct brick write reflection ─────────────────────────────────────
             _brickType        = FindType("Voxheim.Core.Brick", "Voxheim.Core");
@@ -531,9 +531,9 @@ namespace VoxCaves
                 abIl.Emit(OpCodes.Ret);
                 _addBrick = (Action<object, int, int, int, object>)
                     abDm.CreateDelegate(typeof(Action<object, int, int, int, object>));
-                Log.LogInfo("[VoxCaves] Direct brick write path ready.");
+                Log.LogInfo("[ProceduralTerrain] Direct brick write path ready.");
             }
-            else Log.LogWarning("[VoxCaves] Direct brick write unavailable — falling back to per-voxel Set.");
+            else Log.LogWarning("[ProceduralTerrain] Direct brick write unavailable — falling back to per-voxel Set.");
 
             _int3FieldX = int3T.GetField("X", BindingFlags.Public | BindingFlags.Instance)
                           ?? int3T.GetField("x", BindingFlags.Public | BindingFlags.Instance);
@@ -542,7 +542,7 @@ namespace VoxCaves
             _int3FieldZ = int3T.GetField("Z", BindingFlags.Public | BindingFlags.Instance)
                           ?? int3T.GetField("z", BindingFlags.Public | BindingFlags.Instance);
             if (_int3FieldX == null || _int3FieldY == null || _int3FieldZ == null)
-                Log.LogWarning("[VoxCaves] Int3 X/Y/Z fields not found — FallbackDensity patch will use vanilla.");
+                Log.LogWarning("[ProceduralTerrain] Int3 X/Y/Z fields not found — FallbackDensity patch will use vanilla.");
 
             var gDm = new DynamicMethod("VC_Get", typeof(sbyte),
                 new[] { typeof(object), typeof(int), typeof(int), typeof(int) },
@@ -590,7 +590,7 @@ namespace VoxCaves
 
         // ── Config file ───────────────────────────────────────────────────────────
         static string ConfigPath =>
-            Path.Combine(BepInEx.Paths.ConfigPath, "voxcaves_biomes.cfg");
+            Path.Combine(BepInEx.Paths.ConfigPath, "procedural_terrain_biomes.cfg");
 
         // Apply a flat key→value list on top of a base CaveProfile (struct copy).
         static CaveProfile ApplyProfile(
@@ -742,12 +742,12 @@ namespace VoxCaves
 
             _namedProfiles = named;
             _biomeProfiles = profiles;
-            Log.LogInfo($"[VoxCaves] Profiles reloaded: {named.Count} named, {profiles.Count} biomes.");
+            Log.LogInfo($"[ProceduralTerrain] Profiles reloaded: {named.Count} named, {profiles.Count} biomes.");
             foreach (var kv in profiles)
             {
                 var p = kv.Value;
                 if (p.modeA_width > 0f || p.modeB_radius > 0f || p.modeC_noiseAmp > 0f)
-                    Log.LogInfo($"[VoxCaves]   {kv.Key}: mB_r={p.modeB_radius:F1} mA_w={p.modeA_width:F2} mC_amp={p.modeC_noiseAmp:F1}");
+                    Log.LogInfo($"[ProceduralTerrain]   {kv.Key}: mB_r={p.modeB_radius:F1} mA_w={p.modeA_width:F2} mC_amp={p.modeC_noiseAmp:F1}");
             }
         }
 
@@ -755,7 +755,7 @@ namespace VoxCaves
         {
             var sb = new System.Text.StringBuilder();
 
-            sb.AppendLine("# VoxCaves — edit and save to hot-reload in-game");
+            sb.AppendLine("# ProceduralTerrain — edit and save to hot-reload in-game");
             sb.AppendLine("#");
             sb.AppendLine("# Define profiles with [Profile:name], assign to biomes with:");
             sb.AppendLine("#   profile = name");
@@ -830,7 +830,7 @@ namespace VoxCaves
             }
 
             File.WriteAllText(path, sb.ToString());
-            Log.LogInfo($"[VoxCaves] Wrote default biome config to {path}");
+            Log.LogInfo($"[ProceduralTerrain] Wrote default biome config to {path}");
         }
 
         static void WatchBiomeConfig()
@@ -846,7 +846,7 @@ namespace VoxCaves
             if (_caveNoise != null) return;
             long uid = ZNet.instance?.GetWorldUID() ?? 0L;
             int seed = uid != 0L ? (int)(uid * 2654435761L) : 12345;
-            Log.LogInfo($"[VoxCaves] noise seed={seed} (uid={uid})");
+            Log.LogInfo($"[ProceduralTerrain] noise seed={seed} (uid={uid})");
 
             FastNoiseLite MakeNoise(int offset)
             {
@@ -1273,7 +1273,7 @@ namespace VoxCaves
             {
                 _locationsCached  = true;
                 _hotReloadPending = true;
-                Log.LogInfo($"[VoxCaves] Location cache built: {_locationPositions.Count} positions — scheduling recarve.");
+                Log.LogInfo($"[ProceduralTerrain] Location cache built: {_locationPositions.Count} positions — scheduling recarve.");
             }
         }
 
@@ -1309,7 +1309,7 @@ namespace VoxCaves
             if (_scale == null)
             {
                 _scale = _scaleField != null ? (float)_scaleField.GetValue(null)! : 1f;
-                Log.LogInfo($"[VoxCaves] s_scale resolved to {_scale}");
+                Log.LogInfo($"[ProceduralTerrain] s_scale resolved to {_scale}");
             }
             float s      = _scale.Value;
             bool bakeOnly = field == null;
@@ -1328,7 +1328,7 @@ namespace VoxCaves
             // If location data isn't ready yet, leave the zone vanilla.
             if (!bakeOnly && !_locationsCached)
             {
-                Log.LogDebug($"[VoxCaves] zone ({ox},{oz}) skip=no-locations");
+                Log.LogDebug($"[ProceduralTerrain] zone ({ox},{oz}) skip=no-locations");
                 return;
             }
 
@@ -1348,7 +1348,7 @@ namespace VoxCaves
             var centerProf = ProfAt(cw4Early / 2, cw4Early / 2);
 
             var centerBiome = wg?.GetBiome(zoneX, zoneZ) ?? Heightmap.Biome.None;
-            Log.LogDebug($"[VoxCaves] zone ({ox},{oz}) biome={centerBiome} mB_r={centerProf.modeB_radius:F1} mA_w={centerProf.modeA_width:F2} mC_amp={centerProf.modeC_noiseAmp:F1} mC_flare={centerProf.modeC_flare:F3}");
+            Log.LogDebug($"[ProceduralTerrain] zone ({ox},{oz}) biome={centerBiome} mB_r={centerProf.modeB_radius:F1} mA_w={centerProf.modeA_width:F2} mC_amp={centerProf.modeC_noiseAmp:F1} mC_flare={centerProf.modeC_flare:F3}");
 
             // Build nearby-location list for the location-protection fade.
             float searchR = width * s * 0.5f + LocProtectR + LocFadeR;
@@ -1676,7 +1676,7 @@ namespace VoxCaves
                 for (int i = 0; i < islandBufSize; i++)
                     if (!_visitedBuf[i] && buf[i] < 0f) { buf[i] = s; removed++; }
 
-                Log.LogDebug($"[VoxCaves] island-fill zone ({ox},{oz}): pre={!needsFullPass} seeds={qTail} removed={removed}");
+                Log.LogDebug($"[ProceduralTerrain] island-fill zone ({ox},{oz}): pre={!needsFullPass} seeds={qTail} removed={removed}");
             }
 
             // ── Phase 2.6: Sealed underground pocket removal ──────────────────────────
@@ -1733,7 +1733,7 @@ namespace VoxCaves
                 for (int i = 0; i < total; i++)
                     if (!_visitedBuf![i] && buf[i] >= 0f) { buf[i] = -s; filled++; }
 
-                Log.LogDebug($"[VoxCaves] pocket-fill zone ({ox},{oz}): filled={filled}");
+                Log.LogDebug($"[ProceduralTerrain] pocket-fill zone ({ox},{oz}): filled={filled}");
             }
 
             } // end if (!fromBake)
@@ -1866,7 +1866,7 @@ namespace VoxCaves
             }
 
             var _centerBiome = WorldGenerator.instance?.GetBiome((ox + width / 2) * (float)(_scale ?? 1f), (oz + width / 2) * (float)(_scale ?? 1f)) ?? Heightmap.Biome.None;
-            Log.LogDebug($"[VoxCaves] zone ({ox},{oz}) biome={_centerBiome} bakeC={bakeC} bakeA={bakeA} voxels={bw}x{bh}x{bw} fixHops={_lastFixpointHops} Ph0={_t0}ms Ph1={_t1-_t0}ms blur={_t1b-_t1}ms Ph2={_t2-_t1b}ms fix={_tFix}ms Ph3={_t3-_t2}ms total={_t3}ms carved={carved}");
+            Log.LogDebug($"[ProceduralTerrain] zone ({ox},{oz}) biome={_centerBiome} bakeC={bakeC} bakeA={bakeA} voxels={bw}x{bh}x{bw} fixHops={_lastFixpointHops} Ph0={_t0}ms Ph1={_t1-_t0}ms blur={_t1b-_t1}ms Ph2={_t2-_t1b}ms fix={_tFix}ms Ph3={_t3-_t2}ms total={_t3}ms carved={carved}");
         }
 
         // ── Direct brick write ────────────────────────────────────────────────────
@@ -2009,10 +2009,10 @@ namespace VoxCaves
 
                 string outPath = Path.Combine(BepInEx.Paths.ConfigPath, $"voxcaves_dump_{ox}_{oz}.json");
                 File.WriteAllText(outPath, sb.ToString());
-                Log.LogInfo($"[VoxCaves] Dump written → {outPath}");
-                Log.LogInfo($"[VoxCaves] Dump → {outPath}");
+                Log.LogInfo($"[ProceduralTerrain] Dump written → {outPath}");
+                Log.LogInfo($"[ProceduralTerrain] Dump → {outPath}");
             }
-            catch (Exception ex) { Log.LogError($"[VoxCaves] Dump failed: {ex.Message}"); }
+            catch (Exception ex) { Log.LogError($"[ProceduralTerrain] Dump failed: {ex.Message}"); }
         }
 
         // ── SDF bake helpers ─────────────────────────────────────────────────────
@@ -2028,7 +2028,7 @@ namespace VoxCaves
         }
 
         static string BakeFilePath(int seed, uint cfgHash) =>
-            Path.Combine(BepInEx.Paths.ConfigPath, $"voxcaves_bake_{seed:X8}_{cfgHash:X8}.bin");
+            Path.Combine(BepInEx.Paths.ConfigPath, $"procedural_terrain_bake_{seed:X8}_{cfgHash:X8}.bin");
 
         static void LoadBakeFile()
         {
@@ -2046,11 +2046,11 @@ namespace VoxCaves
                 fs.Seek(0, SeekOrigin.Begin);
                 Stream inStream = isGzip ? new GZipStream(fs, CompressionMode.Decompress) : fs;
                 using var br  = new BinaryReader(inStream);
-                if (br.ReadUInt32() != 0x564F5846u) { Log.LogWarning("[VoxCaves] bake: invalid magic."); _bakeData = null; return; }
+                if (br.ReadUInt32() != 0x564F5846u) { Log.LogWarning("[ProceduralTerrain] bake: invalid magic."); _bakeData = null; return; }
                 ushort ver = br.ReadUInt16();
-                if (ver != 1 && ver != 2) { Log.LogWarning($"[VoxCaves] bake: unsupported version {ver}."); _bakeData = null; return; }
+                if (ver != 1 && ver != 2) { Log.LogWarning($"[ProceduralTerrain] bake: unsupported version {ver}."); _bakeData = null; return; }
                 if (br.ReadUInt64() != (ulong)(uint)seed || br.ReadUInt32() != cfgHash)
-                    { Log.LogWarning("[VoxCaves] bake: seed/cfg mismatch."); _bakeData = null; return; }
+                    { Log.LogWarning("[ProceduralTerrain] bake: seed/cfg mismatch."); _bakeData = null; return; }
                 _bakeFileStep = br.ReadUInt16();
                 int count = (int)br.ReadUInt32();
                 var data = new Dictionary<(int, int), (int extLo, int bh, int bw, sbyte[] data)>(count);
@@ -2066,9 +2066,9 @@ namespace VoxCaves
                     data[(eox, eoz)] = (extLo, bh, ebw, raw);
                 }
                 _bakeData = data;
-                Log.LogInfo($"[VoxCaves] Bake loaded: {count} zones, step={_bakeFileStep} from {path}");
+                Log.LogInfo($"[ProceduralTerrain] Bake loaded: {count} zones, step={_bakeFileStep} from {path}");
             }
-            catch (Exception ex) { Log.LogWarning($"[VoxCaves] bake: load failed: {ex.GetType().Name}: {ex.Message}\n{ex.StackTrace}"); _bakeData = null; }
+            catch (Exception ex) { Log.LogWarning($"[ProceduralTerrain] bake: load failed: {ex.GetType().Name}: {ex.Message}\n{ex.StackTrace}"); _bakeData = null; }
         }
 
         static float CatmullRom(float p0, float p1, float p2, float p3, float t)
@@ -2079,15 +2079,15 @@ namespace VoxCaves
 
         static bool TryPopulateFromBake(int ox, int oz, int bw, int bh, int extLo, float s, float[] buf)
         {
-            if (_bakeData == null) { Log.LogInfo($"[VoxCaves] bake miss ({ox},{oz}): no bake data loaded"); return false; }
-            if (!_bakeData.TryGetValue((ox, oz), out var e)) { Log.LogInfo($"[VoxCaves] bake miss ({ox},{oz}): zone not in file"); return false; }
-            if (e.bw != bw) { Log.LogInfo($"[VoxCaves] bake miss ({ox},{oz}): bw mismatch baked={e.bw} live={bw}"); return false; }
+            if (_bakeData == null) { Log.LogInfo($"[ProceduralTerrain] bake miss ({ox},{oz}): no bake data loaded"); return false; }
+            if (!_bakeData.TryGetValue((ox, oz), out var e)) { Log.LogInfo($"[ProceduralTerrain] bake miss ({ox},{oz}): zone not in file"); return false; }
+            if (e.bw != bw) { Log.LogInfo($"[ProceduralTerrain] bake miss ({ox},{oz}): bw mismatch baked={e.bw} live={bw}"); return false; }
             int step = _bakeFileStep;
             int nsx  = (bw   + step - 1) / step;
             int nsy  = (e.bh + step - 1) / step;
             int nsz  = (bw   + step - 1) / step;
             sbyte[] raw = e.data;
-            if (raw.Length != nsx * nsy * nsz) { Log.LogInfo($"[VoxCaves] bake miss ({ox},{oz}): data length mismatch"); return false; }
+            if (raw.Length != nsx * nsy * nsz) { Log.LogInfo($"[ProceduralTerrain] bake miss ({ox},{oz}): data length mismatch"); return false; }
             float scale = 32f * s / 127f;
 
             // Separable tricubic Catmull-Rom reconstruction: three axis passes through
@@ -2169,8 +2169,8 @@ namespace VoxCaves
         static void WriteBakeFile(float radius)
         {
             var wg = WorldGenerator.instance;
-            if (wg == null) { Log.LogWarning("[VoxCaves] bake: WorldGenerator not ready."); return; }
-            if (_scale == null) { Log.LogWarning("[VoxCaves] bake: scale not resolved yet."); return; }
+            if (wg == null) { Log.LogWarning("[ProceduralTerrain] bake: WorldGenerator not ready."); return; }
+            if (_scale == null) { Log.LogWarning("[ProceduralTerrain] bake: scale not resolved yet."); return; }
             float s = _scale.Value;
             int seed = wg.GetSeed();
             uint cfgHash = ComputeCfgHash();
@@ -2183,7 +2183,7 @@ namespace VoxCaves
             // so its XZ origin (lower-left corner) is at -zoneSize/2 = -32 world units.
             // In voxel coords: gridOffset = -(int)(32f / s), mod zoneW to get positive form.
             int gridOffset = ((-(int)(32f / s)) % zoneW + zoneW) % zoneW;
-            Log.LogDebug($"[VoxCaves] bake: zone grid offset={gridOffset}");
+            Log.LogDebug($"[ProceduralTerrain] bake: zone grid offset={gridOffset}");
 
             // Discard all cached bake data so every zone gets re-carved fresh.
             _bakePending.Clear();
@@ -2202,7 +2202,7 @@ namespace VoxCaves
                 toCarve.Add((ox, oz));
             }
             int threads = Math.Max(1, Environment.ProcessorCount - 1);
-            Log.LogInfo($"[VoxCaves] bake: {toCarve.Count} zones to carve (radius={radius:F0}m, threads={threads})...");
+            Log.LogInfo($"[ProceduralTerrain] bake: {toCarve.Count} zones to carve (radius={radius:F0}m, threads={threads})...");
             var bakeSw = System.Diagnostics.Stopwatch.StartNew();
             int doneCount = 0;
             _parallelBakeActive = true;
@@ -2220,7 +2220,7 @@ namespace VoxCaves
                         {
                             float elapsed = bakeSw.ElapsedMilliseconds / 1000f;
                             float eta = elapsed > 0f ? (toCarve.Count - n) / (n / elapsed) : 0f;
-                            Log.LogInfo($"[VoxCaves] bake: {n}/{toCarve.Count} zones — {eta:F0}s remaining");
+                            Log.LogInfo($"[ProceduralTerrain] bake: {n}/{toCarve.Count} zones — {eta:F0}s remaining");
                         }
                     });
             }
@@ -2253,7 +2253,7 @@ namespace VoxCaves
                 int nsz = (ebw + _bakeStep - 1) / _bakeStep;
                 if (raw.Length != nsx * nsy * nsz)
                 {
-                    Log.LogInfo($"[VoxCaves] bake: dropping zone {kv.Key} — raw size {raw.Length} != expected {nsx*nsy*nsz} (stale step?)");
+                    Log.LogInfo($"[ProceduralTerrain] bake: dropping zone {kv.Key} — raw size {raw.Length} != expected {nsx*nsy*nsz} (stale step?)");
                     continue;
                 }
                 validEntries.Add((kv.Key, kv.Value));
@@ -2276,7 +2276,7 @@ namespace VoxCaves
             _bakeData = toWrite;
             _bakeFileStep = _bakeStep;
             _bakePending.Clear();
-            Log.LogInfo($"[VoxCaves] Bake written: {validEntries.Count} zones (dropped {toWrite.Count - validEntries.Count} stale), radius={radius:F0}m, step={_bakeStep} → {path}");
+            Log.LogInfo($"[ProceduralTerrain] Bake written: {validEntries.Count} zones (dropped {toWrite.Count - validEntries.Count} stale), radius={radius:F0}m, step={_bakeStep} → {path}");
         }
 
         // ── Hot-reload: re-run the full voxel pipeline on every loaded zone ───────
@@ -2317,7 +2317,7 @@ namespace VoxCaves
 
         static void RecarveAll()
         {
-            Log.LogInfo($"[VoxCaves] Hot-reload: re-voxelizing {_zoneParams.Count} zone(s).");
+            Log.LogInfo($"[ProceduralTerrain] Hot-reload: re-voxelizing {_zoneParams.Count} zone(s).");
             // Clear all config-derived and geometry-derived caches so the re-voxelization
             // starts from a clean slate. _zoneParams and _zoneObjects are kept because
             // they are the iteration target — the zone objects and geometry metadata
@@ -2331,7 +2331,7 @@ namespace VoxCaves
             if (_voxelizeColumnsMethod == null) return;
             bool canRemesh = _enqueueMeshMethod != null && _finishSkinNowMethod != null && _int3Ctor != null;
             if (!canRemesh)
-                Log.LogWarning("[VoxCaves] EnqueueMesh/FinishSkinNow unavailable — mesh rebuild skipped.");
+                Log.LogWarning("[ProceduralTerrain] EnqueueMesh/FinishSkinNow unavailable — mesh rebuild skipped.");
 
             var snapshot = new List<(string key, (object field, object grid, int ox, int oz, int w, int yLo, int yHi) zp)>(_zoneParams.Count);
             foreach (var kv in _zoneParams) snapshot.Add((kv.Key, kv.Value));
@@ -2382,7 +2382,7 @@ namespace VoxCaves
                     _voxelizeColumnsMethod.Invoke(null, new object[]
                         { zp.field, zp.grid, zp.ox, zp.oz, 0, zp.w - 1, 0, zp.w - 1, extLo, extHi });
                 }
-                catch (Exception e) { Log.LogWarning($"[VoxCaves] Revoxelize {key}: {e.Message}"); }
+                catch (Exception e) { Log.LogWarning($"[ProceduralTerrain] Revoxelize {key}: {e.Message}"); }
             }
 
             // ── Between passes: extend _yScanHi for zones where Mode C raised terrain ──
@@ -2425,12 +2425,12 @@ namespace VoxCaves
                         _enqueueMeshMethod!.Invoke(zoneObj, new[] { i3 });
                         queued++;
                     }
-                    catch (Exception e) { Log.LogWarning($"[VoxCaves] EnqueueMesh {key}: {e.Message}"); break; }
+                    catch (Exception e) { Log.LogWarning($"[ProceduralTerrain] EnqueueMesh {key}: {e.Message}"); break; }
                 }
-                Log.LogDebug($"[VoxCaves] Queued {queued} bricks for zone {key}.");
+                Log.LogDebug($"[ProceduralTerrain] Queued {queued} bricks for zone {key}.");
 
                 try { _finishSkinNowMethod!.Invoke(zoneObj, null); }
-                catch (Exception e) { Log.LogWarning($"[VoxCaves] FinishSkinNow {key}: {e.Message}"); }
+                catch (Exception e) { Log.LogWarning($"[ProceduralTerrain] FinishSkinNow {key}: {e.Message}"); }
             }
         }
 
@@ -2688,7 +2688,7 @@ namespace VoxCaves
             {
                 if (computed >= FixpointMaxZones)
                 {
-                    Log.LogWarning($"[VoxCaves] EnsureFixpoint ({ox},{oz}): hit cap ({FixpointMaxZones}), {worklist.Count} zones skipped");
+                    Log.LogWarning($"[ProceduralTerrain] EnsureFixpoint ({ox},{oz}): hit cap ({FixpointMaxZones}), {worklist.Count} zones skipped");
                     break;
                 }
 
@@ -2716,7 +2716,7 @@ namespace VoxCaves
 
             _lastFixpointHops = computed;
             if (computed > 0)
-                Log.LogInfo($"[VoxCaves] EnsureFixpoint ({ox},{oz}): {computed} neighbor zone(s) computed");
+                Log.LogInfo($"[ProceduralTerrain] EnsureFixpoint ({ox},{oz}): {computed} neighbor zone(s) computed");
         }
 
         // ── Cross-zone face cache precompute ──────────────────────────────────────
@@ -3344,7 +3344,7 @@ namespace VoxCaves
                     worldX, worldZ, bakeC, bakeA);
                 _yloopTicks += System.Diagnostics.Stopwatch.GetTimestamp() - _tb;
             }
-            Log.LogInfo($"[VoxCaves] Ph1 breakdown: setup={_setupTicks*1000/_freq}ms yloop={_yloopTicks*1000/_freq}ms");
+            Log.LogInfo($"[ProceduralTerrain] Ph1 breakdown: setup={_setupTicks*1000/_freq}ms yloop={_yloopTicks*1000/_freq}ms");
         }
     }
 
@@ -3358,7 +3358,7 @@ namespace VoxCaves
             var t = Plugin.FindType("Voxheim.Core.HeightFieldVoxelizer", "Voxheim.Core");
             var m = t?.GetMethod("VoxelizeColumns", BindingFlags.Public | BindingFlags.Static);
             Plugin._voxelizeColumnsMethod = m;
-            if (m == null) Plugin.Log.LogError("[VoxCaves] VoxelizeColumns not found.");
+            if (m == null) Plugin.Log.LogError("[ProceduralTerrain] VoxelizeColumns not found.");
             return m;
         }
 
@@ -3380,9 +3380,9 @@ namespace VoxCaves
             if (gx0 != 0 || gz0 != 0) return;
             long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
             try { Plugin.Carve(field, grid, originX, originZ, gx1 + 1, yLo, yHi); }
-            catch (Exception e) { Plugin.Log.LogError($"[VoxCaves] Carve: {e.Message}"); }
+            catch (Exception e) { Plugin.Log.LogError($"[ProceduralTerrain] Carve: {e.Message}"); }
             long ms = (System.Diagnostics.Stopwatch.GetTimestamp() - t0) * 1000L / System.Diagnostics.Stopwatch.Frequency;
-            Plugin.Log.LogInfo($"[VoxCaves] postfix ({originX},{originZ}) wall={ms}ms");
+            Plugin.Log.LogInfo($"[ProceduralTerrain] postfix ({originX},{originZ}) wall={ms}ms");
         }
     }
 
@@ -3440,7 +3440,7 @@ namespace VoxCaves
             Plugin._vbAnyField.SetValue(bounds, true);
 
             try { Plugin._pokeNeighborsMethod.Invoke(__instance, new object[] { bounds, true }); }
-            catch (Exception ex) { Plugin.Log.LogWarning($"[VoxCaves] PokeNeighbors threw: {ex.Message}"); }
+            catch (Exception ex) { Plugin.Log.LogWarning($"[ProceduralTerrain] PokeNeighbors threw: {ex.Message}"); }
         }
     }
 
@@ -3597,7 +3597,7 @@ namespace VoxCaves
             var t = Plugin.FindType("Voxheim.Unity.VoxelZone", "Voxheim");
             var m = t?.GetMethod("TryInstallAuthoritySnapshot",
                 BindingFlags.NonPublic | BindingFlags.Instance);
-            if (m == null) Plugin.Log.LogWarning("[VoxCaves] TryInstallAuthoritySnapshot not found — caves may disappear in player-edited zones.");
+            if (m == null) Plugin.Log.LogWarning("[ProceduralTerrain] TryInstallAuthoritySnapshot not found — caves may disappear in player-edited zones.");
             return m;
         }
         static void Postfix(object __instance, bool __result, object __0)
@@ -3614,7 +3614,7 @@ namespace VoxCaves
             var t = Plugin.FindType("Voxheim.Unity.VoxelZone", "Voxheim");
             var m = t?.GetMethod("TryInstallAuthorityDelta",
                 BindingFlags.NonPublic | BindingFlags.Instance);
-            if (m == null) Plugin.Log.LogWarning("[VoxCaves] TryInstallAuthorityDelta not found — caves may disappear after live terrain edits.");
+            if (m == null) Plugin.Log.LogWarning("[ProceduralTerrain] TryInstallAuthorityDelta not found — caves may disappear after live terrain edits.");
             return m;
         }
         static void Postfix(object __instance, bool __result, object __1)
@@ -3634,7 +3634,7 @@ namespace VoxCaves
             var zoneT     = Plugin.FindType("Voxheim.Unity.VoxelZone", "Voxheim");
             var stitchedT = zoneT?.GetNestedType("StitchedSource", BindingFlags.NonPublic);
             var m         = stitchedT?.GetMethod("FallbackDensity", BindingFlags.NonPublic | BindingFlags.Instance);
-            if (m == null) Plugin.Log.LogWarning("[VoxCaves] FallbackDensity not found — cross-zone boundary density will be vanilla.");
+            if (m == null) Plugin.Log.LogWarning("[ProceduralTerrain] FallbackDensity not found — cross-zone boundary density will be vanilla.");
             return m;
         }
 

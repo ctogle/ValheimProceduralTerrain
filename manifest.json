@@ -1,0 +1,10 @@
+{
+  "name": "ProceduralTerrain",
+  "version_number": "0.1.0",
+  "website_url": "https://github.com/ctogle/ValheimProceduralTerrain",
+  "description": "Procedural terrain system for the voxel inclined.",
+  "dependencies": [
+    "denikson-BepInExPack_Valheim-5.4.2333",
+    "Voxheim-Voxheim-0.1.3"
+  ]
+}
