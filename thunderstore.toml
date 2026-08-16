@@ -19,7 +19,7 @@ readme = "./README_thunderstore.md"
 outdir = "./dist"
 
 [[build.copy]]
-source = "./VoxCaves/bin/Release/netstandard2.1/VoxCaves.dll"
+source = "./ProceduralTerrain/bin/Release/netstandard2.1/ProceduralTerrain.dll"
 target = "plugins/ProceduralTerrain.dll"
 
 [[build.copy]]
@@ -27,8 +27,8 @@ source = "./CHANGELOG.md"
 target = "CHANGELOG.md"
 
 [[build.copy]]
-source = "./voxcaves_biomes.example.cfg"
-target = "config/voxcaves_biomes.example.cfg"
+source = "./procedural_terrain_biomes.example.cfg"
+target = "config/procedural_terrain_biomes.example.cfg"
 
 [publish]
 repository = "https://thunderstore.io"

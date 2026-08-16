@@ -10,8 +10,9 @@
   </PropertyGroup>
 
   <PropertyGroup>
-    <ValheimManaged>C:\Program Files (x86)\Steam\steamapps\common\Valheim\valheim_Data\Managed</ValheimManaged>
-    <BepInExPath>C:\Users\curti\AppData\Roaming\r2modmanPlus-local\Valheim\profiles\onepoint0\BepInEx</BepInExPath>
+    <!-- Replace these with your local paths -->
+    <ValheimManaged>C:\PATH\TO\Valheim\valheim_Data\Managed</ValheimManaged>
+    <BepInExPath>C:\PATH\TO\BepInEx</BepInExPath>
     <VoxheimPath>$(BepInExPath)\plugins\Voxheim-Voxheim</VoxheimPath>
   </PropertyGroup>
 

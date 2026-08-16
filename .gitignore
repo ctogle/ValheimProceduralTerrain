@@ -1,6 +1,24 @@
+# Build output
 **/bin/
 **/obj/
+
+# User-specific VS files
 *.user
 .vs/
+
+# Package output
+dist/
+*.zip
+
+# Machine-specific files — copy *.template, fill in your paths
+ProceduralTerrain/ProceduralTerrain.csproj
+deploy.sh
+publish.sh
+
+# Internal notes
+NOTES_*.md
 claudehowto/
 
+# OS
+Thumbs.db
+.DS_Store

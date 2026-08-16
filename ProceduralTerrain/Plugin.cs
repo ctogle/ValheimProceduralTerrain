@@ -2435,7 +2435,7 @@ namespace ProceduralTerrain
         }
 
         // ── Placement height ──────────────────────────────────────────────────────
-        // Returns the world-Y of the highest VoxCaves solid surface at (worldX, worldZ),
+        // Returns the world-Y of the highest solid surface at (worldX, worldZ),
         // or originalY if no cached surface exists or if it is lower than originalY.
         internal static float FindCarvedSurfaceY(float worldX, float originalY, float worldZ)
         {
