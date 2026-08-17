@@ -37,9 +37,9 @@ The config has three sections:
 Once your config is tuned for a playthrough, bake the terrain to disk for much faster generation during gameplay. The bake is world- and config-specific — changing either invalidates it.
 
 ```
-voxcaves_bake [radius_in_meters]   — bake terrain on the current machine (admin only on servers)
-voxcaves_clearbake                 — delete the local bake file
-voxcaves_clearbake server          — delete the bake file on the server (admin only)
+pt_bake [radius_in_meters]   — bake terrain on the current machine (admin only on servers)
+pt_clearbake                 — delete the local bake file
+pt_clearbake server          — delete the bake file on the server (admin only)
 ```
 
 **Multiplayer:** run `voxcaves_bake` once on the server (or as an admin while connected). The server bakes in the background — players can continue playing. When done, new clients connecting will automatically download the bake file with a progress indicator. Live calculation is used as fallback during download.

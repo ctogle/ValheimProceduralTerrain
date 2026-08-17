@@ -317,12 +317,12 @@ namespace ProceduralTerrain
             LoadBiomeConfig();
             WatchBiomeConfig();
             new Harmony("com.ctogle.procedural_terrain").PatchAll();
-            new Terminal.ConsoleCommand("voxcaves_dump", "dump SDF + biome blend data for the next 9 zones processed to BepInEx/config/voxcaves_dump_*.json", _ =>
+            new Terminal.ConsoleCommand("pt_dump", "pt_dump — dump SDF + biome blend data for the next 9 zones processed to BepInEx/config/voxcaves_dump_*.json", _ =>
             {
                 _dumpZonesRemaining = 9;
                 Log.LogInfo("[ProceduralTerrain] Will dump next 9 zones to voxcaves_dump_*.json");
             });
-            new Terminal.ConsoleCommand("voxcaves_probe", "voxcaves_probe [x z] — print biome blend breakdown + profile params at world pos (default: player pos)", args =>
+            new Terminal.ConsoleCommand("pt_probe", "pt_probe [x z] — print biome blend breakdown + profile params at world pos (default: player pos)", args =>
             {
                 try
                 {
@@ -344,7 +344,7 @@ namespace ProceduralTerrain
                 }
                 catch (Exception e) { Log.LogError($"[ProceduralTerrain] probe exception: {e}"); }
             });
-            new Terminal.ConsoleCommand("voxcaves_bake", "voxcaves_bake [radius] — bake SDF on server (admin only)", args =>
+            new Terminal.ConsoleCommand("pt_bake", "pt_bake [radius] — bake terrain SDF for a radius in meters; runs on server (admin only)", args =>
             {
                 float radius = _bakeRadius;
                 if (args.Length >= 2 && float.TryParse(args[1], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float r))
@@ -362,7 +362,7 @@ namespace ProceduralTerrain
                     WriteBakeFile(radius);
                 }
             });
-            new Terminal.ConsoleCommand("voxcaves_clearbake", "voxcaves_clearbake [server] — delete local bake file; add 'server' to delete from server (admin only)", args =>
+            new Terminal.ConsoleCommand("pt_clearbake", "pt_clearbake [server] — delete local bake file; add 'server' to delete from server (admin only)", args =>
             {
                 bool serverSide = args.Length >= 2 && args[1].ToLower() == "server";
                 if (serverSide)
@@ -1399,16 +1399,18 @@ namespace ProceduralTerrain
             }
             if (sender != 0L)
             {
-                var resp = new ZPackage(); resp.Write(msg);
+                var resp = new ZPackage(); resp.Write(msg); resp.Write(path);
                 ZRoutedRpc.instance.InvokeRoutedRPC(sender, "PTClearBakeResult", resp);
             }
         }
 
         internal static void RPC_ClearBakeResult(long sender, ZPackage pkg)
         {
-            string msg = pkg.ReadString();
-            Log.LogInfo($"[ProceduralTerrain] Server: {msg}");
+            string msg  = pkg.ReadString();
+            string path = pkg.ReadString();
+            Log.LogInfo($"[ProceduralTerrain] Server: {msg} {path}");
             Console.instance?.Print($"[ProceduralTerrain] Server: {msg}");
+            Console.instance?.Print(path);
         }
 
         // ── Bake execute RPC (client→server) ─────────────────────────────────────
@@ -3768,11 +3770,15 @@ namespace ProceduralTerrain
             if (Plugin._bakeDownloadActive)
             {
                 Plugin._bakeDownloadActive = false;
-                BakeProgressUI.Hide();
                 Plugin._bakeDownloadBuffer?.Dispose();
                 Plugin._bakeDownloadBuffer = null;
                 Plugin.Log.LogInfo("[ProceduralTerrain] Bake download cancelled — disconnected.");
             }
+            if (Plugin._bakeInProgress)
+            {
+                Plugin._bakeInProgress = false;
+            }
+            BakeProgressUI.HideBake();
         }
     }
 
