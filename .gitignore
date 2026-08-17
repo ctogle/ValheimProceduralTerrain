@@ -14,6 +14,7 @@ dist/
 ProceduralTerrain/ProceduralTerrain.csproj
 deploy.sh
 publish.sh
+sync_server.sh
 
 # Internal notes
 NOTES_*.md

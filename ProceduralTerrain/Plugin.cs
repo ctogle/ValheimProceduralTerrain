@@ -111,6 +111,14 @@ namespace ProceduralTerrain
         internal static int   _fixpointMaxZones     = 8;     // EnsureFixpoint hop cap
         internal static float _coastFade           = 0f;     // world units above sea level over which Ocean inflates into blend (0=off)
 
+        // ── Bake download (client receiving from server) ──────────────────────────
+        internal static bool   _bakeDownloadActive;
+        internal static int    _bakeChunksExpected;
+        internal static int    _bakeChunksReceived;
+        internal static System.IO.MemoryStream? _bakeDownloadBuffer;
+        internal static System.Diagnostics.Stopwatch? _bakeDownloadTimer;
+        const int BakeChunkSize = 256 * 1024; // 256 KB per RPC chunk
+
         // ── SDF bake ─────────────────────────────────────────────────────────────
         static float _bakeRadius = 0f;
         static int   _bakeStep   = 8;
@@ -330,12 +338,23 @@ namespace ProceduralTerrain
                 }
                 catch (Exception e) { Log.LogError($"[ProceduralTerrain] probe exception: {e}"); }
             });
-            new Terminal.ConsoleCommand("voxcaves_bake", "voxcaves_bake [radius] — write baked SDF to disk for all staged zones (optionally filtered to radius)", args =>
+            new Terminal.ConsoleCommand("voxcaves_bake", "voxcaves_bake [radius] — bake SDF on server (admin only)", args =>
             {
                 float radius = _bakeRadius;
                 if (args.Length >= 2 && float.TryParse(args[1], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float r))
                     radius = r;
-                WriteBakeFile(radius);
+                if (ZNet.instance != null && !ZNet.instance.IsServer())
+                {
+                    // Client: request server to run the bake.
+                    var pkg = new ZPackage();
+                    pkg.Write(radius);
+                    ZRoutedRpc.instance.InvokeRoutedRPC(ZRoutedRpc.Everybody, "PTBakeExecute", pkg);
+                    Log.LogInfo("[ProceduralTerrain] Bake request sent to server.");
+                }
+                else
+                {
+                    WriteBakeFile(radius);
+                }
             });
             Log.LogInfo("[ProceduralTerrain] Ready.");
         }
@@ -1247,6 +1266,192 @@ namespace ProceduralTerrain
             }
         }
 
+        // ── Dedicated server location RPC ─────────────────────────────────────────
+        internal static void SendLocationListToPeer(long peerID)
+        {
+            var zs = ZoneSystem.instance;
+            if (zs == null || _locationInstancesField == null) return;
+            var dict = _locationInstancesField.GetValue(zs);
+            if (dict == null) return;
+            var valsProp = dict.GetType().GetProperty("Values");
+            if (valsProp?.GetValue(dict) is not System.Collections.IEnumerable vals) return;
+
+            var pkg = new ZPackage();
+            var positions = new List<Vector3>();
+            FieldInfo? mPos = null;
+            foreach (var inst in vals)
+            {
+                mPos ??= inst?.GetType().GetField("m_position");
+                if (inst == null || mPos == null) continue;
+                if (mPos.GetValue(inst) is Vector3 pos)
+                    positions.Add(pos);
+            }
+            pkg.Write(positions.Count);
+            foreach (var pos in positions) pkg.Write(pos);
+            ZRoutedRpc.instance.InvokeRoutedRPC(peerID, "PTLocationList", pkg);
+            Log.LogInfo($"[ProceduralTerrain] Sent {positions.Count} location positions to peer {peerID}.");
+        }
+
+        internal static void RPC_ReceiveLocationList(long sender, ZPackage pkg)
+        {
+            int count = pkg.ReadInt();
+            _locationPositions.Clear();
+            for (int i = 0; i < count; i++)
+            {
+                Vector3 pos = pkg.ReadVector3();
+                _locationPositions.Add(new Vector2(pos.x, pos.z));
+            }
+            if (_locationPositions.Count > 0)
+            {
+                _locationsCached  = true;
+                _hotReloadPending = true;
+                Log.LogInfo($"[ProceduralTerrain] Received {_locationPositions.Count} location positions from server — scheduling recarve.");
+            }
+            // Server connection confirmed — query for bake file now that peer is established.
+            var query = new ZPackage();
+            query.Write(ComputeCfgHash());
+            ZRoutedRpc.instance.InvokeRoutedRPC(sender, "PTBakeQuery", query);
+            Log.LogInfo($"[ProceduralTerrain] Sent PTBakeQuery to server (cfgHash={ComputeCfgHash():X8}).");
+        }
+
+        // ── Bake execute RPC (client→server) ─────────────────────────────────────
+        internal static void RPC_BakeExecute(long sender, ZPackage pkg)
+        {
+            float radius = pkg.ReadSingle();
+            // Admin check: allow server itself (sender==0) or whitelisted Steam IDs.
+            bool isAdmin = sender == 0L;
+            if (!isAdmin)
+            {
+                var peer = ZNet.instance?.GetPeer(sender);
+                var userId = peer?.m_rpc?.GetSocket()?.GetHostName();
+                isAdmin = userId != null && (ZNet.instance?.GetAdminList()?.Contains(userId) ?? false);
+            }
+            if (!isAdmin)
+            {
+                Log.LogWarning($"[ProceduralTerrain] Bake request from non-admin peer {sender} rejected.");
+                return;
+            }
+            Log.LogInfo($"[ProceduralTerrain] Bake request accepted from peer {sender} — running server-side.");
+            WriteBakeFile(radius);
+        }
+
+        // ── Bake file RPC (server→client transfer) ────────────────────────────────
+        // Server: respond to a client querying whether a bake exists.
+        internal static void RPC_BakeQuery(long sender, ZPackage pkg)
+        {
+            uint clientCfgHash = pkg.ReadUInt();
+            int  seed = (int)(ZNet.instance?.GetWorldUID() ?? 0L);
+            uint myCfgHash = ComputeCfgHash();
+            string path = BakeFilePath(seed, myCfgHash);
+            var info = new ZPackage();
+            if (myCfgHash == clientCfgHash && File.Exists(path))
+            {
+                long size = new System.IO.FileInfo(path).Length;
+                info.Write(size);
+                Log.LogInfo($"[ProceduralTerrain] Bake query from {sender}: sending info (size={size}).");
+            }
+            else
+            {
+                info.Write(0L);
+                Log.LogInfo($"[ProceduralTerrain] Bake query from {sender}: no compatible bake file.");
+            }
+            ZRoutedRpc.instance.InvokeRoutedRPC(sender, "PTBakeInfo", info);
+        }
+
+        // Server: stream bake file in chunks after client requests it.
+        internal static void RPC_BakeRequest(long sender, ZPackage _pkg)
+        {
+            int  seed = (int)(ZNet.instance?.GetWorldUID() ?? 0L);
+            uint cfgHash = ComputeCfgHash();
+            string path = BakeFilePath(seed, cfgHash);
+            if (!File.Exists(path)) return;
+            byte[] data = File.ReadAllBytes(path);
+            int total = (int)Math.Ceiling((double)data.Length / BakeChunkSize);
+            Log.LogInfo($"[ProceduralTerrain] Streaming bake to {sender}: {data.Length} bytes in {total} chunks.");
+            // Yield every 4 chunks so the server main thread isn't starved.
+            ZNetScene.instance.StartCoroutine(StreamBakeCoroutine(sender, data, total));
+        }
+
+        static System.Collections.IEnumerator StreamBakeCoroutine(long sender, byte[] data, int total)
+        {
+            var peer = ZNet.instance?.GetPeer(sender);
+            for (int i = 0; i < total; i++)
+            {
+                // Wait until the peer's send queue is clear before sending the next chunk.
+                while (peer?.m_socket?.GetSendQueueSize() > 0)
+                    yield return null;
+
+                if (peer == null || !peer.m_socket.IsConnected()) yield break;
+
+                int offset = i * BakeChunkSize;
+                int len    = Math.Min(BakeChunkSize, data.Length - offset);
+                byte[] slice = new byte[len];
+                System.Array.Copy(data, offset, slice, 0, len);
+                var chunk  = new ZPackage();
+                chunk.Write(i);
+                chunk.Write(total);
+                chunk.Write(slice);
+                ZRoutedRpc.instance.InvokeRoutedRPC(sender, "PTBakeChunk", chunk);
+                yield return null;
+            }
+            var end = new ZPackage();
+            end.Write(data.Length);
+            ZRoutedRpc.instance.InvokeRoutedRPC(sender, "PTBakeEnd", end);
+        }
+
+        // Client: server confirmed a bake is available — start download.
+        internal static void RPC_BakeInfo(long sender, ZPackage pkg)
+        {
+            long size = pkg.ReadLong();
+            if (size <= 0) { Log.LogInfo("[ProceduralTerrain] Server has no bake file — using live calc."); return; }
+            Log.LogInfo($"[ProceduralTerrain] Server bake available ({size / 1024 / 1024} MB) — requesting download.");
+            _bakeDownloadBuffer  = new System.IO.MemoryStream((int)size);
+            _bakeChunksExpected  = (int)Math.Ceiling((double)size / BakeChunkSize);
+            _bakeChunksReceived  = 0;
+            _bakeDownloadActive  = true;
+            _bakeDownloadTimer   = System.Diagnostics.Stopwatch.StartNew();
+            BakeProgressUI.Show();
+            ZRoutedRpc.instance.InvokeRoutedRPC(sender, "PTBakeRequest", new ZPackage());
+        }
+
+        // Client: receive a chunk.
+        internal static void RPC_BakeChunk(long sender, ZPackage pkg)
+        {
+            if (!_bakeDownloadActive || _bakeDownloadBuffer == null) return;
+            int index  = pkg.ReadInt();
+            int total  = pkg.ReadInt();
+            byte[] buf = pkg.ReadByteArray();
+            _bakeDownloadBuffer.Write(buf, 0, buf.Length);
+            _bakeChunksReceived = index + 1;
+            _bakeChunksExpected = total;
+        }
+
+        // Client: all chunks received — write to disk and hot-reload.
+        internal static void RPC_BakeEnd(long sender, ZPackage pkg)
+        {
+            if (!_bakeDownloadActive || _bakeDownloadBuffer == null) return;
+            int expectedLen = pkg.ReadInt();
+            _bakeDownloadActive = false;
+            BakeProgressUI.Hide();
+            byte[] data = _bakeDownloadBuffer.ToArray();
+            _bakeDownloadBuffer.Dispose();
+            _bakeDownloadBuffer = null;
+            if (data.Length != expectedLen)
+            {
+                Log.LogError($"[ProceduralTerrain] Bake download corrupt: got {data.Length} bytes, expected {expectedLen}.");
+                return;
+            }
+            int  seed    = (int)(ZNet.instance?.GetWorldUID() ?? 0L);
+            uint cfgHash = ComputeCfgHash();
+            string path  = BakeFilePath(seed, cfgHash);
+            File.WriteAllBytes(path, data);
+            long ms = _bakeDownloadTimer?.ElapsedMilliseconds ?? 0;
+            Log.LogInfo($"[ProceduralTerrain] Bake downloaded in {ms / 1000.0:F1}s — written to {path}. Reloading.");
+            _bakeData = null;
+            _bakeLoadAttempted = false;
+            _hotReloadPending  = true;
+        }
+
         // ── Location cache ────────────────────────────────────────────────────────
         static void BuildLocationCache()
         {
@@ -2017,7 +2222,7 @@ namespace ProceduralTerrain
 
         // ── SDF bake helpers ─────────────────────────────────────────────────────
 
-        static uint ComputeCfgHash()
+        internal static uint ComputeCfgHash()
         {
             string path = ConfigPath;
             if (!File.Exists(path)) return 0u;
@@ -2034,7 +2239,7 @@ namespace ProceduralTerrain
         {
             var wg = WorldGenerator.instance;
             if (wg == null) { _bakeData = null; return; }
-            int seed = wg.GetSeed();
+            int seed = (int)(ZNet.instance?.GetWorldUID() ?? 0L);
             uint cfgHash = ComputeCfgHash();
             string path = BakeFilePath(seed, cfgHash);
             if (!File.Exists(path)) { _bakeData = null; return; }
@@ -2170,9 +2375,14 @@ namespace ProceduralTerrain
         {
             var wg = WorldGenerator.instance;
             if (wg == null) { Log.LogWarning("[ProceduralTerrain] bake: WorldGenerator not ready."); return; }
-            if (_scale == null) { Log.LogWarning("[ProceduralTerrain] bake: scale not resolved yet."); return; }
+            if (_scale == null || _scale.Value <= 0f)
+            {
+                float resolved = _scaleField != null ? (float)_scaleField.GetValue(null)! : 0f;
+                _scale = resolved > 0f ? resolved : 1f;
+                Log.LogInfo($"[ProceduralTerrain] bake: scale resolved to {_scale} (raw={resolved})");
+            }
             float s = _scale.Value;
-            int seed = wg.GetSeed();
+            int seed = (int)(ZNet.instance?.GetWorldUID() ?? 0L);
             uint cfgHash = ComputeCfgHash();
 
             // Enumerate every zone origin within radius and ensure it's staged.
@@ -3444,6 +3654,61 @@ namespace ProceduralTerrain
         }
     }
 
+    // On dedicated servers, m_locationInstances is server-side only. We send the full
+    // position list to each connecting client via a custom RPC so they can apply
+    // location protection and correctly gate Carve().
+    [HarmonyPatch(typeof(ZNet), "OnDestroy")]
+    static class ZNetOnDestroyPatch
+    {
+        static void Postfix()
+        {
+            if (Plugin._bakeDownloadActive)
+            {
+                Plugin._bakeDownloadActive = false;
+                BakeProgressUI.Hide();
+                Plugin._bakeDownloadBuffer?.Dispose();
+                Plugin._bakeDownloadBuffer = null;
+                Plugin.Log.LogInfo("[ProceduralTerrain] Bake download cancelled — disconnected.");
+            }
+        }
+    }
+
+    [HarmonyPatch(typeof(ZoneSystem), "Start")]
+    static class ZoneSystemStartPatch
+    {
+        static void Postfix()
+        {
+            if (ZNet.instance == null) return;
+            if (ZNet.instance.IsServer())
+            {
+                ZRoutedRpc.instance.Register<ZPackage>("PTBakeExecute", Plugin.RPC_BakeExecute);
+                ZRoutedRpc.instance.Register<ZPackage>("PTBakeQuery",   Plugin.RPC_BakeQuery);
+                ZRoutedRpc.instance.Register<ZPackage>("PTBakeRequest", Plugin.RPC_BakeRequest);
+            }
+            else
+            {
+                ZRoutedRpc.instance.Register<ZPackage>("PTLocationList", Plugin.RPC_ReceiveLocationList);
+                ZRoutedRpc.instance.Register<ZPackage>("PTBakeInfo",     Plugin.RPC_BakeInfo);
+                ZRoutedRpc.instance.Register<ZPackage>("PTBakeChunk",    Plugin.RPC_BakeChunk);
+                ZRoutedRpc.instance.Register<ZPackage>("PTBakeEnd",      Plugin.RPC_BakeEnd);
+                // PTBakeQuery is sent from RPC_ReceiveLocationList once the server connection is confirmed.
+            }
+        }
+    }
+
+    [HarmonyPatch]
+    static class ZoneSystemOnNewPeerPatch
+    {
+        static MethodBase? TargetMethod() =>
+            typeof(ZoneSystem).GetMethod("OnNewPeer", BindingFlags.NonPublic | BindingFlags.Instance);
+
+        static void Postfix(long peerID)
+        {
+            if (ZNet.instance == null || !ZNet.instance.IsServer()) return;
+            Plugin.SendLocationListToPeer(peerID);
+        }
+    }
+
     [HarmonyPatch(typeof(ZNet), nameof(ZNet.SetServer))]
     static class WorldLoadPatch
     {
@@ -3682,4 +3947,64 @@ namespace ProceduralTerrain
             pos.y = Plugin.FindCarvedSurfaceY(pos.x, vanillaY, pos.z);
         }
     }
+
+
+// ── Bake download progress UI ─────────────────────────────────────────────────
+public class BakeProgressUI : MonoBehaviour
+{
+    static BakeProgressUI? _instance;
+    static GUIStyle? _boxStyle;
+    static GUIStyle? _textStyle;
+    static bool _stylesInit;
+
+    public static void Show()
+    {
+        if (_instance != null) return;
+        var go = new GameObject("PTBakeProgressUI");
+        DontDestroyOnLoad(go);
+        _instance = go.AddComponent<BakeProgressUI>();
+    }
+
+    public static void Hide()
+    {
+        if (_instance == null) return;
+        Destroy(_instance.gameObject);
+        _instance = null;
+    }
+
+    void OnGUI()
+    {
+        if (!Plugin._bakeDownloadActive) return;
+        if (!_stylesInit)
+        {
+            _stylesInit = true;
+            _boxStyle = new GUIStyle { normal = { background = Texture2D.blackTexture } };
+            _textStyle = new GUIStyle
+            {
+                normal    = { textColor = Color.white },
+                fontSize  = 18,
+                alignment = TextAnchor.MiddleCenter
+            };
+        }
+
+        float pct    = Plugin._bakeChunksExpected > 0 ? (float)Plugin._bakeChunksReceived / Plugin._bakeChunksExpected : 0f;
+        long  elapsedS = (Plugin._bakeDownloadTimer?.ElapsedMilliseconds ?? 0) / 1000;
+        float eta    = pct > 0.01f ? elapsedS / pct * (1f - pct) : 0f;
+
+        float w = 420f, h = 70f;
+        float x = (Screen.width  - w) * 0.5f;
+        float y = 20f;
+
+        GUI.Box(new Rect(x, y, w, h), GUIContent.none, _boxStyle);
+        GUI.Label(new Rect(x, y + 8f, w, 28f),
+            $"Downloading world bake from server…  {pct * 100f:F0}%", _textStyle);
+        GUI.Label(new Rect(x, y + 36f, w, 28f),
+            eta > 0 ? $"ETA {eta:F0}s" : "Connecting…", _textStyle);
+
+        // Progress bar
+        float barX = x + 16f, barW = w - 32f, barY = y + 58f;
+        GUI.DrawTexture(new Rect(barX, barY, barW, 6f), Texture2D.blackTexture);
+        GUI.DrawTexture(new Rect(barX, barY, barW * pct, 6f), Texture2D.whiteTexture);
+    }
 }
+} // namespace ProceduralTerrain
