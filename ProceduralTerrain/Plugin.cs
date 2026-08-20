@@ -82,6 +82,36 @@ namespace ProceduralTerrain
         // Zero-alloc voxel access via compiled IL — see BuildDelegates().
         internal static Func<object, int, int, int, sbyte>?   _get;
         internal static Action<object, int, int, int, sbyte>? _set;
+        // HeightGrid delegates. Built in BuildDelegates.
+        internal static Func<object, int, int, float>?        _gridGet;
+        internal static Func<object, float>?                  _gridScale;
+
+        // Last grid passed to VoxelizeColumns Postfix — cached for pt_probe_grid.
+        internal static object? _probeGrid;
+        internal static int     _probeOriginX, _probeOriginZ, _probeWidth;
+
+        // AuthorityResolvedIn probe state
+        static readonly Dictionary<(int,int), float> _authResolvedLastLog = new();
+        static FieldInfo? _v2iX, _v2iY;
+
+        static void AuthorityResolvedInProbe(object zoneKey, bool __result)
+        {
+            if (_v2iX == null)
+            {
+                var t = zoneKey.GetType();
+                _v2iX = t.GetField("x") ?? t.GetField("X");
+                _v2iY = t.GetField("y") ?? t.GetField("Y");
+            }
+            if (_v2iX == null || _v2iY == null) return;
+            int zx = (int)_v2iX.GetValue(zoneKey)!;
+            int zy = (int)_v2iY.GetValue(zoneKey)!;
+            if (Math.Abs(zx) > 3 || Math.Abs(zy) > 3) return;
+            var k = (zx, zy);
+            float now = UnityEngine.Time.realtimeSinceStartup;
+            if (_authResolvedLastLog.TryGetValue(k, out float last) && now - last < 5f) return;
+            _authResolvedLastLog[k] = now;
+            Log.LogInfo($"[ProceduralTerrain] AuthorityResolvedIn zone({zx},{zy}) = {__result}");
+        }
 
         // World units per voxel — read lazily, Voxheim initialises it after plugin load.
         static FieldInfo? _scaleField;
@@ -100,7 +130,7 @@ namespace ProceduralTerrain
         static DateTime _configLastWrite = DateTime.MinValue;
 
         // ── Location protection ───────────────────────────────────────────────────
-        internal static readonly List<Vector2> _locationPositions = new();
+        internal static readonly List<(Vector2 pos, float extR)> _locationPositions = new();
         internal static bool _locationsCached;
         internal static bool  _protectLocations    = true;
         internal static bool  _islandRemoval       = true;
@@ -135,8 +165,7 @@ namespace ProceduralTerrain
         static int _bakeFileStep = 8;
         static bool _bakeLoadAttempted = false;
 
-        const float LocProtectR = 30f;
-        const float LocFadeR    = 40f;
+        const float LocProtectR = 10f; // minimum protection radius when exteriorRadius is unavailable
 
         // ── Zone tracking for hot-reload ──────────────────────────────────────────
         internal static readonly Dictionary<string, (object field, object grid, int ox, int oz, int w, int yLo, int yHi)>
@@ -187,8 +216,6 @@ namespace ProceduralTerrain
         internal static ConstructorInfo? _solidFloorCtor;      // SolidFloorRule(int y,x0,x1,z0,z1)
         // Compiled delegate: _bricks[Int3(bx,by,bz)] = brick
         internal static Action<object, int, int, int, object>? _addBrick;
-        // Set when prefix skips VoxelizeColumns so Phase 3 knows to set the floor rule
-        internal static bool _voxelizeColumnsSkipped;
 
         // VoxelBounds fields — used to construct the changed-bounds arg for PokeNeighbors
         internal static Type?       _voxelBoundsType;
@@ -316,7 +343,21 @@ namespace ProceduralTerrain
             }
             LoadBiomeConfig();
             WatchBiomeConfig();
-            new Harmony("com.ctogle.procedural_terrain").PatchAll();
+            var harmony = new Harmony("com.ctogle.procedural_terrain");
+            harmony.PatchAll();
+
+            // Manual patch: AuthorityResolvedIn — skipped gracefully if not found.
+            var vzt = FindType("Voxheim.Unity.VoxelZone", "Voxheim");
+            var arm = vzt?.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static)
+                          .FirstOrDefault(m => m.Name == "AuthorityResolvedIn");
+            if (arm != null)
+            {
+                var postfix = new HarmonyMethod(typeof(Plugin).GetMethod(
+                    nameof(AuthorityResolvedInProbe), BindingFlags.NonPublic | BindingFlags.Static));
+                harmony.Patch(arm, postfix: postfix);
+                Log.LogInfo("[ProceduralTerrain] AuthorityResolvedIn probe active.");
+            }
+            else { Log.LogWarning("[ProceduralTerrain] AuthorityResolvedIn not found — probe skipped."); }
             new Terminal.ConsoleCommand("pt_dump", "pt_dump — dump SDF + biome blend data for the next 9 zones processed to BepInEx/config/voxcaves_dump_*.json", _ =>
             {
                 _dumpZonesRemaining = 9;
@@ -344,6 +385,80 @@ namespace ProceduralTerrain
                 }
                 catch (Exception e) { Log.LogError($"[ProceduralTerrain] probe exception: {e}"); }
             });
+            new Terminal.ConsoleCommand("pt_fix_carriers",
+                "pt_fix_carriers [zx zy] — destroy duplicate Voxheim authority carriers in a zone (default: zone under player). Fixes 'zone contains N authority carriers'.",
+                args =>
+            {
+                try
+                {
+                    if (!ZNet.instance.IsServer()) { Log.LogWarning("[ProceduralTerrain] pt_fix_carriers: must run on server or singleplayer."); return; }
+                    Vector2Int zone;
+                    if (args.Length >= 3 && int.TryParse(args[1], out int ax) && int.TryParse(args[2], out int ay))
+                        zone = new Vector2Int(ax, ay);
+                    else
+                    {
+                        var player = Player.m_localPlayer;
+                        if (player == null) { Log.LogWarning("[ProceduralTerrain] pt_fix_carriers: no player; pass zx zy args."); return; }
+                        var zk = ZoneSystem.GetZone(player.transform.position);
+                        zone = new Vector2Int(zk.x, zk.y);
+                    }
+                    int voxelDataHash = "voxelterrain_field".GetStableHashCode();
+                    var zdos = new List<ZDO>();
+                    ZDOMan.instance.FindSectorObjects(new Vector2i(zone.x, zone.y), 0, 0, zdos, null);
+                    var carriers = zdos.Where(z => z != null && z.IsValid() && z.GetByteArray(voxelDataHash, null) != null).ToList();
+                    Log.LogInfo($"[ProceduralTerrain] pt_fix_carriers: zone({zone.x},{zone.y}) found {carriers.Count} carrier(s).");
+                    if (carriers.Count <= 1) { Log.LogInfo("[ProceduralTerrain] pt_fix_carriers: nothing to fix."); return; }
+                    // Keep the carrier with the most data (largest byte array), destroy the rest.
+                    var keeper = carriers.OrderByDescending(z => z.GetByteArray(voxelDataHash, null)?.Length ?? 0).First();
+                    int destroyed = 0;
+                    foreach (var z in carriers)
+                    {
+                        if (z.m_uid == keeper.m_uid) continue;
+                        ZDOMan.instance.DestroyZDO(z);
+                        destroyed++;
+                    }
+                    Log.LogInfo($"[ProceduralTerrain] pt_fix_carriers: destroyed {destroyed} duplicate(s), kept {keeper.m_uid}. Restart server to re-initialize authority.");
+                }
+                catch (Exception e) { Log.LogError($"[ProceduralTerrain] pt_fix_carriers: {e}"); }
+            });
+            new Terminal.ConsoleCommand("pt_probe_grid",
+                "pt_probe_grid — compare effectiveH (grid) vs rawH (wg.GetHeight) for the last loaded zone",
+                _ =>
+            {
+                try
+                {
+                    var grid = _probeGrid;
+                    if (grid == null)   { Log.LogWarning("[ProceduralTerrain] pt_probe_grid: no zone loaded yet."); return; }
+                    if (_gridGet == null) { Log.LogWarning("[ProceduralTerrain] pt_probe_grid: HeightGrid delegate not built."); return; }
+                    var wg = WorldGenerator.instance;
+                    if (wg == null)     { Log.LogWarning("[ProceduralTerrain] pt_probe_grid: WorldGenerator not ready."); return; }
+                    float s = _scale is { } sv && sv > 0f ? sv : 1f;
+                    int ox = _probeOriginX, oz = _probeOriginZ, w = _probeWidth;
+                    Log.LogInfo($"[ProceduralTerrain] probe_grid zone origin=({ox},{oz}) width={w} scale={s}");
+
+                    float maxDiff = 0f, minDiff = float.MaxValue, sumDiff = 0f;
+                    int nonzero = 0;
+                    var sb = new System.Text.StringBuilder();
+                    sb.AppendLine($"[ProceduralTerrain] probe_grid ci,ri | effH | rawH | diff");
+                    for (int ci = 0; ci < w; ci++)
+                    for (int ri = 0; ri < w; ri++)
+                    {
+                        float effH = _gridGet(grid, ci, ri) * s;  // voxel units → world
+                        float rawH = wg.GetHeight((ox + ci) * s, (oz + ri) * s);
+                        float diff = effH - rawH;
+                        if (Math.Abs(diff) > 0.01f) nonzero++;
+                        if (Math.Abs(diff) > Math.Abs(maxDiff)) maxDiff = diff;
+                        if (Math.Abs(diff) < Math.Abs(minDiff)) minDiff = diff;
+                        sumDiff += diff;
+                        // Only log cells with non-trivial difference to keep log readable
+                        if (Math.Abs(diff) > 0.5f)
+                            sb.AppendLine($"  [{ci},{ri}] eff={effH:F2} raw={rawH:F2} Δ={diff:+0.00;-0.00}");
+                    }
+                    Log.LogInfo(sb.ToString());
+                    Log.LogInfo($"[ProceduralTerrain] probe_grid summary: nonzero={nonzero}/{w*w} maxDiff={maxDiff:F3} avgDiff={sumDiff/(w*w):F3}");
+                }
+                catch (Exception e) { Log.LogError($"[ProceduralTerrain] pt_probe_grid: {e}"); }
+            });
             new Terminal.ConsoleCommand("pt_bake", "pt_bake [radius] — bake terrain SDF for a radius in meters; runs on server (admin only)", args =>
             {
                 float radius = _bakeRadius;
@@ -362,36 +477,88 @@ namespace ProceduralTerrain
                     WriteBakeFile(radius);
                 }
             });
-            new Terminal.ConsoleCommand("pt_clearbake", "pt_clearbake [server] — delete local bake file; add 'server' to delete from server (admin only)", args =>
-            {
-                bool serverSide = args.Length >= 2 && args[1].ToLower() == "server";
-                if (serverSide)
+            new Terminal.ConsoleCommand("pt_clearbake",
+                "pt_clearbake [filename|server] — delete a local bake file (default: current world); 'server' deletes from server (admin only)",
+                args =>
                 {
-                    if (ZNet.instance != null && !ZNet.instance.IsServer())
+                    string arg = args.Length >= 2 ? args[1].ToLower() : "";
+                    if (arg == "server")
                     {
-                        ZRoutedRpc.instance.InvokeRoutedRPC(ZRoutedRpc.Everybody, "PTClearBake", new ZPackage());
-                        Log.LogInfo("[ProceduralTerrain] Clear bake request sent to server.");
+                        if (ZNet.instance != null && !ZNet.instance.IsServer())
+                        {
+                            ZRoutedRpc.instance.InvokeRoutedRPC(ZRoutedRpc.Everybody, "PTClearBake", new ZPackage());
+                            Log.LogInfo("[ProceduralTerrain] Clear bake request sent to server.");
+                        }
+                        else
+                        {
+                            RPC_ClearBake(0L, new ZPackage());
+                        }
+                        return;
+                    }
+                    string path;
+                    if (arg.Length > 0)
+                    {
+                        // Specific filename given (with or without directory).
+                        path = System.IO.Path.IsPathRooted(arg)
+                            ? arg
+                            : System.IO.Path.Combine(Paths.ConfigPath, arg);
                     }
                     else
                     {
-                        RPC_ClearBake(0L, new ZPackage());
+                        int  seed    = (int)(ZNet.instance?.GetWorldUID() ?? 0L);
+                        uint cfgHash = ComputeCfgHash();
+                        path = BakeFilePath(seed, cfgHash);
                     }
+                    if (File.Exists(path))
+                    {
+                        File.Delete(path);
+                        // Reset in-memory cache if we just deleted the active file.
+                        if (System.IO.Path.GetFullPath(path) == System.IO.Path.GetFullPath(BakeFilePath((int)(ZNet.instance?.GetWorldUID() ?? 0L), ComputeCfgHash())))
+                            { _bakeData = null; _bakeLoadAttempted = false; }
+                        Console.instance?.Print($"[ProceduralTerrain] Deleted: {System.IO.Path.GetFileName(path)}");
+                        Log.LogInfo($"[ProceduralTerrain] Deleted local bake file: {path}");
+                    }
+                    else
+                    {
+                        Console.instance?.Print($"[ProceduralTerrain] File not found: {path}");
+                    }
+                },
+                optionsFetcher: () =>
+                {
+                    var opts = new List<string> { "server" };
+                    opts.AddRange(System.IO.Directory.GetFiles(Paths.ConfigPath, "procedural_terrain_bake_*.bin")
+                        .Select(System.IO.Path.GetFileName));
+                    return opts;
+                });
+            new Terminal.ConsoleCommand("pt_listbakes", "pt_listbakes [server] — list local bake files with sizes; 'server' queries server list (admin only)", args =>
+            {
+                if (args.Length > 1 && args[1].Equals("server", System.StringComparison.OrdinalIgnoreCase))
+                {
+                    if (ZNet.instance == null || ZNet.instance.IsServer())
+                    {
+                        // Running locally — just scan directly
+                        RPC_ListBakes(0L, new ZPackage());
+                        return;
+                    }
+                    ZRoutedRpc.instance.InvokeRoutedRPC(ZRoutedRpc.Everybody, "PTListBakes", new ZPackage());
+                    Console.instance?.Print("[ProceduralTerrain] Querying server bake files…");
                     return;
                 }
-                int  seed    = (int)(ZNet.instance?.GetWorldUID() ?? 0L);
-                uint cfgHash = ComputeCfgHash();
-                string path  = BakeFilePath(seed, cfgHash);
-                if (File.Exists(path))
+                string dir = Paths.ConfigPath;
+                var files  = System.IO.Directory.GetFiles(dir, "procedural_terrain_bake_*.bin");
+                if (files.Length == 0)
                 {
-                    File.Delete(path);
-                    _bakeData = null; _bakeLoadAttempted = false;
-                    Log.LogInfo($"[ProceduralTerrain] Deleted local bake file: {path}");
+                    Console.instance?.Print("[ProceduralTerrain] No local bake files found.");
+                    return;
                 }
-                else
+                Console.instance?.Print($"[ProceduralTerrain] {files.Length} bake file(s) in {dir}:");
+                foreach (var f in files)
                 {
-                    Log.LogInfo($"[ProceduralTerrain] No local bake file found at: {path}");
+                    long mb = new System.IO.FileInfo(f).Length / (1024 * 1024);
+                    Console.instance?.Print($"  {System.IO.Path.GetFileName(f)}  ({mb} MB)");
                 }
-            });
+            },
+            optionsFetcher: () => new List<string> { "server" });
             Log.LogInfo("[ProceduralTerrain] Ready.");
         }
 
@@ -624,6 +791,38 @@ namespace ProceduralTerrain
             _set = (Action<object,int,int,int,sbyte>)sDm.CreateDelegate(
                 typeof(Action<object,int,int,int,sbyte>));
 
+            // HeightGrid delegates — Scale property and [x,z] indexer
+            var gridT      = FindType("Voxheim.Core.HeightGrid", "Voxheim.Core");
+            var gridGet    = gridT?.GetMethod("get_Item",
+                BindingFlags.Public | BindingFlags.Instance,
+                null, new[] { typeof(int), typeof(int) }, null);
+            var gridScaleP = gridT?.GetProperty("Scale", BindingFlags.Public | BindingFlags.Instance);
+            if (gridT != null && gridGet != null)
+            {
+                var gdm = new DynamicMethod("HG_Get", typeof(float),
+                    new[] { typeof(object), typeof(int), typeof(int) },
+                    typeof(Plugin).Module, skipVisibility: true);
+                var ggi = gdm.GetILGenerator();
+                ggi.Emit(OpCodes.Ldarg_0); ggi.Emit(OpCodes.Castclass, gridT);
+                ggi.Emit(OpCodes.Ldarg_1); ggi.Emit(OpCodes.Ldarg_2);
+                ggi.Emit(OpCodes.Callvirt, gridGet);
+                ggi.Emit(OpCodes.Ret);
+                _gridGet = (Func<object,int,int,float>)gdm.CreateDelegate(typeof(Func<object,int,int,float>));
+            }
+            else { Log.LogWarning("[ProceduralTerrain] HeightGrid.get_Item not found — pt_probe_grid unavailable."); }
+            if (gridT != null && gridScaleP?.GetMethod != null)
+            {
+                var sdm = new DynamicMethod("HG_Scale", typeof(float),
+                    new[] { typeof(object) }, typeof(Plugin).Module, skipVisibility: true);
+                var sgi = sdm.GetILGenerator();
+                sgi.Emit(OpCodes.Ldarg_0); sgi.Emit(OpCodes.Castclass, gridT);
+                sgi.Emit(OpCodes.Callvirt, gridScaleP.GetMethod);
+                sgi.Emit(OpCodes.Ret);
+                _gridScale = (Func<object,float>)sdm.CreateDelegate(typeof(Func<object,float>));
+                Log.LogInfo("[ProceduralTerrain] HeightGrid.Scale delegate ready — scale read from grid, no s_scale dependency.");
+            }
+            else { Log.LogWarning("[ProceduralTerrain] HeightGrid.Scale not found — falling back to s_scale."); }
+
             return true;
         }
 
@@ -700,20 +899,34 @@ namespace ProceduralTerrain
             return p;
         }
 
+        // When connected to a server, holds the server's cfg lines (applied in-memory; local file untouched).
+        internal static string[]? _serverCfgLines;
+        // When connected to a server, holds the server's cfg hash (used for bake file lookup).
+        internal static uint? _serverCfgHash;
+
         internal static void LoadBiomeConfig()
         {
-            string path = ConfigPath;
-            if (!File.Exists(path))
+            string[] lines;
+            if (_serverCfgLines != null)
             {
-                WriteDefaultBiomeConfig(path);
-                _biomeProfiles = BuildDefaultProfiles();
-                return;
+                lines = _serverCfgLines;
+            }
+            else
+            {
+                string path = ConfigPath;
+                if (!File.Exists(path))
+                {
+                    WriteDefaultBiomeConfig(path);
+                    _biomeProfiles = BuildDefaultProfiles();
+                    return;
+                }
+                lines = File.ReadAllLines(path);
             }
 
             // Collect all sections into raw key-value lists for two-pass resolution.
             var sections = new List<(string name, List<(string key, string val)> kvs)>();
             List<(string, string)>? cur = null;
-            foreach (string raw in File.ReadAllLines(path))
+            foreach (string raw in lines)
             {
                 string line = raw.Trim();
                 if (line.Length == 0 || line[0] == '#') continue;
@@ -1302,6 +1515,30 @@ namespace ProceduralTerrain
             }
         }
 
+        // ── Server cfg sync RPC ───────────────────────────────────────────────────
+        internal static void SendCfgSyncToPeer(long peerID)
+        {
+            string path = ConfigPath;
+            string cfgText = File.Exists(path) ? File.ReadAllText(path) : "";
+            uint hash = ComputeCfgHash();
+            var pkg = new ZPackage();
+            pkg.Write(cfgText);
+            pkg.Write(hash);
+            ZRoutedRpc.instance.InvokeRoutedRPC(peerID, "PTCfgSync", pkg);
+            Log.LogInfo($"[ProceduralTerrain] Sent cfg to peer {peerID} (hash={hash:X8}, {cfgText.Length} chars).");
+        }
+
+        internal static void RPC_ReceiveCfgSync(long sender, ZPackage pkg)
+        {
+            string cfgText = pkg.ReadString();
+            uint hash      = pkg.ReadUInt();
+            _serverCfgLines = cfgText.Split('\n');
+            _serverCfgHash  = hash;
+            LoadBiomeConfig();
+            _hotReloadPending = true;
+            Log.LogInfo($"[ProceduralTerrain] Applied server cfg (hash={hash:X8}) — scheduling recarve.");
+        }
+
         // ── Dedicated server location RPC ─────────────────────────────────────────
         internal static void SendLocationListToPeer(long peerID)
         {
@@ -1312,20 +1549,24 @@ namespace ProceduralTerrain
             var valsProp = dict.GetType().GetProperty("Values");
             if (valsProp?.GetValue(dict) is not System.Collections.IEnumerable vals) return;
 
-            var pkg = new ZPackage();
-            var positions = new List<Vector3>();
-            FieldInfo? mPos = null;
+            var entries = new List<(Vector3 pos, float extR)>();
+            FieldInfo? mPos = null; FieldInfo? mLoc = null;
             foreach (var inst in vals)
             {
-                mPos ??= inst?.GetType().GetField("m_position");
-                if (inst == null || mPos == null) continue;
-                if (mPos.GetValue(inst) is Vector3 pos)
-                    positions.Add(pos);
+                if (inst == null) continue;
+                mPos ??= inst.GetType().GetField("m_position");
+                mLoc ??= inst.GetType().GetField("m_location");
+                if (mPos?.GetValue(inst) is not Vector3 pos) continue;
+                float extR = 0f;
+                if (mLoc?.GetValue(inst) is ZoneSystem.ZoneLocation zloc)
+                    extR = zloc.m_exteriorRadius;
+                entries.Add((pos, extR));
             }
-            pkg.Write(positions.Count);
-            foreach (var pos in positions) pkg.Write(pos);
+            var pkg = new ZPackage();
+            pkg.Write(entries.Count);
+            foreach (var (pos, extR) in entries) { pkg.Write(pos); pkg.Write(extR); }
             ZRoutedRpc.instance.InvokeRoutedRPC(peerID, "PTLocationList", pkg);
-            Log.LogInfo($"[ProceduralTerrain] Sent {positions.Count} location positions to peer {peerID}.");
+            Log.LogInfo($"[ProceduralTerrain] Sent {entries.Count} location positions to peer {peerID}.");
         }
 
         internal static void RPC_ReceiveLocationList(long sender, ZPackage pkg)
@@ -1335,7 +1576,8 @@ namespace ProceduralTerrain
             for (int i = 0; i < count; i++)
             {
                 Vector3 pos = pkg.ReadVector3();
-                _locationPositions.Add(new Vector2(pos.x, pos.z));
+                float extR  = pkg.ReadSingle();
+                _locationPositions.Add((new Vector2(pos.x, pos.z), extR));
             }
             if (_locationPositions.Count > 0)
             {
@@ -1381,15 +1623,15 @@ namespace ProceduralTerrain
                 isAdmin = userId != null && (ZNet.instance?.GetAdminList()?.Contains(userId) ?? false);
             }
             if (!isAdmin) { Log.LogWarning($"[ProceduralTerrain] ClearBake from non-admin peer {sender} rejected."); return; }
-            int  seed    = (int)(ZNet.instance?.GetWorldUID() ?? 0L);
-            uint cfgHash = ComputeCfgHash();
-            string path  = BakeFilePath(seed, cfgHash);
+            int seed = (int)(ZNet.instance?.GetWorldUID() ?? 0L);
+            string pattern = $"procedural_terrain_bake_{seed:X8}_*.bin";
+            var matches = System.IO.Directory.GetFiles(BepInEx.Paths.ConfigPath, pattern);
             string msg;
-            if (File.Exists(path))
+            if (matches.Length > 0)
             {
-                File.Delete(path);
+                foreach (var f in matches) File.Delete(f);
                 _bakeData = null; _bakeLoadAttempted = false;
-                msg = "Server bake file deleted.";
+                msg = $"Deleted {matches.Length} server bake file(s).";
                 Log.LogInfo($"[ProceduralTerrain] {msg}");
             }
             else
@@ -1399,18 +1641,66 @@ namespace ProceduralTerrain
             }
             if (sender != 0L)
             {
-                var resp = new ZPackage(); resp.Write(msg); resp.Write(path);
+                var resp = new ZPackage(); resp.Write(msg);
                 ZRoutedRpc.instance.InvokeRoutedRPC(sender, "PTClearBakeResult", resp);
             }
         }
 
         internal static void RPC_ClearBakeResult(long sender, ZPackage pkg)
         {
-            string msg  = pkg.ReadString();
-            string path = pkg.ReadString();
-            Log.LogInfo($"[ProceduralTerrain] Server: {msg} {path}");
+            string msg = pkg.ReadString();
+            Log.LogInfo($"[ProceduralTerrain] Server: {msg}");
             Console.instance?.Print($"[ProceduralTerrain] Server: {msg}");
-            Console.instance?.Print(path);
+        }
+
+        // ── List bakes RPC (client→server, admin-only) ───────────────────────────
+        internal static void RPC_ListBakes(long sender, ZPackage _pkg)
+        {
+            bool isAdmin = sender == 0L;
+            if (!isAdmin)
+            {
+                var peer   = ZNet.instance?.GetPeer(sender);
+                var userId = peer?.m_rpc?.GetSocket()?.GetHostName();
+                isAdmin = userId != null && (ZNet.instance?.GetAdminList()?.Contains(userId) ?? false);
+            }
+            if (!isAdmin) { Log.LogWarning($"[ProceduralTerrain] ListBakes from non-admin peer {sender} rejected."); return; }
+
+            string dir   = Paths.ConfigPath;
+            var    files = System.IO.Directory.GetFiles(dir, "procedural_terrain_bake_*.bin");
+            var    resp  = new ZPackage();
+            resp.Write(files.Length);
+            foreach (var f in files)
+            {
+                resp.Write(System.IO.Path.GetFileName(f));
+                resp.Write(new System.IO.FileInfo(f).Length);
+            }
+
+            if (sender == 0L)
+            {
+                RPC_ListBakesResult(0L, resp);
+            }
+            else
+            {
+                ZRoutedRpc.instance.InvokeRoutedRPC(sender, "PTListBakesResult", resp);
+            }
+        }
+
+        internal static void RPC_ListBakesResult(long sender, ZPackage pkg)
+        {
+            int count = pkg.ReadInt();
+            if (count == 0)
+            {
+                Console.instance?.Print("[ProceduralTerrain] Server: No bake files found.");
+                return;
+            }
+            Console.instance?.Print($"[ProceduralTerrain] Server: {count} bake file(s):");
+            for (int i = 0; i < count; i++)
+            {
+                string name = pkg.ReadString();
+                long   size = pkg.ReadLong();
+                long   mb   = size / (1024 * 1024);
+                Console.instance?.Print($"  {name}  ({mb} MB)");
+            }
         }
 
         // ── Bake execute RPC (client→server) ─────────────────────────────────────
@@ -1565,17 +1855,18 @@ namespace ProceduralTerrain
             if (dict == null) return;
             var valsProp = dict.GetType().GetProperty("Values");
             if (valsProp?.GetValue(dict) is not System.Collections.IEnumerable vals) return;
-            FieldInfo? mPos = null;
+            FieldInfo? mPos = null; FieldInfo? mLoc = null;
             foreach (var inst in vals)
             {
-                mPos ??= inst?.GetType().GetField("m_position");
-                if (inst == null || mPos == null) continue;
-                if (mPos.GetValue(inst) is Vector3 pos)
-                    _locationPositions.Add(new Vector2(pos.x, pos.z));
+                if (inst == null) continue;
+                mPos ??= inst.GetType().GetField("m_position");
+                mLoc ??= inst.GetType().GetField("m_location");
+                if (mPos?.GetValue(inst) is not Vector3 pos) continue;
+                float extR = 0f;
+                if (mLoc?.GetValue(inst) is ZoneSystem.ZoneLocation zloc)
+                    extR = zloc.m_exteriorRadius;
+                _locationPositions.Add((new Vector2(pos.x, pos.z), extR));
             }
-            // Don't mark cached until we actually find locations — they may not be placed yet on first zone load.
-            // When we first get locations, trigger a full recarve so any zones already written without
-            // location data (e.g. spawn zone) get their protection radius applied retroactively.
             if (_locationPositions.Count > 0)
             {
                 _locationsCached  = true;
@@ -1584,18 +1875,22 @@ namespace ProceduralTerrain
             }
         }
 
-        static float LocationFactor(float worldX, float worldZ, List<Vector2> nearbyLocs)
+        const float LocFadeR = 10f; // fade band outside the exterior radius
+
+        static float LocationFactor(float worldX, float worldZ, List<(Vector2 pos, float extR)> nearbyLocs)
         {
             if (!_protectLocations || nearbyLocs.Count == 0) return 1f;
-            float minDist = float.MaxValue;
+            float minFactor = 1f;
             for (int i = 0; i < nearbyLocs.Count; i++)
             {
-                float dx = worldX - nearbyLocs[i].x;
-                float dz = worldZ - nearbyLocs[i].y;
-                float d  = Mathf.Sqrt(dx * dx + dz * dz);
-                if (d < minDist) minDist = d;
+                float dx   = worldX - nearbyLocs[i].pos.x;
+                float dz   = worldZ - nearbyLocs[i].pos.y;
+                float d    = Mathf.Sqrt(dx * dx + dz * dz);
+                float extR = Mathf.Max(nearbyLocs[i].extR, LocProtectR);
+                float f    = Mathf.Clamp01((d - extR) / LocFadeR);
+                if (f < minFactor) minFactor = f;
             }
-            return Mathf.Clamp01((minDist - LocProtectR) / LocFadeR);
+            return minFactor;
         }
 
         // ── Carve pass ────────────────────────────────────────────────────────────
@@ -1611,14 +1906,62 @@ namespace ProceduralTerrain
         // Combination order: base → max(B) → min(C) → max(A).
         // Mode A (tunnels) runs last so it punches through Mode C solid.
         // field==null means bake-only: run Phase 1+2, stage result, skip Phase 3 voxel writes.
-        internal static void Carve(object? field, object? grid, int ox, int oz, int width, int yLo, int yHi)
+        // Re-applies PT delta for a single XZ column during Rebase (effectiveH changed for that column).
+        // ci/ri are local zone indices (0..width-1), matching _sdfCache layout.
+        internal static void CarveColumn(object field, int originX, int originZ,
+                                         int ci, int ri, int yLo, int yHi, float gridScale = 0f)
         {
-            if (_scale == null)
+            if (_get == null || _set == null) return;
+            string zoneKey = $"{originX},{originZ}";
+            if (!_sdfCache.TryGetValue(zoneKey, out var c)) return;
+            var (extLo, bh, width, cacheData) = c;
+            if (ci < 0 || ci >= width || ri < 0 || ri >= width) return;
+
+            float s;
+            if (gridScale > 0f) s = gridScale;
+            else if (_scale != null && _scale.Value > 0f) s = _scale.Value;
+            else return;
+
+            var wg = WorldGenerator.instance;
+            int gx = originX + ci, gz = originZ + ri;
+            float rawH = wg != null ? wg.GetHeight(gx * s, gz * s) : 0f;
+
+            int loY = Math.Max(yLo, extLo);
+            int hiY = Math.Min(yHi, extLo + bh - 1);
+            for (int gy = loY; gy <= hiY; gy++)
             {
-                _scale = _scaleField != null ? (float)_scaleField.GetValue(null)! : 1f;
-                Log.LogInfo($"[ProceduralTerrain] s_scale resolved to {_scale}");
+                int   cy       = gy - extLo;
+                sbyte rawBase  = ToSDFByte((float)gy * s - rawH, s);
+                sbyte cacheVal = cacheData[(ci * bh + cy) * width + ri];
+                int   delta    = (int)cacheVal - (int)rawBase;
+                if (delta == 0) continue;
+                sbyte existing = _get(field, gx, gy, gz);
+                sbyte final    = (sbyte)Math.Clamp((int)existing + delta, -127, 127);
+                if (final != existing) _set(field, gx, gy, gz, final);
             }
-            float s      = _scale.Value;
+        }
+
+        internal static void Carve(object? field, object? grid, int ox, int oz, int width, int yLo, int yHi, float gridScale = 0f)
+        {
+            // Prefer scale from the HeightGrid parameter (available immediately, no timing dependency).
+            // Fall back to s_scale field for callers that don't pass a grid (bake path etc.).
+            float s;
+            if (gridScale > 0f)
+            {
+                s = gridScale;
+                if (_scale == null || _scale.Value <= 0f) _scale = s; // seed cache for other paths
+            }
+            else
+            {
+                if (_scale == null || _scale.Value <= 0f)
+                {
+                    float raw = _scaleField != null ? (float)_scaleField.GetValue(null)! : 0f;
+                    if (raw <= 0f) return;
+                    _scale = raw;
+                    Log.LogInfo($"[ProceduralTerrain] s_scale resolved to {_scale}");
+                }
+                s = _scale.Value;
+            }
             bool bakeOnly = field == null;
             var   wg = WorldGenerator.instance;
 
@@ -1658,12 +2001,13 @@ namespace ProceduralTerrain
             Log.LogDebug($"[ProceduralTerrain] zone ({ox},{oz}) biome={centerBiome} mB_r={centerProf.modeB_radius:F1} mA_w={centerProf.modeA_width:F2} mC_amp={centerProf.modeC_noiseAmp:F1} mC_flare={centerProf.modeC_flare:F3}");
 
             // Build nearby-location list for the location-protection fade.
-            float searchR = width * s * 0.5f + LocProtectR + LocFadeR;
-            var nearbyLocs = new List<Vector2>();
+            float searchR = width * s * 0.5f + 200f + LocFadeR; // 200 covers largest exterior radius
+            var nearbyLocs = new List<(Vector2 pos, float extR)>();
             foreach (var loc in _locationPositions)
             {
-                float dx = loc.x - zoneX, dz = loc.y - zoneZ;
-                if (dx * dx + dz * dz < searchR * searchR)
+                float dx = loc.pos.x - zoneX, dz = loc.pos.y - zoneZ;
+                float locSearchR = Mathf.Max(loc.extR, LocProtectR) + LocFadeR;
+                if (dx * dx + dz * dz < (searchR + locSearchR) * (searchR + locSearchR))
                     nearbyLocs.Add(loc);
             }
 
@@ -2121,27 +2465,21 @@ namespace ProceduralTerrain
                 }
             }
 
-            // Fast path: write directly into Brick._data arrays (no per-voxel dict lookup)
-            bool wroteViaBricks = _addBrick != null && _brickDataField != null &&
-                WriteCacheDataToBricks(field!, ox, oz, width, extLo, bh, cacheData, _voxelizeColumnsSkipped);
-            _voxelizeColumnsSkipped = false;
-
-            if (!wroteViaBricks)
+            for (int ci = 0; ci < width; ci++)
+            for (int ri = 0; ri < width; ri++)
             {
-                // Slow path: per-voxel VoxelField.Set via reflection delegate
-                for (int ci = 0; ci < width; ci++)
-                for (int ri = 0; ri < width; ri++)
+                int gx = ox + ci, gz = oz + ri;
+                float rawH = wg != null ? wg.GetHeight(gx * s, gz * s) : 0f;
+                for (int gy = extLo; gy <= extHi; gy++)
                 {
-                    int gx = ox + ci, gz = oz + ri;
-                    for (int gy = extLo; gy <= extHi; gy++)
-                    {
-                        int   cy      = gy - extLo;
-                        sbyte newByte = cacheData[(ci * bh + cy) * width + ri];
-                        sbyte curByte = _get!(field, gx, gy, gz);
-                        if (newByte == curByte) continue;
-                        _set!(field, gx, gy, gz, newByte);
-                        carved++;
-                    }
+                    int   cy       = gy - extLo;
+                    sbyte rawBase  = ToSDFByte((float)gy * s - rawH, s);
+                    sbyte cacheVal = cacheData[(ci * bh + cy) * width + ri];
+                    int   delta    = (int)cacheVal - (int)rawBase;
+                    if (delta == 0) continue;
+                    sbyte existing = _get!(field, gx, gy, gz);
+                    sbyte final    = (sbyte)Math.Clamp((int)existing + delta, -127, 127);
+                    if (final != existing) { _set!(field, gx, gy, gz, final); carved++; }
                 }
             }
 
@@ -2326,6 +2664,7 @@ namespace ProceduralTerrain
 
         internal static uint ComputeCfgHash()
         {
+            if (_serverCfgHash.HasValue) return _serverCfgHash.Value;
             string path = ConfigPath;
             if (!File.Exists(path)) return 0u;
             byte[] bytes = File.ReadAllBytes(path);
@@ -2777,7 +3116,7 @@ namespace ProceduralTerrain
         // Populates all _bk2d*, _noiseBuf, _tunBuf*, _tunWBuf, _bkWarpedH statics.
         static void BakeSdfSetup(
             int ox, int oz, int overlap, float s, int extLo, int bh, int bw, int cw4,
-            WorldGenerator? wg, List<Vector2> nearbyLocs,
+            WorldGenerator? wg, List<(Vector2 pos, float extR)> nearbyLocs,
             out bool bakeC, out bool bakeA, out bool anyMbActive)
         {
             bakeC = false; bakeA = false; anyMbActive = false;
@@ -3081,12 +3420,13 @@ namespace ProceduralTerrain
             // Build nearby-location list (same as Carve)
             float zoneX   = (ox + w * 0.5f) * s;
             float zoneZ   = (oz + w * 0.5f) * s;
-            float searchR = w * s * 0.5f + LocProtectR + LocFadeR;
-            var   nearby  = new List<Vector2>();
+            float searchR = w * s * 0.5f + 200f + LocFadeR;
+            var   nearby  = new List<(Vector2 pos, float extR)>();
             foreach (var loc in _locationPositions)
             {
-                float dx = loc.x - zoneX, dz = loc.y - zoneZ;
-                if (dx * dx + dz * dz < searchR * searchR) nearby.Add(loc);
+                float dx = loc.pos.x - zoneX, dz = loc.pos.y - zoneZ;
+                float locSearchR = Mathf.Max(loc.extR, LocProtectR) + LocFadeR;
+                if (dx * dx + dz * dz < (searchR + locSearchR) * (searchR + locSearchR)) nearby.Add(loc);
             }
 
             BakeSdfSetup(ox, oz, overlap, s, extLo, bhZ, bwZ, cw4, wg, nearby,
@@ -3581,7 +3921,7 @@ namespace ProceduralTerrain
         // produces visible terrain artifacts because baseSDF = worldY - h drives the surface position.
         static void FillPhase1(float[] buf, int bw, int bh, int extLo, float s,
             int ox, int oz, int overlap, bool bakeC, bool bakeA, bool anyMbActive, WorldGenerator? wg, int cw4,
-            List<Vector2> nearbyLocs)
+            List<(Vector2 pos, float extR)> nearbyLocs)
         {
             long _setupTicks = 0L, _yloopTicks = 0L;
             long _freq = System.Diagnostics.Stopwatch.Frequency;
@@ -3677,27 +4017,33 @@ namespace ProceduralTerrain
             return m;
         }
 
-        // Skip VoxelizeColumns entirely for bake-hit zones: saves ~5ms of wasted
-        // vanilla SDF computation; Phase 3 will set the floor rule and create bricks.
-        static bool Prefix(object field, object grid, int originX, int originZ,
-                            int gx0, int gx1, int gz0, int gz1, int yLo, int yHi)
-        {
-            if (gx0 != 0 || gz0 != 0) return true;
-            if (Plugin._addBrick == null) return true;
-            if (Plugin._bakeData == null || !Plugin._bakeData.ContainsKey((originX, originZ))) return true;
-            Plugin._voxelizeColumnsSkipped = true;
-            return false; // skip VoxelizeColumns
-        }
-
         static void Postfix(object field, object grid, int originX, int originZ,
                             int gx0, int gx1, int gz0, int gz1, int yLo, int yHi)
         {
-            if (gx0 != 0 || gz0 != 0) return;
-            long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
-            try { Plugin.Carve(field, grid, originX, originZ, gx1 + 1, yLo, yHi); }
-            catch (Exception e) { Plugin.Log.LogError($"[ProceduralTerrain] Carve: {e.Message}"); }
-            long ms = (System.Diagnostics.Stopwatch.GetTimestamp() - t0) * 1000L / System.Diagnostics.Stopwatch.Frequency;
-            Plugin.Log.LogInfo($"[ProceduralTerrain] postfix ({originX},{originZ}) wall={ms}ms");
+            bool fullZone    = gx0 == 0 && gz0 == 0;
+            bool singleCol   = !fullZone && gx0 == gx1 && gz0 == gz1;
+            if (!fullZone && !singleCol) return;
+
+            float gridS = Plugin._gridScale != null && grid != null ? Plugin._gridScale(grid) : 0f;
+
+            if (fullZone)
+            {
+                Plugin._probeGrid    = grid;
+                Plugin._probeOriginX = originX;
+                Plugin._probeOriginZ = originZ;
+                Plugin._probeWidth   = gx1 + 1;
+                long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+                try { Plugin.Carve(field, grid, originX, originZ, gx1 + 1, yLo, yHi, gridS); }
+                catch (Exception e) { Plugin.Log.LogError($"[ProceduralTerrain] Carve: {e.Message}"); }
+                long ms = (System.Diagnostics.Stopwatch.GetTimestamp() - t0) * 1000L / System.Diagnostics.Stopwatch.Frequency;
+                Plugin.Log.LogInfo($"[ProceduralTerrain] postfix ({originX},{originZ}) wall={ms}ms");
+            }
+            else
+            {
+                // Single-column re-voxelization (Rebase path) — re-apply PT delta for this column.
+                try { Plugin.CarveColumn(field, originX, originZ, gx0, gz0, yLo, yHi, gridS); }
+                catch (Exception e) { Plugin.Log.LogError($"[ProceduralTerrain] CarveColumn: {e.Message}"); }
+            }
         }
     }
 
@@ -3779,6 +4125,13 @@ namespace ProceduralTerrain
                 Plugin._bakeInProgress = false;
             }
             BakeProgressUI.HideBake();
+            if (Plugin._serverCfgLines != null)
+            {
+                Plugin._serverCfgLines = null;
+                Plugin._serverCfgHash  = null;
+                Plugin.LoadBiomeConfig();
+                Plugin.Log.LogInfo("[ProceduralTerrain] Server cfg cleared — reverted to local config.");
+            }
         }
     }
 
@@ -3794,15 +4147,18 @@ namespace ProceduralTerrain
                 ZRoutedRpc.instance.Register<ZPackage>("PTBakeQuery",   Plugin.RPC_BakeQuery);
                 ZRoutedRpc.instance.Register<ZPackage>("PTBakeRequest", Plugin.RPC_BakeRequest);
                 ZRoutedRpc.instance.Register<ZPackage>("PTClearBake",   Plugin.RPC_ClearBake);
+                ZRoutedRpc.instance.Register<ZPackage>("PTListBakes",   Plugin.RPC_ListBakes);
             }
             else
             {
+                ZRoutedRpc.instance.Register<ZPackage>("PTCfgSync",       Plugin.RPC_ReceiveCfgSync);
                 ZRoutedRpc.instance.Register<ZPackage>("PTLocationList",  Plugin.RPC_ReceiveLocationList);
                 ZRoutedRpc.instance.Register<ZPackage>("PTBakeInfo",      Plugin.RPC_BakeInfo);
                 ZRoutedRpc.instance.Register<ZPackage>("PTBakeChunk",     Plugin.RPC_BakeChunk);
                 ZRoutedRpc.instance.Register<ZPackage>("PTBakeEnd",       Plugin.RPC_BakeEnd);
                 ZRoutedRpc.instance.Register<ZPackage>("PTBakeProgress",    Plugin.RPC_BakeProgress);
                 ZRoutedRpc.instance.Register<ZPackage>("PTClearBakeResult", Plugin.RPC_ClearBakeResult);
+                ZRoutedRpc.instance.Register<ZPackage>("PTListBakesResult", Plugin.RPC_ListBakesResult);
                 // PTBakeQuery is sent from RPC_ReceiveLocationList once the server connection is confirmed.
             }
         }
@@ -3817,6 +4173,7 @@ namespace ProceduralTerrain
         static void Postfix(long peerID)
         {
             if (ZNet.instance == null || !ZNet.instance.IsServer()) return;
+            Plugin.SendCfgSyncToPeer(peerID);
             Plugin.SendLocationListToPeer(peerID);
         }
     }
