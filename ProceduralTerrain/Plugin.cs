@@ -86,10 +86,6 @@ namespace ProceduralTerrain
         internal static Func<object, int, int, float>?        _gridGet;
         internal static Func<object, float>?                  _gridScale;
 
-        // Last grid passed to VoxelizeColumns Postfix — cached for pt_probe_grid.
-        internal static object? _probeGrid;
-        internal static int     _probeOriginX, _probeOriginZ, _probeWidth;
-
         // AuthorityResolvedIn probe state
         static readonly Dictionary<(int,int), float> _authResolvedLastLog = new();
         static FieldInfo? _v2iX, _v2iY;
@@ -173,8 +169,6 @@ namespace ProceduralTerrain
         internal static readonly Dictionary<string, object> _zoneObjects = new();
         internal static MethodInfo? _enqueueMeshMethod;
         internal static MethodInfo? _finishSkinNowMethod;
-        internal static MethodInfo? _pokeNeighborsMethod;
-        internal static MethodInfo? _voxelizeColumnsMethod;
 
         // ── Noise ─────────────────────────────────────────────────────────────────
         // All noise objects use frequency=1.0; call sites scale coordinates by
@@ -218,10 +212,6 @@ namespace ProceduralTerrain
         internal static Action<object, int, int, int, object>? _addBrick;
 
         // VoxelBounds fields — used to construct the changed-bounds arg for PokeNeighbors
-        internal static Type?       _voxelBoundsType;
-        internal static FieldInfo?  _vbMinField;
-        internal static FieldInfo?  _vbMaxField;
-        internal static FieldInfo?  _vbAnyField;
         internal static readonly Dictionary<string, int> _zoneMaxY  = new();
         internal static readonly Dictionary<string, int> _zoneExtHi = new(); // highest voxel Y ever written; used to size the reset range in hot-reload
 
@@ -358,6 +348,7 @@ namespace ProceduralTerrain
                 Log.LogInfo("[ProceduralTerrain] AuthorityResolvedIn probe active.");
             }
             else { Log.LogWarning("[ProceduralTerrain] AuthorityResolvedIn not found — probe skipped."); }
+            RegisterVoxheimGenerator();
             new Terminal.ConsoleCommand("pt_dump", "pt_dump — dump SDF + biome blend data for the next 9 zones processed to BepInEx/config/voxcaves_dump_*.json", _ =>
             {
                 _dumpZonesRemaining = 9;
@@ -420,44 +411,6 @@ namespace ProceduralTerrain
                     Log.LogInfo($"[ProceduralTerrain] pt_fix_carriers: destroyed {destroyed} duplicate(s), kept {keeper.m_uid}. Restart server to re-initialize authority.");
                 }
                 catch (Exception e) { Log.LogError($"[ProceduralTerrain] pt_fix_carriers: {e}"); }
-            });
-            new Terminal.ConsoleCommand("pt_probe_grid",
-                "pt_probe_grid — compare effectiveH (grid) vs rawH (wg.GetHeight) for the last loaded zone",
-                _ =>
-            {
-                try
-                {
-                    var grid = _probeGrid;
-                    if (grid == null)   { Log.LogWarning("[ProceduralTerrain] pt_probe_grid: no zone loaded yet."); return; }
-                    if (_gridGet == null) { Log.LogWarning("[ProceduralTerrain] pt_probe_grid: HeightGrid delegate not built."); return; }
-                    var wg = WorldGenerator.instance;
-                    if (wg == null)     { Log.LogWarning("[ProceduralTerrain] pt_probe_grid: WorldGenerator not ready."); return; }
-                    float s = _scale is { } sv && sv > 0f ? sv : 1f;
-                    int ox = _probeOriginX, oz = _probeOriginZ, w = _probeWidth;
-                    Log.LogInfo($"[ProceduralTerrain] probe_grid zone origin=({ox},{oz}) width={w} scale={s}");
-
-                    float maxDiff = 0f, minDiff = float.MaxValue, sumDiff = 0f;
-                    int nonzero = 0;
-                    var sb = new System.Text.StringBuilder();
-                    sb.AppendLine($"[ProceduralTerrain] probe_grid ci,ri | effH | rawH | diff");
-                    for (int ci = 0; ci < w; ci++)
-                    for (int ri = 0; ri < w; ri++)
-                    {
-                        float effH = _gridGet(grid, ci, ri) * s;  // voxel units → world
-                        float rawH = wg.GetHeight((ox + ci) * s, (oz + ri) * s);
-                        float diff = effH - rawH;
-                        if (Math.Abs(diff) > 0.01f) nonzero++;
-                        if (Math.Abs(diff) > Math.Abs(maxDiff)) maxDiff = diff;
-                        if (Math.Abs(diff) < Math.Abs(minDiff)) minDiff = diff;
-                        sumDiff += diff;
-                        // Only log cells with non-trivial difference to keep log readable
-                        if (Math.Abs(diff) > 0.5f)
-                            sb.AppendLine($"  [{ci},{ri}] eff={effH:F2} raw={rawH:F2} Δ={diff:+0.00;-0.00}");
-                    }
-                    Log.LogInfo(sb.ToString());
-                    Log.LogInfo($"[ProceduralTerrain] probe_grid summary: nonzero={nonzero}/{w*w} maxDiff={maxDiff:F3} avgDiff={sumDiff/(w*w):F3}");
-                }
-                catch (Exception e) { Log.LogError($"[ProceduralTerrain] pt_probe_grid: {e}"); }
             });
             new Terminal.ConsoleCommand("pt_bake", "pt_bake [radius] — bake terrain SDF for a radius in meters; runs on server (admin only)", args =>
             {
@@ -560,6 +513,13 @@ namespace ProceduralTerrain
             },
             optionsFetcher: () => new List<string> { "server" });
             Log.LogInfo("[ProceduralTerrain] Ready.");
+        }
+
+        [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+        static void RegisterVoxheimGenerator()
+        {
+            Voxheim.Core.VoxelBaselinePipeline.RegisterGenerator(new PTGenerator());
+            Log.LogInfo("[ProceduralTerrain] PTGenerator registered with Voxheim.");
         }
 
         internal static int _dumpZonesRemaining = 0;
@@ -683,23 +643,8 @@ namespace ProceduralTerrain
                 BindingFlags.NonPublic | BindingFlags.Instance);
             _finishSkinNowMethod = zoneT?.GetMethod("FinishSkinNow",
                 BindingFlags.NonPublic | BindingFlags.Instance);
-            // PokeNeighbors(in VoxelBounds, bool) — tells adjacent active zones to remesh boundary bricks.
-            // PokeTransitionNeighbors only iterates _editedBricks (player edits), so we call PokeNeighbors directly.
-            _pokeNeighborsMethod = zoneT?.GetMethods(BindingFlags.NonPublic | BindingFlags.Instance)
-                .FirstOrDefault(m => m.Name == "PokeNeighbors" && m.GetParameters().Length == 2
-                                     && m.GetParameters()[1].ParameterType == typeof(bool));
             if (_enqueueMeshMethod   == null) Log.LogWarning("[ProceduralTerrain] EnqueueMesh not found.");
             if (_finishSkinNowMethod == null) Log.LogWarning("[ProceduralTerrain] FinishSkinNow not found.");
-            if (_pokeNeighborsMethod == null) Log.LogWarning("[ProceduralTerrain] PokeNeighbors not found — neighbor seam repair disabled.");
-
-            var boundsT = AppDomain.CurrentDomain.GetAssemblies()
-                .SelectMany(a => { try { return a.GetTypes(); } catch { return Array.Empty<Type>(); } })
-                .FirstOrDefault(t => t.FullName == "Voxheim.Core.VoxelBounds");
-            _voxelBoundsType = boundsT;
-            _vbMinField = boundsT?.GetField("Min", BindingFlags.Public | BindingFlags.Instance);
-            _vbMaxField = boundsT?.GetField("Max", BindingFlags.Public | BindingFlags.Instance);
-            _vbAnyField = boundsT?.GetField("Any", BindingFlags.Public | BindingFlags.Instance);
-            if (_voxelBoundsType == null) Log.LogWarning("[ProceduralTerrain] VoxelBounds type not found — neighbor seam repair disabled.");
 
             _zoneOriginX         = zoneT?.GetField("_originX",
                 BindingFlags.NonPublic | BindingFlags.Instance);
@@ -2419,18 +2364,15 @@ namespace ProceduralTerrain
                     lock (_surfHCache) _surfHCache[(ox, oz)] = (bw, extLo, s, surfH);
             }
 
-            // ── Phase 3: Write SDF directly to VoxelField via the 'field' parameter ────
-            // Skipped when bakeOnly (field==null); only staging into _bakePending is needed.
+            // ── Phase 3: Build cacheData and optionally write to VoxelField ─────────────
             int carved = 0;
             int maxYC  = yHi;
             int maxYAny = yHi;
-            if (!bakeOnly)
             {
             var transBytes  = new sbyte[bh];
             var transHasOvr = new bool[bh];
             var cacheData   = new sbyte[width * bh * width]; // (ci*bh + cy)*width + ri
 
-            // Encode transition bytes and cacheData for all columns (common to both write paths)
             for (int ci = 0; ci < width; ci++)
             for (int ri = 0; ri < width; ri++)
             {
@@ -2465,6 +2407,11 @@ namespace ProceduralTerrain
                 }
             }
 
+            if (!_parallelBakeActive) _sdfCache[zoneKey] = (extLo, bh, width, cacheData);
+
+            // Direct voxel writes — only when a VoxelField was provided (non-bakeOnly path).
+            if (!bakeOnly)
+            {
             for (int ci = 0; ci < width; ci++)
             for (int ri = 0; ri < width; ri++)
             {
@@ -2482,12 +2429,11 @@ namespace ProceduralTerrain
                     if (final != existing) { _set!(field, gx, gy, gz, final); carved++; }
                 }
             }
+            } // end direct write
 
-            if (!_parallelBakeActive) _sdfCache[zoneKey] = (extLo, bh, width, cacheData);
-
-            // _zoneMaxY tracks highest solid voxel (for _yScanHi extension on mode C terrain)
-            // _zoneExtHi tracks highest ANY write (solid or air) so hot-reload VoxelizeColumns
-            // range covers mode B's air voxels written above yHi
+            // _zoneMaxY / _zoneExtHi only relevant for non-bake paths (zone lifecycle)
+            if (!bakeOnly)
+            {
             if (maxYC > yHi)
             {
                 if (!_zoneMaxY.TryGetValue(zoneKey, out int prevMaxY) || maxYC > prevMaxY)
@@ -2500,7 +2446,8 @@ namespace ProceduralTerrain
                 if (!_zoneExtHi.TryGetValue(zoneKey, out int prevHiMark) || hiMark > prevHiMark)
                     _zoneExtHi[zoneKey] = hiMark;
             }
-            } // end if (!bakeOnly)
+            } // end zone lifecycle bookkeeping
+            } // end Phase 3
 
             long _t3 = _sw.ElapsedMilliseconds;
 
@@ -2982,7 +2929,10 @@ namespace ProceduralTerrain
             _zoneMaxY.Clear();
             _zoneExtHi.Clear();
             _zoneFaceCache.Clear();
-            if (_voxelizeColumnsMethod == null) return;
+            // Re-voxelization of active zones on config hot-reload requires Voxheim to
+            // expose a way to re-run the generator pipeline on a live zone. Until that
+            // API exists, we clear caches and rebuild meshes only — zones reload fully
+            // on next unload/reload cycle.
             bool canRemesh = _enqueueMeshMethod != null && _finishSkinNowMethod != null && _int3Ctor != null;
             if (!canRemesh)
                 Log.LogWarning("[ProceduralTerrain] EnqueueMesh/FinishSkinNow unavailable — mesh rebuild skipped.");
@@ -3005,41 +2955,7 @@ namespace ProceduralTerrain
                 }
             }
 
-            // ── Pass 1: update all VoxelFields before touching any meshes ─────────
-            // Processing all fields first means cross-zone boundary bricks in Pass 2
-            // read current data from every neighbor, eliminating seam ordering issues.
-            foreach (var (key, zp) in snapshot)
-            {
-                int extLo = zp.yLo - 24;
-                // Start from previously stored high-water mark so turning Mode C off
-                // still resets the voxels it previously wrote above yHi.
-                int extHi = _zoneExtHi.TryGetValue(key, out int hiMark) ? hiMark : zp.yHi + 24;
-                {
-                    float sRc = _scale is { } sv && sv > 0f ? sv : 1f;
-                    var wgRc  = WorldGenerator.instance;
-                    if (wgRc != null)
-                    {
-                        float cxRc = (zp.ox + zp.w * 0.5f) * sRc;
-                        float czRc = (zp.oz + zp.w * 0.5f) * sRc;
-                        var cpRc   = PointBlendProfile(cxRc, czRc, wgRc, sRc);
-                        if (cpRc.modeC_noiseAmp > 0f)
-                        {
-                            float maxAmpRc  = cpRc.modeC_noiseAmp * Mathf.Max(1f, 1f + cpRc.modeC_ampVary);
-                            float maxExtMRc = Mathf.Max(0f, 1f - cpRc.modeC_threshold) * maxAmpRc + cpRc.modeC_warpAmp;
-                            int newHi = zp.yHi + Mathf.Max(24, (int)Mathf.Ceil(maxExtMRc / sRc) + 8);
-                            if (newHi > extHi) extHi = newHi;
-                        }
-                    }
-                }
-                try
-                {
-                    _voxelizeColumnsMethod.Invoke(null, new object[]
-                        { zp.field, zp.grid, zp.ox, zp.oz, 0, zp.w - 1, 0, zp.w - 1, extLo, extHi });
-                }
-                catch (Exception e) { Log.LogWarning($"[ProceduralTerrain] Revoxelize {key}: {e.Message}"); }
-            }
-
-            // ── Between passes: extend _yScanHi for zones where Mode C raised terrain ──
+            // ── Extend _yScanHi for zones where Mode C raises terrain ────────────
             // CompletePatch only runs on fresh zone load, so hot-reload must do this itself.
             if (_yScanHiField != null)
             {
@@ -4006,48 +3922,19 @@ namespace ProceduralTerrain
     // ── Harmony patches ───────────────────────────────────────────────────────────
 
     [HarmonyPatch]
-    static class VoxelizeColumnsPatch
-    {
-        static MethodBase? TargetMethod()
-        {
-            var t = Plugin.FindType("Voxheim.Core.HeightFieldVoxelizer", "Voxheim.Core");
-            var m = t?.GetMethod("VoxelizeColumns", BindingFlags.Public | BindingFlags.Static);
-            Plugin._voxelizeColumnsMethod = m;
-            if (m == null) Plugin.Log.LogError("[ProceduralTerrain] VoxelizeColumns not found.");
-            return m;
-        }
-
-        static void Postfix(object field, object grid, int originX, int originZ,
-                            int gx0, int gx1, int gz0, int gz1, int yLo, int yHi)
-        {
-            bool fullZone    = gx0 == 0 && gz0 == 0;
-            bool singleCol   = !fullZone && gx0 == gx1 && gz0 == gz1;
-            if (!fullZone && !singleCol) return;
-
-            float gridS = Plugin._gridScale != null && grid != null ? Plugin._gridScale(grid) : 0f;
-
-            if (fullZone)
-            {
-                Plugin._probeGrid    = grid;
-                Plugin._probeOriginX = originX;
-                Plugin._probeOriginZ = originZ;
-                Plugin._probeWidth   = gx1 + 1;
-                long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
-                try { Plugin.Carve(field, grid, originX, originZ, gx1 + 1, yLo, yHi, gridS); }
-                catch (Exception e) { Plugin.Log.LogError($"[ProceduralTerrain] Carve: {e.Message}"); }
-                long ms = (System.Diagnostics.Stopwatch.GetTimestamp() - t0) * 1000L / System.Diagnostics.Stopwatch.Frequency;
-                Plugin.Log.LogInfo($"[ProceduralTerrain] postfix ({originX},{originZ}) wall={ms}ms");
-            }
-            else
-            {
-                // Single-column re-voxelization (Rebase path) — re-apply PT delta for this column.
-                try { Plugin.CarveColumn(field, originX, originZ, gx0, gz0, yLo, yHi, gridS); }
-                catch (Exception e) { Plugin.Log.LogError($"[ProceduralTerrain] CarveColumn: {e.Message}"); }
-            }
-        }
-    }
-
-
+    // AUTHOR NOTE FOR VOXHEIM — two API gaps this patch works around:
+    //
+    // 1. Y EXTENT DECLARATION: Our generator writes solid voxels ABOVE the vanilla
+    //    heightmap surface (Mode C — overhangs, arches). Voxheim finalizes the zone's
+    //    render extent (_yScanHi) before the generator runs, so that geometry is clipped.
+    //    We patch Complete() to bump _yScanHi to our actual max Y after the fact.
+    //    Ideally IVoxelBaselineGenerator would let us declare a Y extent upfront so
+    //    Voxheim allocates the correct range before finalizing.
+    //
+    // 2. LIVE ZONE REGENERATION: When the user changes terrain config at runtime, we need
+    //    to re-run the generator on already-active zones so changes are visible immediately
+    //    without a full reload. No API for this exists today, so hot-reload only clears
+    //    caches — zones pick up the new config on next unload/reload cycle.
     [HarmonyPatch]
     static class CompletePatch
     {
@@ -4072,36 +3959,6 @@ namespace ProceduralTerrain
                 if (maxY > cur) Plugin._yScanHiField.SetValue(__instance, maxY);
                 Plugin._zoneMaxY.Remove(key);
             }
-        }
-
-        // After Complete() sets _isActive=true, poke neighbors so their boundary
-        // bricks rebuild using this zone's carved _field instead of FallbackDensity or stale data.
-        // PokeNeighbors(in VoxelBounds, bool defer) finds all active adjacent zones and enqueues
-        // a deferred remesh of the bricks overlapping the supplied bounds.
-        static void Postfix(object __instance)
-        {
-            if (Plugin._pokeNeighborsMethod == null) return;
-            if (Plugin._voxelBoundsType == null || Plugin._vbMinField == null
-                || Plugin._vbMaxField == null || Plugin._vbAnyField == null) return;
-            if (Plugin._zoneOriginX == null || Plugin._zoneOriginZ == null) return;
-            if (Plugin._int3Ctor == null) return;
-
-            int ox = (int)Plugin._zoneOriginX.GetValue(__instance)!;
-            int oz = (int)Plugin._zoneOriginZ.GetValue(__instance)!;
-            if (!Plugin._zoneParams.TryGetValue($"{ox},{oz}", out var zp)) return;
-
-            // Build VoxelBounds covering the full carved voxel extent of this zone.
-            // Neighbors only need bricks that touch this zone's edge, but covering the
-            // full zone is safe and ensures we catch Mode C terrain raised above yHi.
-            object minV = Plugin._int3Ctor.Invoke(new object[] { zp.ox,          zp.yLo - 32, zp.oz });
-            object maxV = Plugin._int3Ctor.Invoke(new object[] { zp.ox + zp.w - 1, zp.yHi + 128, zp.oz + zp.w - 1 });
-            object bounds = Activator.CreateInstance(Plugin._voxelBoundsType);
-            Plugin._vbMinField.SetValue(bounds, minV);
-            Plugin._vbMaxField.SetValue(bounds, maxV);
-            Plugin._vbAnyField.SetValue(bounds, true);
-
-            try { Plugin._pokeNeighborsMethod.Invoke(__instance, new object[] { bounds, true }); }
-            catch (Exception ex) { Plugin.Log.LogWarning($"[ProceduralTerrain] PokeNeighbors threw: {ex.Message}"); }
         }
     }
 
@@ -4525,4 +4382,38 @@ public class BakeProgressUI : MonoBehaviour
             GUI.DrawTexture(new Rect(barX, barY, barW * pct, barH), _barFillTex);
     }
 }
+    // ── Voxheim IVoxelBaselineGenerator ──────────────────────────────────────────
+    sealed class PTGenerator : Voxheim.Core.IVoxelBaselineGenerator
+    {
+        public string Id       => "com.ctogle.procedural_terrain";
+        public string Revision => "1";
+
+        public void Generate(Voxheim.Core.VoxelBaselineContext context, Voxheim.Core.VoxelBaselineBuilder builder)
+        {
+            int ox    = context.OriginX;
+            int oz    = context.OriginZ;
+            int width = context.Width;
+
+            builder.SetFloor(context.Floor);
+
+            float gridS = Plugin._gridScale != null ? Plugin._gridScale(context.Heights) : 0f;
+            try { Plugin.Carve(null, context.Heights, ox, oz, width, context.InitialScanLo, context.InitialScanHi, gridS); }
+            catch (Exception e) { Plugin.Log.LogError($"[PT] Carve ({ox},{oz}): {e.Message}"); return; }
+
+            if (!Plugin._sdfCache.TryGetValue($"{ox},{oz}", out var c)) return;
+
+            for (int ci = 0; ci < width; ci++)
+            for (int ri = 0; ri < width; ri++)
+            {
+                int wx = ox + ci, wz = oz + ri;
+                for (int cy = 0; cy < c.bh; cy++)
+                {
+                    sbyte d = c.data[(ci * c.bh + cy) * c.width + ri];
+                    int   wy = c.extLo + cy;
+                    builder.Set(new Voxheim.Core.Int3(wx, wy, wz), d);
+                }
+            }
+        }
+    }
+
 } // namespace ProceduralTerrain
