@@ -79,9 +79,6 @@ namespace ProceduralTerrain
     {
         internal static ManualLogSource Log = null!;
 
-        // Zero-alloc voxel access via compiled IL — see BuildDelegates().
-        internal static Func<object, int, int, int, sbyte>?   _get;
-        internal static Action<object, int, int, int, sbyte>? _set;
         // HeightGrid delegates. Built in BuildDelegates.
         internal static Func<object, int, int, float>?        _gridGet;
         internal static Func<object, float>?                  _gridScale;
@@ -173,8 +170,6 @@ namespace ProceduralTerrain
         internal static FieldInfo?       _zoneOriginX;
         internal static FieldInfo?       _zoneOriginZ;
         internal static FieldInfo?       _yScanHiField;
-        internal static FieldInfo?       _voxelZoneFieldField;  // VoxelZone._field → VoxelField
-
         // ── Direct brick write (Option C fast path) ──────────────────────────────
         // Bypasses per-voxel VoxelField.Set() overhead: ~80 dict lookups per zone
         // instead of ~327K, plus direct sbyte[] writes into Brick._data.
@@ -341,42 +336,6 @@ namespace ProceduralTerrain
                 }
                 catch (Exception e) { Log.LogError($"[ProceduralTerrain] probe exception: {e}"); }
             });
-            new Terminal.ConsoleCommand("pt_fix_carriers",
-                "pt_fix_carriers [zx zy] — destroy duplicate Voxheim authority carriers in a zone (default: zone under player). Fixes 'zone contains N authority carriers'.",
-                args =>
-            {
-                try
-                {
-                    if (!ZNet.instance.IsServer()) { Log.LogWarning("[ProceduralTerrain] pt_fix_carriers: must run on server or singleplayer."); return; }
-                    Vector2Int zone;
-                    if (args.Length >= 3 && int.TryParse(args[1], out int ax) && int.TryParse(args[2], out int ay))
-                        zone = new Vector2Int(ax, ay);
-                    else
-                    {
-                        var player = Player.m_localPlayer;
-                        if (player == null) { Log.LogWarning("[ProceduralTerrain] pt_fix_carriers: no player; pass zx zy args."); return; }
-                        var zk = ZoneSystem.GetZone(player.transform.position);
-                        zone = new Vector2Int(zk.x, zk.y);
-                    }
-                    int voxelDataHash = "voxelterrain_field".GetStableHashCode();
-                    var zdos = new List<ZDO>();
-                    ZDOMan.instance.FindSectorObjects(new Vector2i(zone.x, zone.y), 0, 0, zdos, null);
-                    var carriers = zdos.Where(z => z != null && z.IsValid() && z.GetByteArray(voxelDataHash, null) != null).ToList();
-                    Log.LogInfo($"[ProceduralTerrain] pt_fix_carriers: zone({zone.x},{zone.y}) found {carriers.Count} carrier(s).");
-                    if (carriers.Count <= 1) { Log.LogInfo("[ProceduralTerrain] pt_fix_carriers: nothing to fix."); return; }
-                    // Keep the carrier with the most data (largest byte array), destroy the rest.
-                    var keeper = carriers.OrderByDescending(z => z.GetByteArray(voxelDataHash, null)?.Length ?? 0).First();
-                    int destroyed = 0;
-                    foreach (var z in carriers)
-                    {
-                        if (z.m_uid == keeper.m_uid) continue;
-                        ZDOMan.instance.DestroyZDO(z);
-                        destroyed++;
-                    }
-                    Log.LogInfo($"[ProceduralTerrain] pt_fix_carriers: destroyed {destroyed} duplicate(s), kept {keeper.m_uid}. Restart server to re-initialize authority.");
-                }
-                catch (Exception e) { Log.LogError($"[ProceduralTerrain] pt_fix_carriers: {e}"); }
-            });
             new Terminal.ConsoleCommand("pt_bake", "pt_bake [radius] — bake terrain SDF for a radius in meters; runs on server (admin only)", args =>
             {
                 float radius = _bakeRadius;
@@ -491,46 +450,26 @@ namespace ProceduralTerrain
                 }
                 string header = $"[PT] loc_probe at ({wx:F1}, {wz:F1})  protectLocations={_protectLocations}  cached={_locationsCached}  total={_locationPositions.Count}";
                 Console.instance?.Print(header); Log.LogInfo(header);
-                var nearby = new List<(Vector2 pos, float extR)>();
-                foreach (var loc in _locationPositions)
-                {
-                    float dx = wx - loc.pos.x, dz = wz - loc.pos.y;
-                    float d  = Mathf.Sqrt(dx * dx + dz * dz);
-                    float r  = Mathf.Max(loc.extR, LocProtectR);
-                    if (d < r + LocFadeR + 10f) nearby.Add(loc);
-                }
-                // Find the location with the lowest factor (worst offender) across all locations
                 float worstF = 1f; (Vector2 pos, float extR) worstLoc = default;
                 foreach (var loc in _locationPositions)
                 {
-                    float dx = wx - loc.pos.x, dz = wz - loc.pos.y;
-                    float d  = Mathf.Sqrt(dx * dx + dz * dz);
-                    float r  = Mathf.Max(loc.extR, LocProtectR);
-                    float f  = Mathf.Clamp01((d - r) / LocFadeR);
-                    if (f < worstF) { worstF = f; worstLoc = loc; }
-                }
-                if (nearby.Count == 0 && worstF >= 1f) { Console.instance?.Print("[PT] No locations nearby."); Log.LogInfo("[PT] No locations nearby."); }
-                else
-                {
-                    foreach (var loc in nearby)
+                    float f = LocFactor(loc, wx, wz);
+                    float d = LocDist(loc, wx, wz);
+                    float r = Mathf.Max(loc.extR, LocProtectR);
+                    if (d < r + LocFadeR + 10f)
                     {
-                        float dx = wx - loc.pos.x, dz = wz - loc.pos.y;
-                        float d  = Mathf.Sqrt(dx * dx + dz * dz);
-                        float r  = Mathf.Max(loc.extR, LocProtectR);
-                        float f  = Mathf.Clamp01((d - r) / LocFadeR);
                         string line = $"  loc ({loc.pos.x:F0},{loc.pos.y:F0}) extR={loc.extR:F1} dist={d:F1} factor={f:F3}";
                         Console.instance?.Print(line); Log.LogInfo(line);
                     }
-                    if (worstF < 1f)
-                    {
-                        float dx = wx - worstLoc.pos.x, dz = wz - worstLoc.pos.y;
-                        float d  = Mathf.Sqrt(dx * dx + dz * dz);
-                        string worst = $"  worst: loc ({worstLoc.pos.x:F0},{worstLoc.pos.y:F0}) extR={worstLoc.extR:F1} dist={d:F1} factor={worstF:F3}";
-                        Console.instance?.Print(worst); Log.LogInfo(worst);
-                    }
+                    if (f < worstF) { worstF = f; worstLoc = loc; }
                 }
-                float final = LocationFactor(wx, wz, _locationPositions);
-                string summary = $"[PT] final LocationFactor = {final:F3}";
+                if (worstF < 1f)
+                {
+                    string worst = $"  worst: loc ({worstLoc.pos.x:F0},{worstLoc.pos.y:F0}) extR={worstLoc.extR:F1} dist={LocDist(worstLoc, wx, wz):F1} factor={worstF:F3}";
+                    Console.instance?.Print(worst); Log.LogInfo(worst);
+                }
+                else { Console.instance?.Print("[PT] No locations nearby."); Log.LogInfo("[PT] No locations nearby."); }
+                string summary = $"[PT] final LocationFactor = {LocationFactor(wx, wz, _locationPositions):F3}";
                 Console.instance?.Print(summary); Log.LogInfo(summary);
             });
             Log.LogInfo("[ProceduralTerrain] Ready.");
@@ -671,14 +610,10 @@ namespace ProceduralTerrain
                 BindingFlags.NonPublic | BindingFlags.Instance);
             _zoneOriginZ         = zoneT?.GetField("_originZ",
                 BindingFlags.NonPublic | BindingFlags.Instance);
-            _voxelZoneFieldField = zoneT?.GetField("_field",
-                BindingFlags.NonPublic | BindingFlags.Instance);
             _yScanHiField        = zoneT?.GetField("_yScanHi",
                 BindingFlags.NonPublic | BindingFlags.Instance);
             if (_zoneOriginX == null || _zoneOriginZ == null)
-                Log.LogWarning("[ProceduralTerrain] Zone origin fields missing — per-brick SDF disabled.");
-            if (_voxelZoneFieldField == null)
-                Log.LogWarning("[ProceduralTerrain] VoxelZone._field not found — per-brick SDF disabled.");
+                Log.LogWarning("[ProceduralTerrain] Zone origin fields missing.");
             if (_yScanHiField == null)
                 Log.LogWarning("[ProceduralTerrain] _yScanHi not found — Mode C ceiling extension disabled.");
 
@@ -731,31 +666,6 @@ namespace ProceduralTerrain
                           ?? int3T.GetField("z", BindingFlags.Public | BindingFlags.Instance);
             if (_int3FieldX == null || _int3FieldY == null || _int3FieldZ == null)
                 Log.LogWarning("[ProceduralTerrain] Int3 X/Y/Z fields not found — FallbackDensity patch will use vanilla.");
-
-            var gDm = new DynamicMethod("VC_Get", typeof(sbyte),
-                new[] { typeof(object), typeof(int), typeof(int), typeof(int) },
-                typeof(Plugin).Module, skipVisibility: true);
-            var gi = gDm.GetILGenerator();
-            gi.Emit(OpCodes.Ldarg_0); gi.Emit(OpCodes.Castclass, fieldT);
-            gi.Emit(OpCodes.Ldarg_1); gi.Emit(OpCodes.Ldarg_2); gi.Emit(OpCodes.Ldarg_3);
-            gi.Emit(OpCodes.Newobj, _int3Ctor);
-            gi.Emit(OpCodes.Callvirt, get);
-            gi.Emit(OpCodes.Ret);
-            _get = (Func<object,int,int,int,sbyte>)gDm.CreateDelegate(
-                typeof(Func<object,int,int,int,sbyte>));
-
-            var sDm = new DynamicMethod("VC_Set", typeof(void),
-                new[] { typeof(object), typeof(int), typeof(int), typeof(int), typeof(sbyte) },
-                typeof(Plugin).Module, skipVisibility: true);
-            var si = sDm.GetILGenerator();
-            si.Emit(OpCodes.Ldarg_0); si.Emit(OpCodes.Castclass, fieldT);
-            si.Emit(OpCodes.Ldarg_1); si.Emit(OpCodes.Ldarg_2); si.Emit(OpCodes.Ldarg_3);
-            si.Emit(OpCodes.Newobj, _int3Ctor);
-            si.Emit(OpCodes.Ldarg_S, (byte)4);
-            si.Emit(OpCodes.Callvirt, set);
-            si.Emit(OpCodes.Ret);
-            _set = (Action<object,int,int,int,sbyte>)sDm.CreateDelegate(
-                typeof(Action<object,int,int,int,sbyte>));
 
             // HeightGrid delegates — Scale property and [x,z] indexer
             var gridT      = FindType("Voxheim.Core.HeightGrid", "Voxheim.Core");
@@ -1828,17 +1738,27 @@ namespace ProceduralTerrain
 
         const float LocFadeR = 10f; // fade band outside the exterior radius
 
+        static float LocFactor((Vector2 pos, float extR) loc, float worldX, float worldZ)
+        {
+            float dx = worldX - loc.pos.x, dz = worldZ - loc.pos.y;
+            float d  = Mathf.Sqrt(dx * dx + dz * dz);
+            float r  = Mathf.Max(loc.extR, LocProtectR);
+            return Mathf.Clamp01((d - r) / LocFadeR);
+        }
+
+        static float LocDist((Vector2 pos, float extR) loc, float worldX, float worldZ)
+        {
+            float dx = worldX - loc.pos.x, dz = worldZ - loc.pos.y;
+            return Mathf.Sqrt(dx * dx + dz * dz);
+        }
+
         static float LocationFactor(float worldX, float worldZ, List<(Vector2 pos, float extR)> nearbyLocs)
         {
             if (!_protectLocations || nearbyLocs.Count == 0) return 1f;
             float minFactor = 1f;
             for (int i = 0; i < nearbyLocs.Count; i++)
             {
-                float dx   = worldX - nearbyLocs[i].pos.x;
-                float dz   = worldZ - nearbyLocs[i].pos.y;
-                float d    = Mathf.Sqrt(dx * dx + dz * dz);
-                float extR = Mathf.Max(nearbyLocs[i].extR, LocProtectR);
-                float f    = Mathf.Clamp01((d - extR) / LocFadeR);
+                float f = LocFactor(nearbyLocs[i], worldX, worldZ);
                 if (f < minFactor) minFactor = f;
             }
             return minFactor;
@@ -1857,7 +1777,7 @@ namespace ProceduralTerrain
         // Combination order: base → max(B) → min(C) → max(A).
         // Mode A (tunnels) runs last so it punches through Mode C solid.
         // field==null means bake-only: run Phase 1+2, stage result, skip Phase 3 voxel writes.
-        internal static void Carve(object? field, object? grid, int ox, int oz, int width, int yLo, int yHi, float gridScale = 0f)
+        internal static void Carve(object? grid, int ox, int oz, int width, int yLo, int yHi, float gridScale = 0f)
         {
             // Prefer scale from the HeightGrid parameter (available immediately, no timing dependency).
             // Fall back to s_scale field for callers that don't pass a grid (bake path etc.).
@@ -1878,7 +1798,6 @@ namespace ProceduralTerrain
                 }
                 s = _scale.Value;
             }
-            bool bakeOnly = field == null;
             var   wg = WorldGenerator.instance;
 
             if (!_bakeLoadAttempted) { _bakeLoadAttempted = true; LoadBakeFile(); }
@@ -1889,14 +1808,7 @@ namespace ProceduralTerrain
             float zoneZ = (oz + width * 0.5f) * s;
 
             string zoneKey = $"{ox},{oz}";
-            if (!bakeOnly) _zoneParams[zoneKey] = (ox, oz, width, yLo, yHi);
-
-            // If location data isn't ready yet, leave the zone vanilla.
-            if (!bakeOnly && !_locationsCached)
-            {
-                Log.LogDebug($"[ProceduralTerrain] zone ({ox},{oz}) skip=no-locations");
-                return;
-            }
+            if (!_parallelBakeActive) _zoneParams[zoneKey] = (ox, oz, width, yLo, yHi);
 
             const int overlap = 4;
             int bwEarly = width + 2 * overlap;
@@ -2306,11 +2218,8 @@ namespace ProceduralTerrain
             } // end if (!fromBake)
 
             // ── Bake staging: subsample buf[] into _bakePending ───────────────────────
-            if (!fromBake && (bakeOnly || _bakeRadius > 0f))
-            {
-                if (bakeOnly || (ox * s) * (ox * s) + (oz * s) * (oz * s) <= _bakeRadius * _bakeRadius)
-                    StageBakeEntry(ox, oz, bw, bh, extLo, s, buf);
-            }
+            if (!fromBake)
+                StageBakeEntry(ox, oz, bw, bh, extLo, s, buf);
 
             // ── Surface height cache (for vegetation placement) ───────────────────────
             // Scan each XZ column top-down and record the world-Y of the first solid voxel.
@@ -2336,7 +2245,6 @@ namespace ProceduralTerrain
             }
 
             // ── Phase 3: Build cacheData and optionally write to VoxelField ─────────────
-            int carved = 0;
             int maxYC  = yHi;
             int maxYAny = yHi;
             {
@@ -2380,30 +2288,7 @@ namespace ProceduralTerrain
 
             if (!_parallelBakeActive) _sdfCache[zoneKey] = (extLo, bh, width, cacheData);
 
-            // Direct voxel writes — only when a VoxelField was provided (non-bakeOnly path).
-            if (!bakeOnly)
-            {
-            for (int ci = 0; ci < width; ci++)
-            for (int ri = 0; ri < width; ri++)
-            {
-                int gx = ox + ci, gz = oz + ri;
-                float rawH = wg != null ? wg.GetHeight(gx * s, gz * s) : 0f;
-                for (int gy = extLo; gy <= extHi; gy++)
-                {
-                    int   cy       = gy - extLo;
-                    sbyte rawBase  = ToSDFByte((float)gy * s - rawH, s);
-                    sbyte cacheVal = cacheData[(ci * bh + cy) * width + ri];
-                    int   delta    = (int)cacheVal - (int)rawBase;
-                    if (delta == 0) continue;
-                    sbyte existing = _get!(field, gx, gy, gz);
-                    sbyte final    = (sbyte)Math.Clamp((int)existing + delta, -127, 127);
-                    if (final != existing) { _set!(field, gx, gy, gz, final); carved++; }
-                }
-            }
-            } // end direct write
-
-            // _zoneMaxY / _zoneExtHi only relevant for non-bake paths (zone lifecycle)
-            if (!bakeOnly)
+            if (!_parallelBakeActive)
             {
             if (maxYC > yHi)
             {
@@ -2429,7 +2314,7 @@ namespace ProceduralTerrain
             }
 
             var _centerBiome = WorldGenerator.instance?.GetBiome((ox + width / 2) * (float)(_scale ?? 1f), (oz + width / 2) * (float)(_scale ?? 1f)) ?? Heightmap.Biome.None;
-            Log.LogDebug($"[ProceduralTerrain] zone ({ox},{oz}) biome={_centerBiome} bakeC={bakeC} bakeA={bakeA} voxels={bw}x{bh}x{bw} fixHops={_lastFixpointHops} Ph0={_t0}ms Ph1={_t1-_t0}ms blur={_t1b-_t1}ms Ph2={_t2-_t1b}ms fix={_tFix}ms Ph3={_t3-_t2}ms total={_t3}ms carved={carved}");
+            Log.LogDebug($"[ProceduralTerrain] zone ({ox},{oz}) biome={_centerBiome} bakeC={bakeC} bakeA={bakeA} voxels={bw}x{bh}x{bw} fixHops={_lastFixpointHops} Ph0={_t0}ms Ph1={_t1-_t0}ms blur={_t1b-_t1}ms Ph2={_t2-_t1b}ms fix={_tFix}ms Ph3={_t3-_t2}ms total={_t3}ms");
         }
 
         // ── Direct brick write ────────────────────────────────────────────────────
@@ -2783,7 +2668,7 @@ namespace ProceduralTerrain
                     {
                         var (zox, zoz) = zone;
                         var (yLo, yHi) = ComputeYBounds(zox, zoz, zoneW, s, wg);
-                        Carve(null, null, zox, zoz, zoneW, yLo, yHi);
+                        Carve(null, zox, zoz, zoneW, yLo, yHi);
                         int n = System.Threading.Interlocked.Increment(ref doneCount);
                         if (n % 50 == 0 || n == toCarve.Count)
                         {
@@ -3162,7 +3047,7 @@ namespace ProceduralTerrain
                     float wf    = BL2(_bk2dMbwf!, b00, b10, b01, b11, bfx2, bfz2);
                     float wa    = BL2(_bk2dMbwa!, b00, b10, b01, b11, bfx2, bfz2);
                     float yo    = BL2(_bk2dMbyo!, b00, b10, b01, b11, bfx2, bfz2);
-                    float locF2 = LocationFactor(wx, wz, nearbyLocs);
+                    float locF2 = LocationFactor(wx, wz, nearbyLocs); // suppresses warp near locations
                     float dx    = _hmWarpX!.GetNoise(wx * wf, wz * wf) * (wa * locF2);
                     float dz2   = _hmWarpZ!.GetNoise(wx * wf, wz * wf) * (wa * locF2);
                     _bkWarpedH![cx * bw + cz] = wg.GetHeight(wx + dx, wz + dz2) - yo;
@@ -3848,29 +3733,26 @@ namespace ProceduralTerrain
                         if (!_parallelBakeActive) _heightCache[hKey] = h;
                     }
                 }
-                // Compute locFac and blend h toward the dominant location's flat height.
-                // TerrainOps at locations level to the world height at the op center; we
-                // approximate that here so our SDF fades to a flat surface rather than the
-                // bumpy unflattened vanilla heightmap.
-                float locFac    = 1f;
+                // Blend h toward the dominant location's center height so our SDF fades to
+                // a flat surface instead of bumpy unflattened vanilla terrain.
+                // TODO: villages spawn multiple locations at slightly different heights whose
+                // terrain ops reconcile with each other. Sampling the nearest location center
+                // may not produce the correct flat height in that case — needs further work.
+                float locFac     = 1f;
                 float effectiveH = h;
                 if (_protectLocations && nearbyLocs.Count > 0)
                 {
                     float minFac = 1f, flatH = h;
                     for (int li = 0; li < nearbyLocs.Count; li++)
                     {
-                        float ldx = worldX - nearbyLocs[li].pos.x;
-                        float ldz = worldZ - nearbyLocs[li].pos.y;
-                        float ld  = Mathf.Sqrt(ldx * ldx + ldz * ldz);
-                        float lr  = Mathf.Max(nearbyLocs[li].extR, LocProtectR);
-                        float lf  = Mathf.Clamp01((ld - lr) / LocFadeR);
+                        float lf = LocFactor(nearbyLocs[li], worldX, worldZ);
                         if (lf < minFac)
                         {
                             minFac = lf;
                             flatH  = wg != null ? wg.GetHeight(nearbyLocs[li].pos.x, nearbyLocs[li].pos.y) : h;
                         }
                     }
-                    locFac    = minFac;
+                    locFac     = minFac;
                     effectiveH = Mathf.Lerp(flatH, h, locFac);
                 }
                 float floorY   = effectiveH - profFlD;
@@ -4083,145 +3965,6 @@ namespace ProceduralTerrain
         }
     }
 
-    // After Voxheim's authority system installs a snapshot or delta, re-establish caves:
-    //   1. Write our SDF into the field (replaces vanilla baseline in the authority data)
-    //   2. Re-apply the authority bricks on top (player edits win over caves)
-    // For delta: removed bricks are already gone (floor-rule default), so our SDF fills them.
-    //            upserted bricks are re-applied after our SDF.
-    static class AuthorityInstallHelper
-    {
-        // Cached reflection for VoxelSnapshotBrick — resolved on first use
-        static PropertyInfo? _brickCoordProp;
-        static PropertyInfo? _brickDensProp;
-
-        static void EnsureBrickProps(object brick)
-        {
-            if (_brickCoordProp != null) return;
-            var t = brick.GetType();
-            _brickCoordProp = t.GetProperty("Coordinate");
-            _brickDensProp  = t.GetProperty("Densities");
-        }
-
-        // Write our cached SDF (or re-run Carve if cache is cold) into field.
-        static void WriteSDF(object field, int ox, int oz)
-        {
-            if (Plugin._get == null || Plugin._set == null) return;
-            string zoneKey = $"{ox},{oz}";
-            if (Plugin._sdfCache.TryGetValue(zoneKey, out var c))
-            {
-                var (extLo, bh, width, cacheData) = c;
-                for (int ci = 0; ci < width; ci++)
-                for (int ri = 0; ri < width; ri++)
-                {
-                    int gx = ox + ci, gz = oz + ri;
-                    for (int cy = 0; cy < bh; cy++)
-                    {
-                        sbyte v = cacheData[(ci * bh + cy) * width + ri];
-                        if (Plugin._get(field, gx, extLo + cy, gz) != v)
-                            Plugin._set(field, gx, extLo + cy, gz, v);
-                    }
-                }
-            }
-            else
-            {
-                Plugin.Log.LogWarning($"[ProceduralTerrain] WriteSDF ({ox},{oz}): no cache — authority snapshot arrived before generator ran.");
-            }
-        }
-
-        // Write authority brick densities back into field so player edits win over our SDF.
-        static void WriteBricks(object field, System.Collections.IEnumerable bricks)
-        {
-            if (Plugin._set == null || Plugin._int3FieldX == null ||
-                Plugin._int3FieldY == null || Plugin._int3FieldZ == null) return;
-            foreach (object brick in bricks)
-            {
-                EnsureBrickProps(brick);
-                object? coord     = _brickCoordProp?.GetValue(brick);
-                var     densities = _brickDensProp?.GetValue(brick) as IReadOnlyList<sbyte>;
-                if (coord == null || densities == null) continue;
-                int bx = (int)Plugin._int3FieldX.GetValue(coord)! << 4;
-                int by = (int)Plugin._int3FieldY!.GetValue(coord)! << 4;
-                int bz = (int)Plugin._int3FieldZ!.GetValue(coord)! << 4;
-                for (int x = 0; x < 16; x++)
-                for (int y = 0; y < 16; y++)
-                for (int z = 0; z < 16; z++)
-                    Plugin._set(field, bx + x, by + y, bz + z, densities[x + 16 * (y + 16 * z)]);
-            }
-        }
-
-        static (object? field, int ox, int oz) GetZoneState(object zoneInstance)
-        {
-            if (Plugin._zoneOriginX == null || Plugin._zoneOriginZ == null ||
-                Plugin._voxelZoneFieldField == null) return (null, 0, 0);
-            int ox = (int)Plugin._zoneOriginX.GetValue(zoneInstance)!;
-            int oz = (int)Plugin._zoneOriginZ.GetValue(zoneInstance)!;
-            return (Plugin._voxelZoneFieldField.GetValue(zoneInstance), ox, oz);
-        }
-
-        internal static void OnSnapshot(object zoneInstance, object? snapshotObj)
-        {
-            var (field, ox, oz) = GetZoneState(zoneInstance);
-            if (field == null) return;
-            WriteSDF(field, ox, oz);
-            // Re-apply authority bricks (player edits) on top of our SDF
-            var bricks = GetBricksFromSnapshot(snapshotObj);
-            if (bricks != null) WriteBricks(field, bricks);
-        }
-
-        internal static void OnDelta(object zoneInstance, object? patchObj)
-        {
-            var (field, ox, oz) = GetZoneState(zoneInstance);
-            if (field == null) return;
-            WriteSDF(field, ox, oz);
-            // Re-apply only the upserted bricks (removed bricks are now floor-default, our SDF already covers them)
-            var upserted = GetProp(patchObj, "UpsertedBricks") as System.Collections.IEnumerable;
-            if (upserted != null) WriteBricks(field, upserted);
-        }
-
-        static System.Collections.IEnumerable? GetBricksFromSnapshot(object? snapshotObj)
-        {
-            var fieldDoc = GetProp(snapshotObj, "Field");
-            return GetProp(fieldDoc, "Bricks") as System.Collections.IEnumerable;
-        }
-
-        static object? GetProp(object? obj, string name) =>
-            obj?.GetType().GetProperty(name)?.GetValue(obj);
-    }
-
-    [HarmonyPatch]
-    static class AuthoritySnapshotPatch
-    {
-        static MethodBase? TargetMethod()
-        {
-            var t = Plugin.FindType("Voxheim.Unity.VoxelZone", "Voxheim");
-            var m = t?.GetMethod("TryInstallAuthoritySnapshot",
-                BindingFlags.NonPublic | BindingFlags.Instance);
-            if (m == null) Plugin.Log.LogWarning("[ProceduralTerrain] TryInstallAuthoritySnapshot not found — caves may disappear in player-edited zones.");
-            return m;
-        }
-        static void Postfix(object __instance, bool __result, object __0)
-        {
-            if (__result) AuthorityInstallHelper.OnSnapshot(__instance, __0);
-        }
-    }
-
-    [HarmonyPatch]
-    static class AuthorityDeltaPatch
-    {
-        static MethodBase? TargetMethod()
-        {
-            var t = Plugin.FindType("Voxheim.Unity.VoxelZone", "Voxheim");
-            var m = t?.GetMethod("TryInstallAuthorityDelta",
-                BindingFlags.NonPublic | BindingFlags.Instance);
-            if (m == null) Plugin.Log.LogWarning("[ProceduralTerrain] TryInstallAuthorityDelta not found — caves may disappear after live terrain edits.");
-            return m;
-        }
-        static void Postfix(object __instance, bool __result, object __1)
-        {
-            if (__result) AuthorityInstallHelper.OnDelta(__instance, __1);
-        }
-    }
-
     // Patches StitchedSource.FallbackDensity (private nested class inside VoxelZone).
     // FallbackDensity is called when a boundary voxel's zone is absent or inactive in s_zones.
     // We return our own SDF so boundary bricks are built correctly on first mesh — no post-hoc repair needed.
@@ -4408,7 +4151,7 @@ public class BakeProgressUI : MonoBehaviour
             if (!Plugin._sdfCache.TryGetValue(zoneKey, out var c))
             {
                 float gridS = Plugin._gridScale != null ? Plugin._gridScale(context.Heights) : 0f;
-                try { Plugin.Carve(null, context.Heights, ox, oz, width, context.InitialScanLo, context.InitialScanHi, gridS); }
+                try { Plugin.Carve(context.Heights, ox, oz, width, context.InitialScanLo, context.InitialScanHi, gridS); }
                 catch (Exception e) { Plugin.Log.LogError($"[PT] Carve ({ox},{oz}): {e.Message}"); return; }
                 if (!Plugin._sdfCache.TryGetValue(zoneKey, out c)) return;
             }
