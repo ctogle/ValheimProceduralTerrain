@@ -86,29 +86,6 @@ namespace ProceduralTerrain
         internal static Func<object, int, int, float>?        _gridGet;
         internal static Func<object, float>?                  _gridScale;
 
-        // AuthorityResolvedIn probe state
-        static readonly Dictionary<(int,int), float> _authResolvedLastLog = new();
-        static FieldInfo? _v2iX, _v2iY;
-
-        static void AuthorityResolvedInProbe(object zoneKey, bool __result)
-        {
-            if (_v2iX == null)
-            {
-                var t = zoneKey.GetType();
-                _v2iX = t.GetField("x") ?? t.GetField("X");
-                _v2iY = t.GetField("y") ?? t.GetField("Y");
-            }
-            if (_v2iX == null || _v2iY == null) return;
-            int zx = (int)_v2iX.GetValue(zoneKey)!;
-            int zy = (int)_v2iY.GetValue(zoneKey)!;
-            if (Math.Abs(zx) > 3 || Math.Abs(zy) > 3) return;
-            var k = (zx, zy);
-            float now = UnityEngine.Time.realtimeSinceStartup;
-            if (_authResolvedLastLog.TryGetValue(k, out float last) && now - last < 5f) return;
-            _authResolvedLastLog[k] = now;
-            Log.LogInfo($"[ProceduralTerrain] AuthorityResolvedIn zone({zx},{zy}) = {__result}");
-        }
-
         // World units per voxel — read lazily, Voxheim initialises it after plugin load.
         static FieldInfo? _scaleField;
         static float? _scale;
@@ -164,7 +141,7 @@ namespace ProceduralTerrain
         const float LocProtectR = 10f; // minimum protection radius when exteriorRadius is unavailable
 
         // ── Zone tracking for hot-reload ──────────────────────────────────────────
-        internal static readonly Dictionary<string, (object field, object grid, int ox, int oz, int w, int yLo, int yHi)>
+        internal static readonly Dictionary<string, (int ox, int oz, int w, int yLo, int yHi)>
             _zoneParams = new();
         internal static readonly Dictionary<string, object> _zoneObjects = new();
         internal static MethodInfo? _enqueueMeshMethod;
@@ -336,18 +313,6 @@ namespace ProceduralTerrain
             var harmony = new Harmony("com.ctogle.procedural_terrain");
             harmony.PatchAll();
 
-            // Manual patch: AuthorityResolvedIn — skipped gracefully if not found.
-            var vzt = FindType("Voxheim.Unity.VoxelZone", "Voxheim");
-            var arm = vzt?.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static)
-                          .FirstOrDefault(m => m.Name == "AuthorityResolvedIn");
-            if (arm != null)
-            {
-                var postfix = new HarmonyMethod(typeof(Plugin).GetMethod(
-                    nameof(AuthorityResolvedInProbe), BindingFlags.NonPublic | BindingFlags.Static));
-                harmony.Patch(arm, postfix: postfix);
-                Log.LogInfo("[ProceduralTerrain] AuthorityResolvedIn probe active.");
-            }
-            else { Log.LogWarning("[ProceduralTerrain] AuthorityResolvedIn not found — probe skipped."); }
             RegisterVoxheimGenerator();
             new Terminal.ConsoleCommand("pt_dump", "pt_dump — dump SDF + biome blend data for the next 9 zones processed to BepInEx/config/voxcaves_dump_*.json", _ =>
             {
@@ -512,6 +477,62 @@ namespace ProceduralTerrain
                 }
             },
             optionsFetcher: () => new List<string> { "server" });
+            new Terminal.ConsoleCommand("pt_loc_probe", "pt_loc_probe [x z] — print nearby locations and location protection factor at world pos (default: player pos)", args =>
+            {
+                float wx, wz;
+                if (args.Length >= 3 && float.TryParse(args[1], out float ax) && float.TryParse(args[2], out float az))
+                { wx = ax; wz = az; }
+                else
+                {
+                    var p = Player.m_localPlayer;
+                    if (p == null) { Console.instance?.Print("[PT] No player."); return; }
+                    wx = p.transform.position.x;
+                    wz = p.transform.position.z;
+                }
+                string header = $"[PT] loc_probe at ({wx:F1}, {wz:F1})  protectLocations={_protectLocations}  cached={_locationsCached}  total={_locationPositions.Count}";
+                Console.instance?.Print(header); Log.LogInfo(header);
+                var nearby = new List<(Vector2 pos, float extR)>();
+                foreach (var loc in _locationPositions)
+                {
+                    float dx = wx - loc.pos.x, dz = wz - loc.pos.y;
+                    float d  = Mathf.Sqrt(dx * dx + dz * dz);
+                    float r  = Mathf.Max(loc.extR, LocProtectR);
+                    if (d < r + LocFadeR + 10f) nearby.Add(loc);
+                }
+                // Find the location with the lowest factor (worst offender) across all locations
+                float worstF = 1f; (Vector2 pos, float extR) worstLoc = default;
+                foreach (var loc in _locationPositions)
+                {
+                    float dx = wx - loc.pos.x, dz = wz - loc.pos.y;
+                    float d  = Mathf.Sqrt(dx * dx + dz * dz);
+                    float r  = Mathf.Max(loc.extR, LocProtectR);
+                    float f  = Mathf.Clamp01((d - r) / LocFadeR);
+                    if (f < worstF) { worstF = f; worstLoc = loc; }
+                }
+                if (nearby.Count == 0 && worstF >= 1f) { Console.instance?.Print("[PT] No locations nearby."); Log.LogInfo("[PT] No locations nearby."); }
+                else
+                {
+                    foreach (var loc in nearby)
+                    {
+                        float dx = wx - loc.pos.x, dz = wz - loc.pos.y;
+                        float d  = Mathf.Sqrt(dx * dx + dz * dz);
+                        float r  = Mathf.Max(loc.extR, LocProtectR);
+                        float f  = Mathf.Clamp01((d - r) / LocFadeR);
+                        string line = $"  loc ({loc.pos.x:F0},{loc.pos.y:F0}) extR={loc.extR:F1} dist={d:F1} factor={f:F3}";
+                        Console.instance?.Print(line); Log.LogInfo(line);
+                    }
+                    if (worstF < 1f)
+                    {
+                        float dx = wx - worstLoc.pos.x, dz = wz - worstLoc.pos.y;
+                        float d  = Mathf.Sqrt(dx * dx + dz * dz);
+                        string worst = $"  worst: loc ({worstLoc.pos.x:F0},{worstLoc.pos.y:F0}) extR={worstLoc.extR:F1} dist={d:F1} factor={worstF:F3}";
+                        Console.instance?.Print(worst); Log.LogInfo(worst);
+                    }
+                }
+                float final = LocationFactor(wx, wz, _locationPositions);
+                string summary = $"[PT] final LocationFactor = {final:F3}";
+                Console.instance?.Print(summary); Log.LogInfo(summary);
+            });
             Log.LogInfo("[ProceduralTerrain] Ready.");
         }
 
@@ -1487,26 +1508,7 @@ namespace ProceduralTerrain
         // ── Dedicated server location RPC ─────────────────────────────────────────
         internal static void SendLocationListToPeer(long peerID)
         {
-            var zs = ZoneSystem.instance;
-            if (zs == null || _locationInstancesField == null) return;
-            var dict = _locationInstancesField.GetValue(zs);
-            if (dict == null) return;
-            var valsProp = dict.GetType().GetProperty("Values");
-            if (valsProp?.GetValue(dict) is not System.Collections.IEnumerable vals) return;
-
-            var entries = new List<(Vector3 pos, float extR)>();
-            FieldInfo? mPos = null; FieldInfo? mLoc = null;
-            foreach (var inst in vals)
-            {
-                if (inst == null) continue;
-                mPos ??= inst.GetType().GetField("m_position");
-                mLoc ??= inst.GetType().GetField("m_location");
-                if (mPos?.GetValue(inst) is not Vector3 pos) continue;
-                float extR = 0f;
-                if (mLoc?.GetValue(inst) is ZoneSystem.ZoneLocation zloc)
-                    extR = zloc.m_exteriorRadius;
-                entries.Add((pos, extR));
-            }
+            var entries = ReadLocationInstances();
             var pkg = new ZPackage();
             pkg.Write(entries.Count);
             foreach (var (pos, extR) in entries) { pkg.Write(pos); pkg.Write(extR); }
@@ -1790,34 +1792,38 @@ namespace ProceduralTerrain
         }
 
         // ── Location cache ────────────────────────────────────────────────────────
-        static void BuildLocationCache()
+        static List<(Vector3 pos, float extR)> ReadLocationInstances()
         {
-            if (_locationsCached) return;
+            var result = new List<(Vector3, float)>();
             var zs = ZoneSystem.instance;
-            if (zs == null || _locationInstancesField == null) return;
-            _locationPositions.Clear();
+            if (zs == null || _locationInstancesField == null) return result;
             var dict = _locationInstancesField.GetValue(zs);
-            if (dict == null) return;
-            var valsProp = dict.GetType().GetProperty("Values");
-            if (valsProp?.GetValue(dict) is not System.Collections.IEnumerable vals) return;
-            FieldInfo? mPos = null; FieldInfo? mLoc = null;
+            if (dict == null) return result;
+            if (dict.GetType().GetProperty("Values")?.GetValue(dict) is not System.Collections.IEnumerable vals) return result;
+            FieldInfo? mPos = null, mLoc = null;
             foreach (var inst in vals)
             {
                 if (inst == null) continue;
                 mPos ??= inst.GetType().GetField("m_position");
                 mLoc ??= inst.GetType().GetField("m_location");
                 if (mPos?.GetValue(inst) is not Vector3 pos) continue;
-                float extR = 0f;
-                if (mLoc?.GetValue(inst) is ZoneSystem.ZoneLocation zloc)
-                    extR = zloc.m_exteriorRadius;
+                float extR = mLoc?.GetValue(inst) is ZoneSystem.ZoneLocation zloc ? zloc.m_exteriorRadius : 0f;
+                result.Add((pos, extR));
+            }
+            return result;
+        }
+
+        static void BuildLocationCache()
+        {
+            if (_locationsCached) return;
+            var entries = ReadLocationInstances();
+            if (entries.Count == 0) return;
+            _locationPositions.Clear();
+            foreach (var (pos, extR) in entries)
                 _locationPositions.Add((new Vector2(pos.x, pos.z), extR));
-            }
-            if (_locationPositions.Count > 0)
-            {
-                _locationsCached  = true;
-                _hotReloadPending = true;
-                Log.LogInfo($"[ProceduralTerrain] Location cache built: {_locationPositions.Count} positions — scheduling recarve.");
-            }
+            _locationsCached  = true;
+            _hotReloadPending = true;
+            Log.LogInfo($"[ProceduralTerrain] Location cache built: {_locationPositions.Count} location(s) loaded.");
         }
 
         const float LocFadeR = 10f; // fade band outside the exterior radius
@@ -1851,41 +1857,6 @@ namespace ProceduralTerrain
         // Combination order: base → max(B) → min(C) → max(A).
         // Mode A (tunnels) runs last so it punches through Mode C solid.
         // field==null means bake-only: run Phase 1+2, stage result, skip Phase 3 voxel writes.
-        // Re-applies PT delta for a single XZ column during Rebase (effectiveH changed for that column).
-        // ci/ri are local zone indices (0..width-1), matching _sdfCache layout.
-        internal static void CarveColumn(object field, int originX, int originZ,
-                                         int ci, int ri, int yLo, int yHi, float gridScale = 0f)
-        {
-            if (_get == null || _set == null) return;
-            string zoneKey = $"{originX},{originZ}";
-            if (!_sdfCache.TryGetValue(zoneKey, out var c)) return;
-            var (extLo, bh, width, cacheData) = c;
-            if (ci < 0 || ci >= width || ri < 0 || ri >= width) return;
-
-            float s;
-            if (gridScale > 0f) s = gridScale;
-            else if (_scale != null && _scale.Value > 0f) s = _scale.Value;
-            else return;
-
-            var wg = WorldGenerator.instance;
-            int gx = originX + ci, gz = originZ + ri;
-            float rawH = wg != null ? wg.GetHeight(gx * s, gz * s) : 0f;
-
-            int loY = Math.Max(yLo, extLo);
-            int hiY = Math.Min(yHi, extLo + bh - 1);
-            for (int gy = loY; gy <= hiY; gy++)
-            {
-                int   cy       = gy - extLo;
-                sbyte rawBase  = ToSDFByte((float)gy * s - rawH, s);
-                sbyte cacheVal = cacheData[(ci * bh + cy) * width + ri];
-                int   delta    = (int)cacheVal - (int)rawBase;
-                if (delta == 0) continue;
-                sbyte existing = _get(field, gx, gy, gz);
-                sbyte final    = (sbyte)Math.Clamp((int)existing + delta, -127, 127);
-                if (final != existing) _set(field, gx, gy, gz, final);
-            }
-        }
-
         internal static void Carve(object? field, object? grid, int ox, int oz, int width, int yLo, int yHi, float gridScale = 0f)
         {
             // Prefer scale from the HeightGrid parameter (available immediately, no timing dependency).
@@ -1918,7 +1889,7 @@ namespace ProceduralTerrain
             float zoneZ = (oz + width * 0.5f) * s;
 
             string zoneKey = $"{ox},{oz}";
-            if (!bakeOnly) _zoneParams[zoneKey] = (field!, grid!, ox, oz, width, yLo, yHi);
+            if (!bakeOnly) _zoneParams[zoneKey] = (ox, oz, width, yLo, yHi);
 
             // If location data isn't ready yet, leave the zone vanilla.
             if (!bakeOnly && !_locationsCached)
@@ -2937,7 +2908,7 @@ namespace ProceduralTerrain
             if (!canRemesh)
                 Log.LogWarning("[ProceduralTerrain] EnqueueMesh/FinishSkinNow unavailable — mesh rebuild skipped.");
 
-            var snapshot = new List<(string key, (object field, object grid, int ox, int oz, int w, int yLo, int yHi) zp)>(_zoneParams.Count);
+            var snapshot = new List<(string key, (int ox, int oz, int w, int yLo, int yHi) zp)>(_zoneParams.Count);
             foreach (var kv in _zoneParams) snapshot.Add((kv.Key, kv.Value));
 
             // ── Pre-pass: reset _yScanHi to baseline so it accurately reflects the new config ──
@@ -3877,8 +3848,32 @@ namespace ProceduralTerrain
                         if (!_parallelBakeActive) _heightCache[hKey] = h;
                     }
                 }
-                float floorY   = h - profFlD;
-                float locFac   = LocationFactor(worldX, worldZ, nearbyLocs);
+                // Compute locFac and blend h toward the dominant location's flat height.
+                // TerrainOps at locations level to the world height at the op center; we
+                // approximate that here so our SDF fades to a flat surface rather than the
+                // bumpy unflattened vanilla heightmap.
+                float locFac    = 1f;
+                float effectiveH = h;
+                if (_protectLocations && nearbyLocs.Count > 0)
+                {
+                    float minFac = 1f, flatH = h;
+                    for (int li = 0; li < nearbyLocs.Count; li++)
+                    {
+                        float ldx = worldX - nearbyLocs[li].pos.x;
+                        float ldz = worldZ - nearbyLocs[li].pos.y;
+                        float ld  = Mathf.Sqrt(ldx * ldx + ldz * ldz);
+                        float lr  = Mathf.Max(nearbyLocs[li].extR, LocProtectR);
+                        float lf  = Mathf.Clamp01((ld - lr) / LocFadeR);
+                        if (lf < minFac)
+                        {
+                            minFac = lf;
+                            flatH  = wg != null ? wg.GetHeight(nearbyLocs[li].pos.x, nearbyLocs[li].pos.y) : h;
+                        }
+                    }
+                    locFac    = minFac;
+                    effectiveH = Mathf.Lerp(flatH, h, locFac);
+                }
+                float floorY   = effectiveH - profFlD;
 
                 float mbWarpedH = 0f, mbR = 0f, mbNA = 0f, mbVS = 0f, mbWF = 0f, mbTwist = 0f;
                 if (anyMbActive)
@@ -3907,7 +3902,7 @@ namespace ProceduralTerrain
                 long _tb = System.Diagnostics.Stopwatch.GetTimestamp();
                 _setupTicks += _tb - _ta;
                 FillYColumn(buf, bw, bh, extLo, s, cx, cz,
-                    h, addH, profMcT, profMcFlare, localAmp, localAmp > 0f && bakeC,
+                    effectiveH, addH, profMcT, profMcFlare, localAmp, localAmp > 0f && bakeC,
                     locFac, floorY, profFlFade,
                     mbWarpedH, mbR, mbNA, mbVS, mbWF, mbTwist,
                     bb00, bb10, bb01, bb11, bfx, bfz,
@@ -3922,7 +3917,7 @@ namespace ProceduralTerrain
     // ── Harmony patches ───────────────────────────────────────────────────────────
 
     [HarmonyPatch]
-    // AUTHOR NOTE FOR VOXHEIM — two API gaps this patch works around:
+    // AUTHOR NOTE FOR VOXHEIM — API gaps this patch works around:
     //
     // 1. Y EXTENT DECLARATION: Our generator writes solid voxels ABOVE the vanilla
     //    heightmap surface (Mode C — overhangs, arches). Voxheim finalizes the zone's
@@ -3935,6 +3930,20 @@ namespace ProceduralTerrain
     //    to re-run the generator on already-active zones so changes are visible immediately
     //    without a full reload. No API for this exists today, so hot-reload only clears
     //    caches — zones pick up the new config on next unload/reload cycle.
+    //
+    // 3. LOCATION TERRAIN FLATTENING: Voxheim patches TerrainOp.Awake to route all
+    //    terrain ops (level/raise/smooth) through the authority system as voxel deltas,
+    //    suppressing direct heightmap modification. This means hmap.m_heights — and
+    //    therefore context.Heights passed to the generator — contains only raw world
+    //    generator heights with no terrain ops applied. Location flattening arrives as
+    //    authority deltas on top of the baseline, after the generator has already run.
+    //    Our location-protection fader suppresses PT's deviation from vanilla heights,
+    //    but the reference surface at a location is unflattened world terrain, not the
+    //    flat floor the location expects. The generator has no way to know where terrain
+    //    ops will be applied, so it cannot account for location footprints upfront.
+    //    A possible solution: expose pending TerrainOperationIntents (or their baked
+    //    result) as part of VoxelBaselineContext so generators can treat those areas
+    //    as authority-owned and leave them alone.
     [HarmonyPatch]
     static class CompletePatch
     {
@@ -4113,10 +4122,9 @@ namespace ProceduralTerrain
                     }
                 }
             }
-            else if (Plugin._zoneParams.TryGetValue(zoneKey, out var zp))
+            else
             {
-                Plugin._zoneParams[zoneKey] = (field, zp.grid, zp.ox, zp.oz, zp.w, zp.yLo, zp.yHi);
-                Plugin.Carve(field, zp.grid, zp.ox, zp.oz, zp.w, zp.yLo, zp.yHi);
+                Plugin.Log.LogWarning($"[ProceduralTerrain] WriteSDF ({ox},{oz}): no cache — authority snapshot arrived before generator ran.");
             }
         }
 
@@ -4396,11 +4404,14 @@ public class BakeProgressUI : MonoBehaviour
 
             builder.SetFloor(context.Floor);
 
-            float gridS = Plugin._gridScale != null ? Plugin._gridScale(context.Heights) : 0f;
-            try { Plugin.Carve(null, context.Heights, ox, oz, width, context.InitialScanLo, context.InitialScanHi, gridS); }
-            catch (Exception e) { Plugin.Log.LogError($"[PT] Carve ({ox},{oz}): {e.Message}"); return; }
-
-            if (!Plugin._sdfCache.TryGetValue($"{ox},{oz}", out var c)) return;
+            string zoneKey = $"{ox},{oz}";
+            if (!Plugin._sdfCache.TryGetValue(zoneKey, out var c))
+            {
+                float gridS = Plugin._gridScale != null ? Plugin._gridScale(context.Heights) : 0f;
+                try { Plugin.Carve(null, context.Heights, ox, oz, width, context.InitialScanLo, context.InitialScanHi, gridS); }
+                catch (Exception e) { Plugin.Log.LogError($"[PT] Carve ({ox},{oz}): {e.Message}"); return; }
+                if (!Plugin._sdfCache.TryGetValue(zoneKey, out c)) return;
+            }
 
             for (int ci = 0; ci < width; ci++)
             for (int ri = 0; ri < width; ri++)
