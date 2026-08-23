@@ -170,19 +170,6 @@ namespace ProceduralTerrain
         internal static FieldInfo?       _zoneOriginX;
         internal static FieldInfo?       _zoneOriginZ;
         internal static FieldInfo?       _yScanHiField;
-        // ── Direct brick write (Option C fast path) ──────────────────────────────
-        // Bypasses per-voxel VoxelField.Set() overhead: ~80 dict lookups per zone
-        // instead of ~327K, plus direct sbyte[] writes into Brick._data.
-        internal static Type?            _brickType;
-        internal static FieldInfo?       _vfBricksField;       // VoxelField._bricks
-        internal static FieldInfo?       _vfMaxBrickYField;    // VoxelField._maxBrickY
-        internal static MethodInfo?      _vfSetFloorMethod;    // VoxelField.SetFloor(SolidFloorRule)
-        internal static FieldInfo?       _brickDataField;      // Brick._data
-        internal static Type?            _solidFloorRuleType;
-        internal static ConstructorInfo? _solidFloorCtor;      // SolidFloorRule(int y,x0,x1,z0,z1)
-        // Compiled delegate: _bricks[Int3(bx,by,bz)] = brick
-        internal static Action<object, int, int, int, object>? _addBrick;
-
         // VoxelBounds fields — used to construct the changed-bounds arg for PokeNeighbors
         internal static readonly Dictionary<string, int> _zoneMaxY  = new();
         internal static readonly Dictionary<string, int> _zoneExtHi = new(); // highest voxel Y ever written; used to size the reset range in hot-reload
@@ -200,11 +187,6 @@ namespace ProceduralTerrain
         [ThreadStatic] static int[]?         _biomeBfsQ;
         [ThreadStatic] static float[]?       _biomeTotW;
         [ThreadStatic] static CaveProfile[]? _blendedProfs;
-
-        // Scratch buffers for floating-island BFS (Phase 1.5). Pre-allocated, resized on demand.
-        [ThreadStatic] static bool[]? _visitedBuf;
-        [ThreadStatic] static bool[]? _percolVisited;
-        [ThreadStatic] static int[]?  _islandQueue;
 
         // wg.GetHeight is a pure function of (worldX, worldZ) for a given world seed.
         // Cache it keyed by integer coarse voxel coords — cleared on world load only.
@@ -242,49 +224,9 @@ namespace ProceduralTerrain
         // Set true during parallel bake to suppress main-thread-only side effects.
         static volatile bool _parallelBakeActive;
 
-        // Reused across Carve() calls to avoid per-zone GC pressure.
-        [ThreadStatic] internal static float[]? _bufA;
-        [ThreadStatic] internal static float[]? _bufB;
         // CR reconstruction temp buffers — main thread only, not [ThreadStatic].
         static float[] _crTemp1 = new float[72 * 150 * 36]; // [bw * nsy * nsz]
         static float[] _crTemp2 = new float[72 * 300 * 36]; // [bw * bh  * nsz]
-
-        [ThreadStatic] internal static float[]? _bufC;
-        // Dedicated buffer for ComputeZoneFaceCache so it never clobbers Carve()'s active buf.
-        [ThreadStatic] internal static float[]? _precomputeBuf;
-
-        [ThreadStatic] internal static float[]? _noiseBuf;
-        [ThreadStatic] internal static float[]? _tunBuf;
-        [ThreadStatic] internal static float[]? _tunBuf2;
-        [ThreadStatic] internal static float[]? _tunWBuf;
-        // 2D coarse bake (same XZ grid as _noiseBuf): [cx4*cw4 + cz4]
-        [ThreadStatic] internal static float[]? _bk2dAddH;
-        [ThreadStatic] internal static float[]? _bk2dLAmp;
-        [ThreadStatic] internal static float[]? _bk2dMcS;
-        [ThreadStatic] internal static float[]? _bk2dMcT;
-        [ThreadStatic] internal static float[]? _bk2dMcFlare;
-        [ThreadStatic] internal static float[]? _bk2dFlD;
-        [ThreadStatic] internal static float[]? _bk2dFlFade;
-        // 2D coarse bake — Mode B shape params
-        [ThreadStatic] internal static float[]? _bk2dMbwf;
-        [ThreadStatic] internal static float[]? _bk2dMbwa;
-        [ThreadStatic] internal static float[]? _bk2dMbr;
-        [ThreadStatic] internal static float[]? _bk2dMbvs;
-        [ThreadStatic] internal static float[]? _bk2dMbna;
-        [ThreadStatic] internal static float[]? _bk2dMbyo;
-        [ThreadStatic] internal static float[]? _bk2dMbtwist;
-        // 2D coarse bake — Mode A shape params
-        [ThreadStatic] internal static float[]? _bk2dMawf;
-        [ThreadStatic] internal static float[]? _bk2dMawa;
-        [ThreadStatic] internal static float[]? _bk2dMaway;
-        [ThreadStatic] internal static float[]? _bk2dMaf;
-        [ThreadStatic] internal static float[]? _bk2dMavs;
-        [ThreadStatic] internal static float[]? _bk2dMaw;
-        [ThreadStatic] internal static float[]? _bk2dMawv;
-        [ThreadStatic] internal static float[]? _bk2dMawvf;
-        [ThreadStatic] internal static float[]? _bk2dMayo;
-        // Full-res (bw×bw) — Mode B warped heightmap (wg.GetHeight after XZ warp)
-        [ThreadStatic] internal static float[]? _bkWarpedH;
 
         static FieldInfo? _locationInstancesField;
 

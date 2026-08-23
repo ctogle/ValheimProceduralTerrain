@@ -12,8 +12,33 @@ using UnityEngine;
 
 namespace ProceduralTerrain
 {
+    // Per-thread scratch buffers for the Carve pipeline. Held in a single [ThreadStatic]
+    // struct so parallel bake workers each get their own set without 26 separate statics.
+    struct CarveBuffers
+    {
+        // Main SDF working buffers (buf = active, tmp/orig for Taubin blur swap)
+        public float[]? bufA, bufB, bufC;
+        // ComputeZoneFaceCache working buffer (kept separate to avoid clobbering Carve's buf)
+        public float[]? precomputeBuf;
+        // BakeSdfSetup coarse 4× noise grids [cw4 × bh × cw4]
+        public float[]? noiseBuf, tunBuf, tunBuf2, tunWBuf;
+        // BakeSdfSetup 2D coarse param grids [cw4 × cw4]
+        public float[]? bk2dAddH, bk2dLAmp;
+        public float[]? bk2dMcS, bk2dMcT, bk2dMcFlare;
+        public float[]? bk2dFlD, bk2dFlFade;
+        public float[]? bk2dMbwf, bk2dMbwa, bk2dMbr, bk2dMbvs, bk2dMbna, bk2dMbyo, bk2dMbtwist;
+        public float[]? bk2dMawf, bk2dMawa, bk2dMaway, bk2dMaf, bk2dMavs, bk2dMaw, bk2dMawv, bk2dMawvf, bk2dMayo;
+        // Full-res Mode B warped heightmap [bw × bw]
+        public float[]? bkWarpedH;
+        // Island/pocket BFS (bool and int queues)
+        public bool[]? visitedBuf, percolVisited;
+        public int[]?  islandQueue;
+    }
+
     public partial class Plugin
     {
+        [ThreadStatic] static CarveBuffers _cb;
+
         // ── Carve pass ────────────────────────────────────────────────────────────
         internal static void Carve(object? grid, int ox, int oz, int width, int yLo, int yHi, float gridScale = 0f)
         {
@@ -92,10 +117,10 @@ namespace ProceduralTerrain
             int bh      = extHi - extLo + 1;
             int bufSize = bw * bh * bw;
 
-            if (_bufA == null || _bufA.Length < bufSize) _bufA = new float[bufSize];
-            if (_bufB == null || _bufB.Length < bufSize) _bufB = new float[bufSize];
-            if (_bufC == null || _bufC.Length < bufSize) _bufC = new float[bufSize];
-            float[] buf = _bufA, tmp = _bufB, orig = _bufC;
+            if (_cb.bufA == null || _cb.bufA.Length < bufSize) _cb.bufA = new float[bufSize];
+            if (_cb.bufB == null || _cb.bufB.Length < bufSize) _cb.bufB = new float[bufSize];
+            if (_cb.bufC == null || _cb.bufC.Length < bufSize) _cb.bufC = new float[bufSize];
+            float[] buf = _cb.bufA, tmp = _cb.bufB, orig = _cb.bufC;
 
             bool bakeC = false, bakeA = false, anyMbActive = false;
             bool fromBake = _bakeData != null && TryPopulateFromBake(ox, oz, bw, bh, extLo, s, buf);
@@ -212,9 +237,9 @@ namespace ProceduralTerrain
                 int terPosX25 = overlap + width - 1;
                 int terNegZ25 = overlap;
                 int terPosZ25 = overlap + width - 1;
-                if (_visitedBuf  == null || _visitedBuf.Length  < islandBufSize) _visitedBuf  = new bool[islandBufSize];
-                if (_islandQueue == null || _islandQueue.Length < islandBufSize) _islandQueue = new int[islandBufSize];
-                Array.Clear(_visitedBuf, 0, islandBufSize);
+                if (_cb.visitedBuf  == null || _cb.visitedBuf.Length  < islandBufSize) _cb.visitedBuf  = new bool[islandBufSize];
+                if (_cb.islandQueue == null || _cb.islandQueue.Length < islandBufSize) _cb.islandQueue = new int[islandBufSize];
+                Array.Clear(_cb.visitedBuf, 0, islandBufSize);
 
                 int qHead = 0, qTail = 0;
 
@@ -222,23 +247,23 @@ namespace ProceduralTerrain
                 for (int cz = 0; cz < bw; cz++)
                 {
                     int idx = cx * stride_x + cz;
-                    if (buf[idx] < 0f && !_visitedBuf[idx])
-                    { _visitedBuf[idx] = true; _islandQueue[qTail++] = idx; }
+                    if (buf[idx] < 0f && !_cb.visitedBuf[idx])
+                    { _cb.visitedBuf[idx] = true; _cb.islandQueue[qTail++] = idx; }
                 }
                 while (qHead < qTail)
                 {
-                    int idx = _islandQueue[qHead++];
+                    int idx = _cb.islandQueue[qHead++];
                     int cx  = idx / stride_x;
                     int rem = idx % stride_x;
                     int cy  = rem / bw;
                     int cz  = rem % bw;
                     int ni;
-                    if (cx > 0)    { ni = idx - stride_x; if (!_visitedBuf[ni] && buf[ni] < 0f) { _visitedBuf[ni] = true; _islandQueue[qTail++] = ni; } }
-                    if (cx < bw-1) { ni = idx + stride_x; if (!_visitedBuf[ni] && buf[ni] < 0f) { _visitedBuf[ni] = true; _islandQueue[qTail++] = ni; } }
-                    if (cy > 0)    { ni = idx - bw;        if (!_visitedBuf[ni] && buf[ni] < 0f) { _visitedBuf[ni] = true; _islandQueue[qTail++] = ni; } }
-                    if (cy < bh-1) { ni = idx + bw;        if (!_visitedBuf[ni] && buf[ni] < 0f) { _visitedBuf[ni] = true; _islandQueue[qTail++] = ni; } }
-                    if (cz > 0)    { ni = idx - 1;         if (!_visitedBuf[ni] && buf[ni] < 0f) { _visitedBuf[ni] = true; _islandQueue[qTail++] = ni; } }
-                    if (cz < bw-1) { ni = idx + 1;         if (!_visitedBuf[ni] && buf[ni] < 0f) { _visitedBuf[ni] = true; _islandQueue[qTail++] = ni; } }
+                    if (cx > 0)    { ni = idx - stride_x; if (!_cb.visitedBuf[ni] && buf[ni] < 0f) { _cb.visitedBuf[ni] = true; _cb.islandQueue[qTail++] = ni; } }
+                    if (cx < bw-1) { ni = idx + stride_x; if (!_cb.visitedBuf[ni] && buf[ni] < 0f) { _cb.visitedBuf[ni] = true; _cb.islandQueue[qTail++] = ni; } }
+                    if (cy > 0)    { ni = idx - bw;        if (!_cb.visitedBuf[ni] && buf[ni] < 0f) { _cb.visitedBuf[ni] = true; _cb.islandQueue[qTail++] = ni; } }
+                    if (cy < bh-1) { ni = idx + bw;        if (!_cb.visitedBuf[ni] && buf[ni] < 0f) { _cb.visitedBuf[ni] = true; _cb.islandQueue[qTail++] = ni; } }
+                    if (cz > 0)    { ni = idx - 1;         if (!_cb.visitedBuf[ni] && buf[ni] < 0f) { _cb.visitedBuf[ni] = true; _cb.islandQueue[qTail++] = ni; } }
+                    if (cz < bw-1) { ni = idx + 1;         if (!_cb.visitedBuf[ni] && buf[ni] < 0f) { _cb.visitedBuf[ni] = true; _cb.islandQueue[qTail++] = ni; } }
                 }
 
                 bool ungNX = false, ungPX = false, ungNZ = false, ungPZ = false;
@@ -247,16 +272,16 @@ namespace ProceduralTerrain
                 {
                     int iNX = terNegX25 * stride_x + cy * bw + cz;
                     int iPX = terPosX25 * stride_x + cy * bw + cz;
-                    if (!ungNX && buf[iNX] < 0f && !_visitedBuf[iNX]) ungNX = true;
-                    if (!ungPX && buf[iPX] < 0f && !_visitedBuf[iPX]) ungPX = true;
+                    if (!ungNX && buf[iNX] < 0f && !_cb.visitedBuf[iNX]) ungNX = true;
+                    if (!ungPX && buf[iPX] < 0f && !_cb.visitedBuf[iPX]) ungPX = true;
                 }
                 for (int cy = 0; cy < bh; cy++)
                 for (int cx = 0; cx < bw; cx++)
                 {
                     int iNZ = cx * stride_x + cy * bw + terNegZ25;
                     int iPZ = cx * stride_x + cy * bw + terPosZ25;
-                    if (!ungNZ && buf[iNZ] < 0f && !_visitedBuf[iNZ]) ungNZ = true;
-                    if (!ungPZ && buf[iPZ] < 0f && !_visitedBuf[iPZ]) ungPZ = true;
+                    if (!ungNZ && buf[iNZ] < 0f && !_cb.visitedBuf[iNZ]) ungNZ = true;
+                    if (!ungPZ && buf[iPZ] < 0f && !_cb.visitedBuf[iPZ]) ungPZ = true;
                 }
 
                 bool needsFullPass = ungNX || ungPX || ungNZ || ungPZ;
@@ -266,15 +291,15 @@ namespace ProceduralTerrain
                     EnsureFixpoint(ox, oz, width, ungNX, ungPX, ungNZ, ungPZ);
                     _tFix = _sw.ElapsedMilliseconds - _fixStart;
 
-                    Array.Clear(_visitedBuf, 0, islandBufSize);
+                    Array.Clear(_cb.visitedBuf, 0, islandBufSize);
                     qHead = 0; qTail = 0;
 
                     for (int cx = 0; cx < bw; cx++)
                     for (int cz = 0; cz < bw; cz++)
                     {
                         int idx = cx * stride_x + cz;
-                        if (buf[idx] < 0f && !_visitedBuf[idx])
-                        { _visitedBuf[idx] = true; _islandQueue[qTail++] = idx; }
+                        if (buf[idx] < 0f && !_cb.visitedBuf[idx])
+                        { _cb.visitedBuf[idx] = true; _cb.islandQueue[qTail++] = idx; }
                     }
 
                     void SeedFromCache(bool[]? nFace, int nExtLo, int nBh, int nBw,
@@ -292,8 +317,8 @@ namespace ProceduralTerrain
                             int bufIdx = xFace
                                 ? ourCx * stride_x + cy * bw + cperp
                                 : cperp * stride_x + cy * bw + ourCx;
-                            if (buf[bufIdx] < 0f && !_visitedBuf[bufIdx])
-                            { _visitedBuf[bufIdx] = true; _islandQueue[qTail++] = bufIdx; }
+                            if (buf[bufIdx] < 0f && !_cb.visitedBuf[bufIdx])
+                            { _cb.visitedBuf[bufIdx] = true; _cb.islandQueue[qTail++] = bufIdx; }
                         }
                     }
 
@@ -308,18 +333,18 @@ namespace ProceduralTerrain
 
                     while (qHead < qTail)
                     {
-                        int idx = _islandQueue[qHead++];
+                        int idx = _cb.islandQueue[qHead++];
                         int cx  = idx / stride_x;
                         int rem = idx % stride_x;
                         int cy  = rem / bw;
                         int cz  = rem % bw;
                         int ni;
-                        if (cx > 0)    { ni = idx - stride_x; if (!_visitedBuf[ni] && buf[ni] < 0f) { _visitedBuf[ni] = true; _islandQueue[qTail++] = ni; } }
-                        if (cx < bw-1) { ni = idx + stride_x; if (!_visitedBuf[ni] && buf[ni] < 0f) { _visitedBuf[ni] = true; _islandQueue[qTail++] = ni; } }
-                        if (cy > 0)    { ni = idx - bw;        if (!_visitedBuf[ni] && buf[ni] < 0f) { _visitedBuf[ni] = true; _islandQueue[qTail++] = ni; } }
-                        if (cy < bh-1) { ni = idx + bw;        if (!_visitedBuf[ni] && buf[ni] < 0f) { _visitedBuf[ni] = true; _islandQueue[qTail++] = ni; } }
-                        if (cz > 0)    { ni = idx - 1;         if (!_visitedBuf[ni] && buf[ni] < 0f) { _visitedBuf[ni] = true; _islandQueue[qTail++] = ni; } }
-                        if (cz < bw-1) { ni = idx + 1;         if (!_visitedBuf[ni] && buf[ni] < 0f) { _visitedBuf[ni] = true; _islandQueue[qTail++] = ni; } }
+                        if (cx > 0)    { ni = idx - stride_x; if (!_cb.visitedBuf[ni] && buf[ni] < 0f) { _cb.visitedBuf[ni] = true; _cb.islandQueue[qTail++] = ni; } }
+                        if (cx < bw-1) { ni = idx + stride_x; if (!_cb.visitedBuf[ni] && buf[ni] < 0f) { _cb.visitedBuf[ni] = true; _cb.islandQueue[qTail++] = ni; } }
+                        if (cy > 0)    { ni = idx - bw;        if (!_cb.visitedBuf[ni] && buf[ni] < 0f) { _cb.visitedBuf[ni] = true; _cb.islandQueue[qTail++] = ni; } }
+                        if (cy < bh-1) { ni = idx + bw;        if (!_cb.visitedBuf[ni] && buf[ni] < 0f) { _cb.visitedBuf[ni] = true; _cb.islandQueue[qTail++] = ni; } }
+                        if (cz > 0)    { ni = idx - 1;         if (!_cb.visitedBuf[ni] && buf[ni] < 0f) { _cb.visitedBuf[ni] = true; _cb.islandQueue[qTail++] = ni; } }
+                        if (cz < bw-1) { ni = idx + 1;         if (!_cb.visitedBuf[ni] && buf[ni] < 0f) { _cb.visitedBuf[ni] = true; _cb.islandQueue[qTail++] = ni; } }
                     }
                 }
 
@@ -338,34 +363,34 @@ namespace ProceduralTerrain
                     for (int cz = 0; cz < bw; cz++)
                     {
                         int fIdx = cy * bw + cz;
-                        ac.negX[fIdx] = _visitedBuf[terNegX25 * stride_x + cy * bw + cz];
-                        ac.posX[fIdx] = _visitedBuf[terPosX25 * stride_x + cy * bw + cz];
+                        ac.negX[fIdx] = _cb.visitedBuf[terNegX25 * stride_x + cy * bw + cz];
+                        ac.posX[fIdx] = _cb.visitedBuf[terPosX25 * stride_x + cy * bw + cz];
                     }
                     for (int cy = 0; cy < bh; cy++)
                     for (int cx = 0; cx < bw; cx++)
                     {
                         int fIdx = cy * bw + cx;
-                        ac.negZ[fIdx] = _visitedBuf[cx * stride_x + cy * bw + terNegZ25];
-                        ac.posZ[fIdx] = _visitedBuf[cx * stride_x + cy * bw + terPosZ25];
+                        ac.negZ[fIdx] = _cb.visitedBuf[cx * stride_x + cy * bw + terNegZ25];
+                        ac.posZ[fIdx] = _cb.visitedBuf[cx * stride_x + cy * bw + terPosZ25];
                     }
                     _zoneFaceCache[(ox, oz)] = ac;
                 }
 
                 int removed = 0;
                 for (int i = 0; i < islandBufSize; i++)
-                    if (!_visitedBuf[i] && buf[i] < 0f) { buf[i] = s; removed++; }
+                    if (!_cb.visitedBuf[i] && buf[i] < 0f) { buf[i] = s; removed++; }
 
                 Log.LogDebug($"[ProceduralTerrain] island-fill zone ({ox},{oz}): pre={!needsFullPass} seeds={qTail} removed={removed}");
             }
 
             if (_pocketRemoval) {
-                Array.Clear(_visitedBuf!, 0, bw * bh * bw);
+                Array.Clear(_cb.visitedBuf!, 0, bw * bh * bw);
                 int stride_x = bh * bw;
                 int qHead = 0, qTail = 0;
 
                 void TryEnqueueAir(int i)
                 {
-                    if (!_visitedBuf![i] && buf[i] >= 0f) { _visitedBuf[i] = true; _islandQueue![qTail++] = i; }
+                    if (!_cb.visitedBuf![i] && buf[i] >= 0f) { _cb.visitedBuf[i] = true; _cb.islandQueue![qTail++] = i; }
                 }
 
                 for (int cx = 0; cx < bw; cx++)
@@ -387,24 +412,24 @@ namespace ProceduralTerrain
 
                 while (qHead < qTail)
                 {
-                    int idx = _islandQueue![qHead++];
+                    int idx = _cb.islandQueue![qHead++];
                     int cx  = idx / stride_x;
                     int rem = idx % stride_x;
                     int cy  = rem / bw;
                     int cz  = rem % bw;
                     int ni;
-                    if (cx > 0)    { ni = idx - stride_x; if (!_visitedBuf![ni] && buf[ni] >= 0f) { _visitedBuf[ni] = true; _islandQueue[qTail++] = ni; } }
-                    if (cx < bw-1) { ni = idx + stride_x; if (!_visitedBuf![ni] && buf[ni] >= 0f) { _visitedBuf[ni] = true; _islandQueue[qTail++] = ni; } }
-                    if (cy > 0)    { ni = idx - bw;        if (!_visitedBuf![ni] && buf[ni] >= 0f) { _visitedBuf[ni] = true; _islandQueue[qTail++] = ni; } }
-                    if (cy < bh-1) { ni = idx + bw;        if (!_visitedBuf![ni] && buf[ni] >= 0f) { _visitedBuf[ni] = true; _islandQueue[qTail++] = ni; } }
-                    if (cz > 0)    { ni = idx - 1;         if (!_visitedBuf![ni] && buf[ni] >= 0f) { _visitedBuf[ni] = true; _islandQueue[qTail++] = ni; } }
-                    if (cz < bw-1) { ni = idx + 1;         if (!_visitedBuf![ni] && buf[ni] >= 0f) { _visitedBuf[ni] = true; _islandQueue[qTail++] = ni; } }
+                    if (cx > 0)    { ni = idx - stride_x; if (!_cb.visitedBuf![ni] && buf[ni] >= 0f) { _cb.visitedBuf[ni] = true; _cb.islandQueue[qTail++] = ni; } }
+                    if (cx < bw-1) { ni = idx + stride_x; if (!_cb.visitedBuf![ni] && buf[ni] >= 0f) { _cb.visitedBuf[ni] = true; _cb.islandQueue[qTail++] = ni; } }
+                    if (cy > 0)    { ni = idx - bw;        if (!_cb.visitedBuf![ni] && buf[ni] >= 0f) { _cb.visitedBuf[ni] = true; _cb.islandQueue[qTail++] = ni; } }
+                    if (cy < bh-1) { ni = idx + bw;        if (!_cb.visitedBuf![ni] && buf[ni] >= 0f) { _cb.visitedBuf[ni] = true; _cb.islandQueue[qTail++] = ni; } }
+                    if (cz > 0)    { ni = idx - 1;         if (!_cb.visitedBuf![ni] && buf[ni] >= 0f) { _cb.visitedBuf[ni] = true; _cb.islandQueue[qTail++] = ni; } }
+                    if (cz < bw-1) { ni = idx + 1;         if (!_cb.visitedBuf![ni] && buf[ni] >= 0f) { _cb.visitedBuf[ni] = true; _cb.islandQueue[qTail++] = ni; } }
                 }
 
                 int filled = 0;
                 int total  = bw * bh * bw;
                 for (int i = 0; i < total; i++)
-                    if (!_visitedBuf![i] && buf[i] >= 0f) { buf[i] = -s; filled++; }
+                    if (!_cb.visitedBuf![i] && buf[i] >= 0f) { buf[i] = -s; filled++; }
 
                 Log.LogDebug($"[ProceduralTerrain] pocket-fill zone ({ox},{oz}): filled={filled}");
             }
@@ -506,62 +531,6 @@ namespace ProceduralTerrain
             Log.LogDebug($"[ProceduralTerrain] zone ({ox},{oz}) biome={_centerBiome} bakeC={bakeC} bakeA={bakeA} voxels={bw}x{bh}x{bw} fixHops={_lastFixpointHops} Ph0={_t0}ms Ph1={_t1-_t0}ms blur={_t1b-_t1}ms Ph2={_t2-_t1b}ms fix={_tFix}ms Ph3={_t3-_t2}ms total={_t3}ms");
         }
 
-        // ── Direct brick write ────────────────────────────────────────────────────
-        static bool WriteCacheDataToBricks(object field, int ox, int oz, int width,
-                                           int extLo, int bh, sbyte[] cacheData, bool setFloor)
-        {
-            if (_addBrick == null || _brickDataField == null || _brickType == null ||
-                _vfMaxBrickYField == null) return false;
-
-            if (setFloor)
-            {
-                if (_solidFloorCtor == null || _vfSetFloorMethod == null) return false;
-                var floorRule = _solidFloorCtor.Invoke(
-                    new object[] { extLo - 1, ox, ox + width - 1, oz, oz + width - 1 });
-                _vfSetFloorMethod.Invoke(field, new object[] { floorRule });
-            }
-
-            int maxBrickY = (int)_vfMaxBrickYField.GetValue(field)!;
-
-            int brickXMin = ox >> 4,          brickXMax = (ox + width - 1) >> 4;
-            int brickYMin = extLo >> 4,       brickYMax = (extLo + bh - 1) >> 4;
-            int brickZMin = oz >> 4,          brickZMax = (oz + width - 1) >> 4;
-
-            for (int brickX = brickXMin; brickX <= brickXMax; brickX++)
-            for (int brickY = brickYMin; brickY <= brickYMax; brickY++)
-            for (int brickZ = brickZMin; brickZ <= brickZMax; brickZ++)
-            {
-                int vx0 = brickX << 4, vy0 = brickY << 4, vz0 = brickZ << 4;
-
-                sbyte fill = (vy0 + 15 < extLo) ? (sbyte)-127 : (sbyte)127;
-                var brick  = Activator.CreateInstance(_brickType, fill)!;
-                var data   = new sbyte[4096];
-                if (fill != 0) { for (int i = 0; i < 4096; i++) data[i] = fill; }
-
-                for (int lx = 0; lx < 16; lx++)
-                for (int lz = 0; lz < 16; lz++)
-                {
-                    int gx = vx0 + lx, gz = vz0 + lz;
-                    if (gx < ox || gx >= ox + width || gz < oz || gz >= oz + width) continue;
-                    int ci = gx - ox, ri = gz - oz;
-                    for (int ly = 0; ly < 16; ly++)
-                    {
-                        int gy = vy0 + ly;
-                        if (gy < extLo || gy >= extLo + bh) continue;
-                        int cy = gy - extLo;
-                        data[lx + 16 * (ly + 16 * lz)] = cacheData[(ci * bh + cy) * width + ri];
-                    }
-                }
-
-                _brickDataField.SetValue(brick, data);
-                _addBrick(field, brickX, brickY, brickZ, brick);
-                if (brickY > maxBrickY) maxBrickY = brickY;
-            }
-
-            _vfMaxBrickYField.SetValue(field, maxBrickY);
-            return true;
-        }
-
         // ── Zone data dump ───────────────────────────────────────────────────────
         static void DumpZoneData(int ox, int oz, int overlap, float s, WorldGenerator wg,
                                   int cw4, int bw, int bh, int extLo, float[] buf)
@@ -608,8 +577,8 @@ namespace ProceduralTerrain
                     float mcAmp = (_blendedProfs != null && idx < _blendedProfs.Length) ? _blendedProfs[idx].modeC_noiseAmp : -1f;
                     float mbR2  = (_blendedProfs != null && idx < _blendedProfs.Length) ? _blendedProfs[idx].modeB_radius   : -1f;
                     float blur  = (_blendedProfs != null && idx < _blendedProfs.Length) ? _blendedProfs[idx].blur_passes    : -1f;
-                    float addH  = (_bk2dAddH    != null && idx < _bk2dAddH.Length)     ? _bk2dAddH[idx]    : -1f;
-                    float bk2dS = (_bk2dMcS     != null && idx < _bk2dMcS.Length)      ? _bk2dMcS[idx]     : -1f;
+                    float addH  = (_cb.bk2dAddH    != null && idx < _cb.bk2dAddH.Length)     ? _cb.bk2dAddH[idx]    : -1f;
+                    float bk2dS = (_cb.bk2dMcS     != null && idx < _cb.bk2dMcS.Length)      ? _cb.bk2dMcS[idx]     : -1f;
                     sb.AppendLine($"    {{\"cx4\":{cx4},\"cz4\":{cz4},\"wx\":{wx:F1},\"wz\":{wz:F1},\"biome\":{biomeRaw},\"totW\":{totW:F3},\"mcAmp\":{mcAmp:F2},\"mbR\":{mbR2:F2},\"blur\":{blur:F2},\"addH\":{addH:F1},\"bk2dMcAmp\":{bk2dS:F3}}}{(last ? "" : ",")}");
                 }
                 sb.AppendLine("  ],");
@@ -756,8 +725,8 @@ namespace ProceduralTerrain
             int bhZ    = extHi - extLo + 1;
             int bufSz  = bwZ * bhZ * bwZ;
 
-            if (_precomputeBuf == null || _precomputeBuf.Length < bufSz) _precomputeBuf = new float[bufSz];
-            float[] buf = _precomputeBuf;
+            if (_cb.precomputeBuf == null || _cb.precomputeBuf.Length < bufSz) _cb.precomputeBuf = new float[bufSz];
+            float[] buf = _cb.precomputeBuf;
 
             InitNoise();
 
@@ -778,17 +747,17 @@ namespace ProceduralTerrain
 
             int stX   = bhZ * bwZ;
             int bufSz2 = bwZ * bhZ * bwZ;
-            if (_visitedBuf  == null || _visitedBuf.Length  < bufSz2) _visitedBuf  = new bool[bufSz2];
-            if (_islandQueue == null || _islandQueue.Length < bufSz2) _islandQueue = new int[bufSz2];
-            Array.Clear(_visitedBuf, 0, bufSz2);
+            if (_cb.visitedBuf  == null || _cb.visitedBuf.Length  < bufSz2) _cb.visitedBuf  = new bool[bufSz2];
+            if (_cb.islandQueue == null || _cb.islandQueue.Length < bufSz2) _cb.islandQueue = new int[bufSz2];
+            Array.Clear(_cb.visitedBuf, 0, bufSz2);
             int qHead = 0, qTail = 0;
 
             for (int cx = 0; cx < bwZ; cx++)
             for (int cz = 0; cz < bwZ; cz++)
             {
                 int idx = cx * stX + cz;
-                if (buf[idx] < 0f && !_visitedBuf[idx])
-                { _visitedBuf[idx] = true; _islandQueue[qTail++] = idx; }
+                if (buf[idx] < 0f && !_cb.visitedBuf[idx])
+                { _cb.visitedBuf[idx] = true; _cb.islandQueue[qTail++] = idx; }
             }
 
             void SeedFromNeighborFace(bool[]? nFace, int nExtLo, int nBh, int nBw,
@@ -807,8 +776,8 @@ namespace ProceduralTerrain
                     int bufIdx = iterateCz
                         ? ourCx * stX + cy * bwZ + cperp
                         : cperp * stX + cy * bwZ + ourCx;
-                    if (buf[bufIdx] < 0f && !_visitedBuf[bufIdx])
-                    { _visitedBuf[bufIdx] = true; _islandQueue[qTail++] = bufIdx; }
+                    if (buf[bufIdx] < 0f && !_cb.visitedBuf[bufIdx])
+                    { _cb.visitedBuf[bufIdx] = true; _cb.islandQueue[qTail++] = bufIdx; }
                 }
             }
 
@@ -828,18 +797,18 @@ namespace ProceduralTerrain
 
             while (qHead < qTail)
             {
-                int idx = _islandQueue[qHead++];
+                int idx = _cb.islandQueue[qHead++];
                 int cx  = idx / stX;
                 int rem = idx % stX;
                 int cy  = rem / bwZ;
                 int cz  = rem % bwZ;
                 int ni;
-                if (cx > 0)     { ni = idx - stX;  if (!_visitedBuf[ni] && buf[ni] < 0f) { _visitedBuf[ni] = true; _islandQueue[qTail++] = ni; } }
-                if (cx < bwZ-1) { ni = idx + stX;  if (!_visitedBuf[ni] && buf[ni] < 0f) { _visitedBuf[ni] = true; _islandQueue[qTail++] = ni; } }
-                if (cy > 0)     { ni = idx - bwZ;  if (!_visitedBuf[ni] && buf[ni] < 0f) { _visitedBuf[ni] = true; _islandQueue[qTail++] = ni; } }
-                if (cy < bhZ-1) { ni = idx + bwZ;  if (!_visitedBuf[ni] && buf[ni] < 0f) { _visitedBuf[ni] = true; _islandQueue[qTail++] = ni; } }
-                if (cz > 0)     { ni = idx - 1;    if (!_visitedBuf[ni] && buf[ni] < 0f) { _visitedBuf[ni] = true; _islandQueue[qTail++] = ni; } }
-                if (cz < bwZ-1) { ni = idx + 1;    if (!_visitedBuf[ni] && buf[ni] < 0f) { _visitedBuf[ni] = true; _islandQueue[qTail++] = ni; } }
+                if (cx > 0)     { ni = idx - stX;  if (!_cb.visitedBuf[ni] && buf[ni] < 0f) { _cb.visitedBuf[ni] = true; _cb.islandQueue[qTail++] = ni; } }
+                if (cx < bwZ-1) { ni = idx + stX;  if (!_cb.visitedBuf[ni] && buf[ni] < 0f) { _cb.visitedBuf[ni] = true; _cb.islandQueue[qTail++] = ni; } }
+                if (cy > 0)     { ni = idx - bwZ;  if (!_cb.visitedBuf[ni] && buf[ni] < 0f) { _cb.visitedBuf[ni] = true; _cb.islandQueue[qTail++] = ni; } }
+                if (cy < bhZ-1) { ni = idx + bwZ;  if (!_cb.visitedBuf[ni] && buf[ni] < 0f) { _cb.visitedBuf[ni] = true; _cb.islandQueue[qTail++] = ni; } }
+                if (cz > 0)     { ni = idx - 1;    if (!_cb.visitedBuf[ni] && buf[ni] < 0f) { _cb.visitedBuf[ni] = true; _cb.islandQueue[qTail++] = ni; } }
+                if (cz < bwZ-1) { ni = idx + 1;    if (!_cb.visitedBuf[ni] && buf[ni] < 0f) { _cb.visitedBuf[ni] = true; _cb.islandQueue[qTail++] = ni; } }
             }
 
             int faceSz = bhZ * bwZ;
@@ -854,23 +823,23 @@ namespace ProceduralTerrain
             for (int cz = 0; cz < bwZ; cz++)
             {
                 int fIdx = cy * bwZ + cz;
-                cache.negX[fIdx] = _visitedBuf[terNegX * stX + cy * bwZ + cz];
-                cache.posX[fIdx] = _visitedBuf[terPosX * stX + cy * bwZ + cz];
+                cache.negX[fIdx] = _cb.visitedBuf[terNegX * stX + cy * bwZ + cz];
+                cache.posX[fIdx] = _cb.visitedBuf[terPosX * stX + cy * bwZ + cz];
             }
             for (int cy = 0; cy < bhZ; cy++)
             for (int cx = 0; cx < bwZ; cx++)
             {
                 int fIdx = cy * bwZ + cx;
-                cache.negZ[fIdx] = _visitedBuf[cx * stX + cy * bwZ + terNegZ];
-                cache.posZ[fIdx] = _visitedBuf[cx * stX + cy * bwZ + terPosZ];
+                cache.negZ[fIdx] = _cb.visitedBuf[cx * stX + cy * bwZ + terNegZ];
+                cache.posZ[fIdx] = _cb.visitedBuf[cx * stX + cy * bwZ + terPosZ];
             }
 
-            Array.Clear(_visitedBuf, 0, bufSz2);
+            Array.Clear(_cb.visitedBuf, 0, bufSz2);
             qHead = 0; qTail = 0;
 
             void TryEnqueueAirSeed(int idx) {
-                if (!_visitedBuf[idx] && buf[idx] >= 0f)
-                { _visitedBuf[idx] = true; _islandQueue![qTail++] = idx; }
+                if (!_cb.visitedBuf[idx] && buf[idx] >= 0f)
+                { _cb.visitedBuf[idx] = true; _cb.islandQueue![qTail++] = idx; }
             }
 
             for (int cx = 0; cx < bwZ; cx++)
@@ -891,41 +860,41 @@ namespace ProceduralTerrain
 
             while (qHead < qTail)
             {
-                int idx = _islandQueue[qHead++];
+                int idx = _cb.islandQueue[qHead++];
                 int cx  = idx / stX;
                 int rem = idx % stX;
                 int cy  = rem / bwZ;
                 int cz  = rem % bwZ;
                 int ni;
-                if (cx > 0)     { ni = idx - stX;  if (!_visitedBuf[ni] && buf[ni] >= 0f) { _visitedBuf[ni] = true; _islandQueue[qTail++] = ni; } }
-                if (cx < bwZ-1) { ni = idx + stX;  if (!_visitedBuf[ni] && buf[ni] >= 0f) { _visitedBuf[ni] = true; _islandQueue[qTail++] = ni; } }
-                if (cy > 0)     { ni = idx - bwZ;  if (!_visitedBuf[ni] && buf[ni] >= 0f) { _visitedBuf[ni] = true; _islandQueue[qTail++] = ni; } }
-                if (cy < bhZ-1) { ni = idx + bwZ;  if (!_visitedBuf[ni] && buf[ni] >= 0f) { _visitedBuf[ni] = true; _islandQueue[qTail++] = ni; } }
-                if (cz > 0)     { ni = idx - 1;    if (!_visitedBuf[ni] && buf[ni] >= 0f) { _visitedBuf[ni] = true; _islandQueue[qTail++] = ni; } }
-                if (cz < bwZ-1) { ni = idx + 1;    if (!_visitedBuf[ni] && buf[ni] >= 0f) { _visitedBuf[ni] = true; _islandQueue[qTail++] = ni; } }
+                if (cx > 0)     { ni = idx - stX;  if (!_cb.visitedBuf[ni] && buf[ni] >= 0f) { _cb.visitedBuf[ni] = true; _cb.islandQueue[qTail++] = ni; } }
+                if (cx < bwZ-1) { ni = idx + stX;  if (!_cb.visitedBuf[ni] && buf[ni] >= 0f) { _cb.visitedBuf[ni] = true; _cb.islandQueue[qTail++] = ni; } }
+                if (cy > 0)     { ni = idx - bwZ;  if (!_cb.visitedBuf[ni] && buf[ni] >= 0f) { _cb.visitedBuf[ni] = true; _cb.islandQueue[qTail++] = ni; } }
+                if (cy < bhZ-1) { ni = idx + bwZ;  if (!_cb.visitedBuf[ni] && buf[ni] >= 0f) { _cb.visitedBuf[ni] = true; _cb.islandQueue[qTail++] = ni; } }
+                if (cz > 0)     { ni = idx - 1;    if (!_cb.visitedBuf[ni] && buf[ni] >= 0f) { _cb.visitedBuf[ni] = true; _cb.islandQueue[qTail++] = ni; } }
+                if (cz < bwZ-1) { ni = idx + 1;    if (!_cb.visitedBuf[ni] && buf[ni] >= 0f) { _cb.visitedBuf[ni] = true; _cb.islandQueue[qTail++] = ni; } }
             }
 
             for (int cy = 0; cy < bhZ; cy++)
             for (int cz = 0; cz < bwZ; cz++)
             {
                 int fIdx = cy * bwZ + cz;
-                cache.negXAir[fIdx] = _visitedBuf[terNegX * stX + cy * bwZ + cz];
-                cache.posXAir[fIdx] = _visitedBuf[terPosX * stX + cy * bwZ + cz];
+                cache.negXAir[fIdx] = _cb.visitedBuf[terNegX * stX + cy * bwZ + cz];
+                cache.posXAir[fIdx] = _cb.visitedBuf[terPosX * stX + cy * bwZ + cz];
             }
             for (int cy = 0; cy < bhZ; cy++)
             for (int cx = 0; cx < bwZ; cx++)
             {
                 int fIdx = cy * bwZ + cx;
-                cache.negZAir[fIdx] = _visitedBuf[cx * stX + cy * bwZ + terNegZ];
-                cache.posZAir[fIdx] = _visitedBuf[cx * stX + cy * bwZ + terPosZ];
+                cache.negZAir[fIdx] = _cb.visitedBuf[cx * stX + cy * bwZ + terNegZ];
+                cache.posZAir[fIdx] = _cb.visitedBuf[cx * stX + cy * bwZ + terPosZ];
             }
 
             var percol = new bool[4, 4];
-            if (_percolVisited == null || _percolVisited.Length < bufSz2) _percolVisited = new bool[bufSz2];
+            if (_cb.percolVisited == null || _cb.percolVisited.Length < bufSz2) _cb.percolVisited = new bool[bufSz2];
 
             for (int fromFace = 0; fromFace < 4; fromFace++)
             {
-                Array.Clear(_percolVisited, 0, bufSz2);
+                Array.Clear(_cb.percolVisited, 0, bufSz2);
                 qHead = 0; qTail = 0;
                 bool hitNX = false, hitPX = false, hitNZ = false, hitPZ = false;
                 int facesLeft = 3;
@@ -937,8 +906,8 @@ namespace ProceduralTerrain
                     for (int cz = terNegZ; cz <= terPosZ; cz++)
                     {
                         int idx = fCx * stX + cy * bwZ + cz;
-                        if (buf[idx] < 0f && !_visitedBuf[idx] && !_percolVisited[idx])
-                        { _percolVisited[idx] = true; _islandQueue![qTail++] = idx; }
+                        if (buf[idx] < 0f && !_cb.visitedBuf[idx] && !_cb.percolVisited[idx])
+                        { _cb.percolVisited[idx] = true; _cb.islandQueue![qTail++] = idx; }
                     }
                 }
                 else
@@ -948,14 +917,14 @@ namespace ProceduralTerrain
                     for (int cx = terNegX; cx <= terPosX; cx++)
                     {
                         int idx = cx * stX + cy * bwZ + fCz;
-                        if (buf[idx] < 0f && !_visitedBuf[idx] && !_percolVisited[idx])
-                        { _percolVisited[idx] = true; _islandQueue![qTail++] = idx; }
+                        if (buf[idx] < 0f && !_cb.visitedBuf[idx] && !_cb.percolVisited[idx])
+                        { _cb.percolVisited[idx] = true; _cb.islandQueue![qTail++] = idx; }
                     }
                 }
 
                 while (qHead < qTail && facesLeft > 0)
                 {
-                    int idx = _islandQueue![qHead++];
+                    int idx = _cb.islandQueue![qHead++];
                     int pcx = idx / stX;
                     int rem = idx % stX;
                     int pcy = rem / bwZ;
@@ -967,12 +936,12 @@ namespace ProceduralTerrain
                     if (pcz == terPosZ && fromFace != 3 && !hitPZ) { hitPZ = true; facesLeft--; }
 
                     int ni;
-                    if (pcx > terNegX) { ni = idx - stX; if (!_percolVisited[ni] && buf[ni] < 0f && !_visitedBuf[ni]) { _percolVisited[ni] = true; _islandQueue[qTail++] = ni; } }
-                    if (pcx < terPosX) { ni = idx + stX; if (!_percolVisited[ni] && buf[ni] < 0f && !_visitedBuf[ni]) { _percolVisited[ni] = true; _islandQueue[qTail++] = ni; } }
-                    if (pcy > 0)       { ni = idx - bwZ; if (!_percolVisited[ni] && buf[ni] < 0f && !_visitedBuf[ni]) { _percolVisited[ni] = true; _islandQueue[qTail++] = ni; } }
-                    if (pcy < bhZ-1)   { ni = idx + bwZ; if (!_percolVisited[ni] && buf[ni] < 0f && !_visitedBuf[ni]) { _percolVisited[ni] = true; _islandQueue[qTail++] = ni; } }
-                    if (pcz > terNegZ) { ni = idx - 1;   if (!_percolVisited[ni] && buf[ni] < 0f && !_visitedBuf[ni]) { _percolVisited[ni] = true; _islandQueue[qTail++] = ni; } }
-                    if (pcz < terPosZ) { ni = idx + 1;   if (!_percolVisited[ni] && buf[ni] < 0f && !_visitedBuf[ni]) { _percolVisited[ni] = true; _islandQueue[qTail++] = ni; } }
+                    if (pcx > terNegX) { ni = idx - stX; if (!_cb.percolVisited[ni] && buf[ni] < 0f && !_cb.visitedBuf[ni]) { _cb.percolVisited[ni] = true; _cb.islandQueue[qTail++] = ni; } }
+                    if (pcx < terPosX) { ni = idx + stX; if (!_cb.percolVisited[ni] && buf[ni] < 0f && !_cb.visitedBuf[ni]) { _cb.percolVisited[ni] = true; _cb.islandQueue[qTail++] = ni; } }
+                    if (pcy > 0)       { ni = idx - bwZ; if (!_cb.percolVisited[ni] && buf[ni] < 0f && !_cb.visitedBuf[ni]) { _cb.percolVisited[ni] = true; _cb.islandQueue[qTail++] = ni; } }
+                    if (pcy < bhZ-1)   { ni = idx + bwZ; if (!_cb.percolVisited[ni] && buf[ni] < 0f && !_cb.visitedBuf[ni]) { _cb.percolVisited[ni] = true; _cb.islandQueue[qTail++] = ni; } }
+                    if (pcz > terNegZ) { ni = idx - 1;   if (!_cb.percolVisited[ni] && buf[ni] < 0f && !_cb.visitedBuf[ni]) { _cb.percolVisited[ni] = true; _cb.islandQueue[qTail++] = ni; } }
+                    if (pcz < terPosZ) { ni = idx + 1;   if (!_cb.percolVisited[ni] && buf[ni] < 0f && !_cb.visitedBuf[ni]) { _cb.percolVisited[ni] = true; _cb.islandQueue[qTail++] = ni; } }
                 }
 
                 percol[fromFace, 0] = hitNX;
@@ -1018,8 +987,8 @@ namespace ProceduralTerrain
                     float relY = worldY - addH;
                     float n;
                     {
-                        float n0 = _noiseBuf![bb00+cy] + (_noiseBuf[bb10+cy] - _noiseBuf![bb00+cy]) * bfx;
-                        float n1 = _noiseBuf![bb01+cy] + (_noiseBuf[bb11+cy] - _noiseBuf![bb01+cy]) * bfx;
+                        float n0 = _cb.noiseBuf![bb00+cy] + (_cb.noiseBuf[bb10+cy] - _cb.noiseBuf![bb00+cy]) * bfx;
+                        float n1 = _cb.noiseBuf![bb01+cy] + (_cb.noiseBuf[bb11+cy] - _cb.noiseBuf![bb01+cy]) * bfx;
                         n = n0 + (n1-n0) * bfz;
                     }
                     float _ft = Mathf.Clamp01(relY / localAmp);
@@ -1033,14 +1002,14 @@ namespace ProceduralTerrain
                     float na, nb, wn;
                     if (bakeA)
                     {
-                        float t0 = _tunBuf![bb00+cy]  + (_tunBuf[bb10+cy]  - _tunBuf[bb00+cy])  * bfx;
-                        float t1 = _tunBuf![bb01+cy]  + (_tunBuf[bb11+cy]  - _tunBuf[bb01+cy])  * bfx;
+                        float t0 = _cb.tunBuf![bb00+cy]  + (_cb.tunBuf[bb10+cy]  - _cb.tunBuf[bb00+cy])  * bfx;
+                        float t1 = _cb.tunBuf![bb01+cy]  + (_cb.tunBuf[bb11+cy]  - _cb.tunBuf[bb01+cy])  * bfx;
                         na = t0 + (t1 - t0) * bfz;
-                        float t0b = _tunBuf2![bb00+cy] + (_tunBuf2[bb10+cy] - _tunBuf2[bb00+cy]) * bfx;
-                        float t1b = _tunBuf2![bb01+cy] + (_tunBuf2[bb11+cy] - _tunBuf2[bb01+cy]) * bfx;
+                        float t0b = _cb.tunBuf2![bb00+cy] + (_cb.tunBuf2[bb10+cy] - _cb.tunBuf2[bb00+cy]) * bfx;
+                        float t1b = _cb.tunBuf2![bb01+cy] + (_cb.tunBuf2[bb11+cy] - _cb.tunBuf2[bb01+cy]) * bfx;
                         nb = t0b + (t1b - t0b) * bfz;
-                        float w0 = _tunWBuf![bb00+cy] + (_tunWBuf[bb10+cy] - _tunWBuf[bb00+cy]) * bfx;
-                        float w1 = _tunWBuf![bb01+cy] + (_tunWBuf[bb11+cy] - _tunWBuf[bb01+cy]) * bfx;
+                        float w0 = _cb.tunWBuf![bb00+cy] + (_cb.tunWBuf[bb10+cy] - _cb.tunWBuf[bb00+cy]) * bfx;
+                        float w1 = _cb.tunWBuf![bb01+cy] + (_cb.tunWBuf[bb11+cy] - _cb.tunWBuf[bb01+cy]) * bfx;
                         wn = w0 + (w1 - w0) * bfz;
                     }
                     else
@@ -1098,8 +1067,8 @@ namespace ProceduralTerrain
                     float relY = worldY - addH;
                     float n;
                     {
-                        float n0 = _noiseBuf![bb00+cy] + (_noiseBuf[bb10+cy] - _noiseBuf![bb00+cy]) * bfx;
-                        float n1 = _noiseBuf![bb01+cy] + (_noiseBuf[bb11+cy] - _noiseBuf![bb01+cy]) * bfx;
+                        float n0 = _cb.noiseBuf![bb00+cy] + (_cb.noiseBuf[bb10+cy] - _cb.noiseBuf![bb00+cy]) * bfx;
+                        float n1 = _cb.noiseBuf![bb01+cy] + (_cb.noiseBuf[bb11+cy] - _cb.noiseBuf![bb01+cy]) * bfx;
                         n = n0 + (n1-n0) * bfz;
                     }
                     float _ft = Mathf.Clamp01(relY / localAmp);
@@ -1113,14 +1082,14 @@ namespace ProceduralTerrain
                     float na, nb, wn;
                     if (bakeA)
                     {
-                        float t0 = _tunBuf![bb00+cy]  + (_tunBuf[bb10+cy]  - _tunBuf[bb00+cy])  * bfx;
-                        float t1 = _tunBuf![bb01+cy]  + (_tunBuf[bb11+cy]  - _tunBuf[bb01+cy])  * bfx;
+                        float t0 = _cb.tunBuf![bb00+cy]  + (_cb.tunBuf[bb10+cy]  - _cb.tunBuf[bb00+cy])  * bfx;
+                        float t1 = _cb.tunBuf![bb01+cy]  + (_cb.tunBuf[bb11+cy]  - _cb.tunBuf[bb01+cy])  * bfx;
                         na = t0 + (t1 - t0) * bfz;
-                        float t0b = _tunBuf2![bb00+cy] + (_tunBuf2[bb10+cy] - _tunBuf2[bb00+cy]) * bfx;
-                        float t1b = _tunBuf2![bb01+cy] + (_tunBuf2[bb11+cy] - _tunBuf2[bb01+cy]) * bfx;
+                        float t0b = _cb.tunBuf2![bb00+cy] + (_cb.tunBuf2[bb10+cy] - _cb.tunBuf2[bb00+cy]) * bfx;
+                        float t1b = _cb.tunBuf2![bb01+cy] + (_cb.tunBuf2[bb11+cy] - _cb.tunBuf2[bb01+cy]) * bfx;
                         nb = t0b + (t1b - t0b) * bfz;
-                        float w0 = _tunWBuf![bb00+cy] + (_tunWBuf[bb10+cy] - _tunWBuf[bb00+cy]) * bfx;
-                        float w1 = _tunWBuf![bb01+cy] + (_tunWBuf[bb11+cy] - _tunWBuf[bb01+cy]) * bfx;
+                        float w0 = _cb.tunWBuf![bb00+cy] + (_cb.tunWBuf[bb10+cy] - _cb.tunWBuf[bb00+cy]) * bfx;
+                        float w1 = _cb.tunWBuf![bb01+cy] + (_cb.tunWBuf[bb11+cy] - _cb.tunWBuf[bb01+cy]) * bfx;
                         wn = w0 + (w1 - w0) * bfz;
                     }
                     else
@@ -1159,8 +1128,8 @@ namespace ProceduralTerrain
                     float relY = worldY - addH;
                     float n;
                     {
-                        float n0 = _noiseBuf![bb00+cy] + (_noiseBuf[bb10+cy] - _noiseBuf![bb00+cy]) * bfx;
-                        float n1 = _noiseBuf![bb01+cy] + (_noiseBuf[bb11+cy] - _noiseBuf![bb01+cy]) * bfx;
+                        float n0 = _cb.noiseBuf![bb00+cy] + (_cb.noiseBuf[bb10+cy] - _cb.noiseBuf![bb00+cy]) * bfx;
+                        float n1 = _cb.noiseBuf![bb01+cy] + (_cb.noiseBuf[bb11+cy] - _cb.noiseBuf![bb01+cy]) * bfx;
                         n = n0 + (n1-n0) * bfz;
                     }
                     float _ft = Mathf.Clamp01(relY / localAmp);
@@ -1174,14 +1143,14 @@ namespace ProceduralTerrain
                     float na, nb, wn;
                     if (bakeA)
                     {
-                        float t0 = _tunBuf![bb00+cy]  + (_tunBuf[bb10+cy]  - _tunBuf[bb00+cy])  * bfx;
-                        float t1 = _tunBuf![bb01+cy]  + (_tunBuf[bb11+cy]  - _tunBuf[bb01+cy])  * bfx;
+                        float t0 = _cb.tunBuf![bb00+cy]  + (_cb.tunBuf[bb10+cy]  - _cb.tunBuf[bb00+cy])  * bfx;
+                        float t1 = _cb.tunBuf![bb01+cy]  + (_cb.tunBuf[bb11+cy]  - _cb.tunBuf[bb01+cy])  * bfx;
                         na = t0 + (t1 - t0) * bfz;
-                        float t0b = _tunBuf2![bb00+cy] + (_tunBuf2[bb10+cy] - _tunBuf2[bb00+cy]) * bfx;
-                        float t1b = _tunBuf2![bb01+cy] + (_tunBuf2[bb11+cy] - _tunBuf2[bb01+cy]) * bfx;
+                        float t0b = _cb.tunBuf2![bb00+cy] + (_cb.tunBuf2[bb10+cy] - _cb.tunBuf2[bb00+cy]) * bfx;
+                        float t1b = _cb.tunBuf2![bb01+cy] + (_cb.tunBuf2[bb11+cy] - _cb.tunBuf2[bb01+cy]) * bfx;
                         nb = t0b + (t1b - t0b) * bfz;
-                        float w0 = _tunWBuf![bb00+cy] + (_tunWBuf[bb10+cy] - _tunWBuf[bb00+cy]) * bfx;
-                        float w1 = _tunWBuf![bb01+cy] + (_tunWBuf[bb11+cy] - _tunWBuf[bb01+cy]) * bfx;
+                        float w0 = _cb.tunWBuf![bb00+cy] + (_cb.tunWBuf[bb10+cy] - _cb.tunWBuf[bb00+cy]) * bfx;
+                        float w1 = _cb.tunWBuf![bb01+cy] + (_cb.tunWBuf[bb11+cy] - _cb.tunWBuf[bb01+cy]) * bfx;
                         wn = w0 + (w1 - w0) * bfz;
                     }
                     else
@@ -1252,33 +1221,33 @@ namespace ProceduralTerrain
             bakeC = false; bakeA = false; anyMbActive = false;
             int nb4Size = cw4 * cw4 * bh;
             int nb2Size = cw4 * cw4;
-            if (_noiseBuf  == null || _noiseBuf.Length  < nb4Size) _noiseBuf  = new float[nb4Size];
-            if (_tunBuf    == null || _tunBuf.Length    < nb4Size) _tunBuf    = new float[nb4Size];
-            if (_tunBuf2   == null || _tunBuf2.Length   < nb4Size) _tunBuf2   = new float[nb4Size];
-            if (_tunWBuf   == null || _tunWBuf.Length   < nb4Size) _tunWBuf   = new float[nb4Size];
-            if (_bk2dAddH  == null || _bk2dAddH.Length  < nb2Size) _bk2dAddH  = new float[nb2Size];
-            if (_bk2dLAmp  == null || _bk2dLAmp.Length  < nb2Size) _bk2dLAmp  = new float[nb2Size];
-            if (_bk2dMcS     == null || _bk2dMcS.Length     < nb2Size) _bk2dMcS     = new float[nb2Size];
-            if (_bk2dMcT     == null || _bk2dMcT.Length     < nb2Size) _bk2dMcT     = new float[nb2Size];
-            if (_bk2dMcFlare == null || _bk2dMcFlare.Length < nb2Size) _bk2dMcFlare = new float[nb2Size];
-            if (_bk2dFlD    == null || _bk2dFlD.Length    < nb2Size) _bk2dFlD    = new float[nb2Size];
-            if (_bk2dFlFade == null || _bk2dFlFade.Length < nb2Size) _bk2dFlFade = new float[nb2Size];
-            if (_bk2dMbwf  == null || _bk2dMbwf.Length  < nb2Size) _bk2dMbwf  = new float[nb2Size];
-            if (_bk2dMbwa  == null || _bk2dMbwa.Length  < nb2Size) _bk2dMbwa  = new float[nb2Size];
-            if (_bk2dMbr   == null || _bk2dMbr.Length   < nb2Size) _bk2dMbr   = new float[nb2Size];
-            if (_bk2dMbvs  == null || _bk2dMbvs.Length  < nb2Size) _bk2dMbvs  = new float[nb2Size];
-            if (_bk2dMbna  == null || _bk2dMbna.Length  < nb2Size) _bk2dMbna  = new float[nb2Size];
-            if (_bk2dMbyo    == null || _bk2dMbyo.Length    < nb2Size) _bk2dMbyo    = new float[nb2Size];
-            if (_bk2dMbtwist == null || _bk2dMbtwist.Length < nb2Size) _bk2dMbtwist = new float[nb2Size];
-            if (_bk2dMawf  == null || _bk2dMawf.Length  < nb2Size) _bk2dMawf  = new float[nb2Size];
-            if (_bk2dMawa  == null || _bk2dMawa.Length  < nb2Size) _bk2dMawa  = new float[nb2Size];
-            if (_bk2dMaway == null || _bk2dMaway.Length < nb2Size) _bk2dMaway = new float[nb2Size];
-            if (_bk2dMaf   == null || _bk2dMaf.Length   < nb2Size) _bk2dMaf   = new float[nb2Size];
-            if (_bk2dMavs  == null || _bk2dMavs.Length  < nb2Size) _bk2dMavs  = new float[nb2Size];
-            if (_bk2dMaw   == null || _bk2dMaw.Length   < nb2Size) _bk2dMaw   = new float[nb2Size];
-            if (_bk2dMawv  == null || _bk2dMawv.Length  < nb2Size) _bk2dMawv  = new float[nb2Size];
-            if (_bk2dMawvf == null || _bk2dMawvf.Length < nb2Size) _bk2dMawvf = new float[nb2Size];
-            if (_bk2dMayo  == null || _bk2dMayo.Length  < nb2Size) _bk2dMayo  = new float[nb2Size];
+            if (_cb.noiseBuf  == null || _cb.noiseBuf.Length  < nb4Size) _cb.noiseBuf  = new float[nb4Size];
+            if (_cb.tunBuf    == null || _cb.tunBuf.Length    < nb4Size) _cb.tunBuf    = new float[nb4Size];
+            if (_cb.tunBuf2   == null || _cb.tunBuf2.Length   < nb4Size) _cb.tunBuf2   = new float[nb4Size];
+            if (_cb.tunWBuf   == null || _cb.tunWBuf.Length   < nb4Size) _cb.tunWBuf   = new float[nb4Size];
+            if (_cb.bk2dAddH  == null || _cb.bk2dAddH.Length  < nb2Size) _cb.bk2dAddH  = new float[nb2Size];
+            if (_cb.bk2dLAmp  == null || _cb.bk2dLAmp.Length  < nb2Size) _cb.bk2dLAmp  = new float[nb2Size];
+            if (_cb.bk2dMcS     == null || _cb.bk2dMcS.Length     < nb2Size) _cb.bk2dMcS     = new float[nb2Size];
+            if (_cb.bk2dMcT     == null || _cb.bk2dMcT.Length     < nb2Size) _cb.bk2dMcT     = new float[nb2Size];
+            if (_cb.bk2dMcFlare == null || _cb.bk2dMcFlare.Length < nb2Size) _cb.bk2dMcFlare = new float[nb2Size];
+            if (_cb.bk2dFlD    == null || _cb.bk2dFlD.Length    < nb2Size) _cb.bk2dFlD    = new float[nb2Size];
+            if (_cb.bk2dFlFade == null || _cb.bk2dFlFade.Length < nb2Size) _cb.bk2dFlFade = new float[nb2Size];
+            if (_cb.bk2dMbwf  == null || _cb.bk2dMbwf.Length  < nb2Size) _cb.bk2dMbwf  = new float[nb2Size];
+            if (_cb.bk2dMbwa  == null || _cb.bk2dMbwa.Length  < nb2Size) _cb.bk2dMbwa  = new float[nb2Size];
+            if (_cb.bk2dMbr   == null || _cb.bk2dMbr.Length   < nb2Size) _cb.bk2dMbr   = new float[nb2Size];
+            if (_cb.bk2dMbvs  == null || _cb.bk2dMbvs.Length  < nb2Size) _cb.bk2dMbvs  = new float[nb2Size];
+            if (_cb.bk2dMbna  == null || _cb.bk2dMbna.Length  < nb2Size) _cb.bk2dMbna  = new float[nb2Size];
+            if (_cb.bk2dMbyo    == null || _cb.bk2dMbyo.Length    < nb2Size) _cb.bk2dMbyo    = new float[nb2Size];
+            if (_cb.bk2dMbtwist == null || _cb.bk2dMbtwist.Length < nb2Size) _cb.bk2dMbtwist = new float[nb2Size];
+            if (_cb.bk2dMawf  == null || _cb.bk2dMawf.Length  < nb2Size) _cb.bk2dMawf  = new float[nb2Size];
+            if (_cb.bk2dMawa  == null || _cb.bk2dMawa.Length  < nb2Size) _cb.bk2dMawa  = new float[nb2Size];
+            if (_cb.bk2dMaway == null || _cb.bk2dMaway.Length < nb2Size) _cb.bk2dMaway = new float[nb2Size];
+            if (_cb.bk2dMaf   == null || _cb.bk2dMaf.Length   < nb2Size) _cb.bk2dMaf   = new float[nb2Size];
+            if (_cb.bk2dMavs  == null || _cb.bk2dMavs.Length  < nb2Size) _cb.bk2dMavs  = new float[nb2Size];
+            if (_cb.bk2dMaw   == null || _cb.bk2dMaw.Length   < nb2Size) _cb.bk2dMaw   = new float[nb2Size];
+            if (_cb.bk2dMawv  == null || _cb.bk2dMawv.Length  < nb2Size) _cb.bk2dMawv  = new float[nb2Size];
+            if (_cb.bk2dMawvf == null || _cb.bk2dMawvf.Length < nb2Size) _cb.bk2dMawvf = new float[nb2Size];
+            if (_cb.bk2dMayo  == null || _cb.bk2dMayo.Length  < nb2Size) _cb.bk2dMayo  = new float[nb2Size];
 
             if (_blendedProfs != null)
             {
@@ -1302,27 +1271,27 @@ namespace ProceduralTerrain
                 var   p4    = (wg != null && _blendedProfs != null && idx2 < _blendedProfs.Length)
                               ? _blendedProfs[idx2] : CaveProfile.Default;
 
-                _bk2dMcS!    [idx2] = p4.modeC_noiseAmp;
-                _bk2dMcT!    [idx2] = p4.modeC_threshold;
-                _bk2dMcFlare![idx2] = p4.modeC_flare;
-                _bk2dFlD!   [idx2] = p4.floorDepth;
-                _bk2dFlFade![idx2] = p4.floorFade;
-                _bk2dMbwf![idx2] = p4.modeB_warpFrequency;
-                _bk2dMbwa![idx2] = p4.modeB_warpAmp;
-                _bk2dMbr! [idx2] = p4.modeB_radius;
-                _bk2dMbvs![idx2] = p4.modeB_vScale;
-                _bk2dMbna![idx2] = p4.modeB_noiseAmp;
-                _bk2dMbyo![idx2]    = p4.modeB_yOffset;
-                _bk2dMbtwist![idx2] = p4.modeB_twist;
-                _bk2dMawf![idx2] = p4.modeA_warpFrequency;
-                _bk2dMawa![idx2] = p4.modeA_warpAmp;
-                _bk2dMaway![idx2] = p4.modeA_warpAmpY;
-                _bk2dMaf! [idx2] = p4.modeA_frequency;
-                _bk2dMavs![idx2] = p4.modeA_vScale;
-                _bk2dMaw! [idx2] = p4.modeA_width;
-                _bk2dMawv![idx2] = p4.modeA_widthVary;
-                _bk2dMawvf![idx2]= p4.modeA_widthFrequency;
-                _bk2dMayo! [idx2]= p4.modeA_yOffset;
+                _cb.bk2dMcS!    [idx2] = p4.modeC_noiseAmp;
+                _cb.bk2dMcT!    [idx2] = p4.modeC_threshold;
+                _cb.bk2dMcFlare![idx2] = p4.modeC_flare;
+                _cb.bk2dFlD!   [idx2] = p4.floorDepth;
+                _cb.bk2dFlFade![idx2] = p4.floorFade;
+                _cb.bk2dMbwf![idx2] = p4.modeB_warpFrequency;
+                _cb.bk2dMbwa![idx2] = p4.modeB_warpAmp;
+                _cb.bk2dMbr! [idx2] = p4.modeB_radius;
+                _cb.bk2dMbvs![idx2] = p4.modeB_vScale;
+                _cb.bk2dMbna![idx2] = p4.modeB_noiseAmp;
+                _cb.bk2dMbyo![idx2]    = p4.modeB_yOffset;
+                _cb.bk2dMbtwist![idx2] = p4.modeB_twist;
+                _cb.bk2dMawf![idx2] = p4.modeA_warpFrequency;
+                _cb.bk2dMawa![idx2] = p4.modeA_warpAmp;
+                _cb.bk2dMaway![idx2] = p4.modeA_warpAmpY;
+                _cb.bk2dMaf! [idx2] = p4.modeA_frequency;
+                _cb.bk2dMavs![idx2] = p4.modeA_vScale;
+                _cb.bk2dMaw! [idx2] = p4.modeA_width;
+                _cb.bk2dMawv![idx2] = p4.modeA_widthVary;
+                _cb.bk2dMawvf![idx2]= p4.modeA_widthFrequency;
+                _cb.bk2dMayo! [idx2]= p4.modeA_yOffset;
 
                 if (bakeC && p4.modeC_noiseAmp > 0f)
                 {
@@ -1331,8 +1300,8 @@ namespace ProceduralTerrain
                     float awz4  = _hmAddWarpZ!.GetNoise(wx4 * awf4, wz4 * awf4) * p4.modeC_warpAmp;
                     float addH4    = wg!.GetHeight(wx4 + awx4, wz4 + awz4) - p4.modeC_yOffset;
                     float avf4  = p4.modeC_ampFrequency;
-                    _bk2dAddH![idx2] = addH4;
-                    _bk2dLAmp![idx2] = Mathf.Max(p4.modeC_noiseAmp * (1f + p4.modeC_ampVary
+                    _cb.bk2dAddH![idx2] = addH4;
+                    _cb.bk2dLAmp![idx2] = Mathf.Max(p4.modeC_noiseAmp * (1f + p4.modeC_ampVary
                                            * _addVaryNoise!.GetNoise(wx4 * avf4, wz4 * avf4)), 0f);
                     float ts4 = 1f + p4.modeC_twistVary
                         * _twistVaryNoise!.GetNoise(wx4 * p4.modeC_twistFrequency, wz4 * p4.modeC_twistFrequency);
@@ -1346,24 +1315,24 @@ namespace ProceduralTerrain
                         float cos4 = Mathf.Cos(ang4), sin4 = Mathf.Sin(ang4);
                         float tx4  = wx4 * cos4 - wz4 * sin4;
                         float tz4  = wx4 * sin4 + wz4 * cos4;
-                        _noiseBuf[baseIdx + cy] = _addNoise!.GetNoise(tx4 * af4, sy4 * af4, tz4 * af4);
+                        _cb.noiseBuf[baseIdx + cy] = _addNoise!.GetNoise(tx4 * af4, sy4 * af4, tz4 * af4);
                     }
                 }
                 else if (bakeC)
                 {
-                    _bk2dAddH![idx2] = wg!.GetHeight(wx4, wz4);
-                    _bk2dLAmp![idx2] = 0f;
+                    _cb.bk2dAddH![idx2] = wg!.GetHeight(wx4, wz4);
+                    _cb.bk2dLAmp![idx2] = 0f;
                     int baseIdx = cx4 * cw4 * bh + cz4 * bh;
-                    for (int cy = 0; cy < bh; cy++) _noiseBuf[baseIdx + cy] = 0f;
+                    for (int cy = 0; cy < bh; cy++) _cb.noiseBuf[baseIdx + cy] = 0f;
                 }
 
                 if (bakeA && p4.modeA_width > 0f)
                 {
-                    float mawf4  = _bk2dMawf! [idx2];
-                    float mawa4  = _bk2dMawa! [idx2];
-                    float maf4   = _bk2dMaf!  [idx2];
-                    float mavs4  = _bk2dMavs! [idx2];
-                    float mawvf4 = _bk2dMawvf![idx2];
+                    float mawf4  = _cb.bk2dMawf! [idx2];
+                    float mawa4  = _cb.bk2dMawa! [idx2];
+                    float maf4   = _cb.bk2dMaf!  [idx2];
+                    float mavs4  = _cb.bk2dMavs! [idx2];
+                    float mawvf4 = _cb.bk2dMawvf![idx2];
                     float mayo4  = p4.modeA_yOffset;
                     float addHA4 = mayo4 > 0f ? wg!.GetHeight(wx4, wz4) : 0f;
                     int baseIdxA = cx4 * cw4 * bh + cz4 * bh;
@@ -1374,22 +1343,22 @@ namespace ProceduralTerrain
                         float awz4  = _warpZ! .GetNoise(wx4 * mawf4, sy4 * mawf4, wz4 * mawf4) * mawa4;
                         float awx4b = _warpX2!.GetNoise(wx4 * mawf4, sy4 * mawf4, wz4 * mawf4) * mawa4;
                         float awz4b = _warpZ2!.GetNoise(wx4 * mawf4, sy4 * mawf4, wz4 * mawf4) * mawa4;
-                        _tunBuf! [baseIdxA + cy] = _caveNoise! .GetNoise((wx4 + awx4)  * maf4, sy4 * maf4, (wz4 + awz4)  * maf4);
-                        _tunBuf2![baseIdxA + cy] = _caveNoise2!.GetNoise((wx4 + awx4b) * maf4, sy4 * maf4, (wz4 + awz4b) * maf4);
-                        _tunWBuf![baseIdxA + cy] = _widthNoise!.GetNoise(wx4 * mawvf4, sy4 * mawvf4, wz4 * mawvf4);
+                        _cb.tunBuf! [baseIdxA + cy] = _caveNoise! .GetNoise((wx4 + awx4)  * maf4, sy4 * maf4, (wz4 + awz4)  * maf4);
+                        _cb.tunBuf2![baseIdxA + cy] = _caveNoise2!.GetNoise((wx4 + awx4b) * maf4, sy4 * maf4, (wz4 + awz4b) * maf4);
+                        _cb.tunWBuf![baseIdxA + cy] = _widthNoise!.GetNoise(wx4 * mawvf4, sy4 * mawvf4, wz4 * mawvf4);
                     }
                 }
                 else if (bakeA)
                 {
                     int baseIdxA = cx4 * cw4 * bh + cz4 * bh;
-                    for (int cy = 0; cy < bh; cy++) { _tunBuf![baseIdxA + cy] = 0f; _tunBuf2![baseIdxA + cy] = 0f; _tunWBuf![baseIdxA + cy] = 0f; }
+                    for (int cy = 0; cy < bh; cy++) { _cb.tunBuf![baseIdxA + cy] = 0f; _cb.tunBuf2![baseIdxA + cy] = 0f; _cb.tunWBuf![baseIdxA + cy] = 0f; }
                 }
             }
 
             if (anyMbActive && wg != null)
             {
                 int fullSz = bw * bw;
-                if (_bkWarpedH == null || _bkWarpedH.Length < fullSz) _bkWarpedH = new float[fullSz];
+                if (_cb.bkWarpedH == null || _cb.bkWarpedH.Length < fullSz) _cb.bkWarpedH = new float[fullSz];
                 for (int cx = 0; cx < bw; cx++)
                 for (int cz = 0; cz < bw; cz++)
                 {
@@ -1402,13 +1371,13 @@ namespace ProceduralTerrain
                     static float BL2(float[] a, int i00, int i10, int i01, int i11, float fx, float fz) =>
                         Mathf.Lerp(Mathf.Lerp(a[i00], a[i10], fx),
                                    Mathf.Lerp(a[i01], a[i11], fx), fz);
-                    float wf    = BL2(_bk2dMbwf!, b00, b10, b01, b11, bfx2, bfz2);
-                    float wa    = BL2(_bk2dMbwa!, b00, b10, b01, b11, bfx2, bfz2);
-                    float yo    = BL2(_bk2dMbyo!, b00, b10, b01, b11, bfx2, bfz2);
+                    float wf    = BL2(_cb.bk2dMbwf!, b00, b10, b01, b11, bfx2, bfz2);
+                    float wa    = BL2(_cb.bk2dMbwa!, b00, b10, b01, b11, bfx2, bfz2);
+                    float yo    = BL2(_cb.bk2dMbyo!, b00, b10, b01, b11, bfx2, bfz2);
                     float locF2 = LocationFactor(wx, wz, nearbyLocs);
                     float dx    = _hmWarpX!.GetNoise(wx * wf, wz * wf) * (wa * locF2);
                     float dz2   = _hmWarpZ!.GetNoise(wx * wf, wz * wf) * (wa * locF2);
-                    _bkWarpedH![cx * bw + cz] = wg.GetHeight(wx + dx, wz + dz2) - yo;
+                    _cb.bkWarpedH![cx * bw + cz] = wg.GetHeight(wx + dx, wz + dz2) - yo;
                 }
             }
         }
@@ -1438,12 +1407,12 @@ namespace ProceduralTerrain
                 static float BL(float[] a, int i00, int i10, int i01, int i11, float fx, float fz) =>
                     Mathf.Lerp(Mathf.Lerp(a[i00], a[i10], fx), Mathf.Lerp(a[i01], a[i11], fx), fz);
 
-                float profMcT    = BL(_bk2dMcT!,     b200, b210, b201, b211, bfx, bfz);
-                float profMcFlare= BL(_bk2dMcFlare!, b200, b210, b201, b211, bfx, bfz);
-                float profFlD    = BL(_bk2dFlD!,    b200, b210, b201, b211, bfx, bfz);
-                float profFlFade = BL(_bk2dFlFade!, b200, b210, b201, b211, bfx, bfz);
-                float addH     = bakeC ? BL(_bk2dAddH!, b200, b210, b201, b211, bfx, bfz) : 0f;
-                float localAmp = bakeC ? BL(_bk2dLAmp!, b200, b210, b201, b211, bfx, bfz) : 0f;
+                float profMcT    = BL(_cb.bk2dMcT!,     b200, b210, b201, b211, bfx, bfz);
+                float profMcFlare= BL(_cb.bk2dMcFlare!, b200, b210, b201, b211, bfx, bfz);
+                float profFlD    = BL(_cb.bk2dFlD!,    b200, b210, b201, b211, bfx, bfz);
+                float profFlFade = BL(_cb.bk2dFlFade!, b200, b210, b201, b211, bfx, bfz);
+                float addH     = bakeC ? BL(_cb.bk2dAddH!, b200, b210, b201, b211, bfx, bfz) : 0f;
+                float localAmp = bakeC ? BL(_cb.bk2dLAmp!, b200, b210, b201, b211, bfx, bfz) : 0f;
                 float h;
                 if (wg == null) { h = 0f; }
                 else
@@ -1477,25 +1446,25 @@ namespace ProceduralTerrain
                 float mbWarpedH = 0f, mbR = 0f, mbNA = 0f, mbVS = 0f, mbWF = 0f, mbTwist = 0f;
                 if (anyMbActive)
                 {
-                    mbR       = BL(_bk2dMbr!,     b200, b210, b201, b211, bfx, bfz);
-                    mbWarpedH = mbR > 0f ? _bkWarpedH![cx * bw + cz] : 0f;
-                    mbNA      = BL(_bk2dMbna!,    b200, b210, b201, b211, bfx, bfz);
-                    mbVS      = BL(_bk2dMbvs!,    b200, b210, b201, b211, bfx, bfz);
-                    mbWF      = BL(_bk2dMbwf!,    b200, b210, b201, b211, bfx, bfz);
-                    mbTwist   = BL(_bk2dMbtwist!, b200, b210, b201, b211, bfx, bfz);
+                    mbR       = BL(_cb.bk2dMbr!,     b200, b210, b201, b211, bfx, bfz);
+                    mbWarpedH = mbR > 0f ? _cb.bkWarpedH![cx * bw + cz] : 0f;
+                    mbNA      = BL(_cb.bk2dMbna!,    b200, b210, b201, b211, bfx, bfz);
+                    mbVS      = BL(_cb.bk2dMbvs!,    b200, b210, b201, b211, bfx, bfz);
+                    mbWF      = BL(_cb.bk2dMbwf!,    b200, b210, b201, b211, bfx, bfz);
+                    mbTwist   = BL(_cb.bk2dMbtwist!, b200, b210, b201, b211, bfx, bfz);
                 }
 
                 float mAwf=0f, mAwa=0f, mAway=0f, mAf=0f, mAvs=0f, mAw=0f, mAwv=0f, mAwvf=0f;
                 if (bakeA)
                 {
-                    mAwf  = BL(_bk2dMawf!,  b200, b210, b201, b211, bfx, bfz);
-                    mAwa  = BL(_bk2dMawa!,  b200, b210, b201, b211, bfx, bfz);
-                    mAway = BL(_bk2dMaway!, b200, b210, b201, b211, bfx, bfz);
-                    mAf   = BL(_bk2dMaf!,   b200, b210, b201, b211, bfx, bfz);
-                    mAvs  = BL(_bk2dMavs!,  b200, b210, b201, b211, bfx, bfz);
-                    mAw   = BL(_bk2dMaw!,   b200, b210, b201, b211, bfx, bfz);
-                    mAwv  = BL(_bk2dMawv!,  b200, b210, b201, b211, bfx, bfz);
-                    mAwvf = BL(_bk2dMawvf!, b200, b210, b201, b211, bfx, bfz);
+                    mAwf  = BL(_cb.bk2dMawf!,  b200, b210, b201, b211, bfx, bfz);
+                    mAwa  = BL(_cb.bk2dMawa!,  b200, b210, b201, b211, bfx, bfz);
+                    mAway = BL(_cb.bk2dMaway!, b200, b210, b201, b211, bfx, bfz);
+                    mAf   = BL(_cb.bk2dMaf!,   b200, b210, b201, b211, bfx, bfz);
+                    mAvs  = BL(_cb.bk2dMavs!,  b200, b210, b201, b211, bfx, bfz);
+                    mAw   = BL(_cb.bk2dMaw!,   b200, b210, b201, b211, bfx, bfz);
+                    mAwv  = BL(_cb.bk2dMawv!,  b200, b210, b201, b211, bfx, bfz);
+                    mAwvf = BL(_cb.bk2dMawvf!, b200, b210, b201, b211, bfx, bfz);
                 }
 
                 long _tb = System.Diagnostics.Stopwatch.GetTimestamp();

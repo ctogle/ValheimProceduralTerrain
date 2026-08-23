@@ -81,39 +81,6 @@ namespace ProceduralTerrain
             if (_locationInstancesField == null)
                 Log.LogWarning("[ProceduralTerrain] m_locationInstances not found — location protection off.");
 
-            // ── Direct brick write reflection ─────────────────────────────────────
-            _brickType        = FindType("Voxheim.Core.Brick", "Voxheim.Core");
-            _solidFloorRuleType = FindType("Voxheim.Core.SolidFloorRule", "Voxheim.Core");
-            _vfBricksField    = fieldT?.GetField("_bricks",    BindingFlags.NonPublic | BindingFlags.Instance);
-            _vfMaxBrickYField = fieldT?.GetField("_maxBrickY", BindingFlags.NonPublic | BindingFlags.Instance);
-            _vfSetFloorMethod = fieldT?.GetMethod("SetFloor",  BindingFlags.Public | BindingFlags.Instance);
-            _brickDataField   = _brickType?.GetField("_data",  BindingFlags.NonPublic | BindingFlags.Instance);
-            _solidFloorCtor   = _solidFloorRuleType?.GetConstructor(
-                new[] { typeof(int), typeof(int), typeof(int), typeof(int), typeof(int) });
-
-            if (_brickType != null && _vfBricksField != null && _int3Ctor != null && fieldT != null)
-            {
-                // Emit: void(object field, int bx, int by, int bz, object brick)
-                //       → ((VoxelField)field)._bricks[new Int3(bx,by,bz)] = (Brick)brick
-                var dictType = typeof(Dictionary<,>).MakeGenericType(int3T, _brickType);
-                var setItem  = dictType.GetMethod("set_Item")!;
-                var abDm = new DynamicMethod("VC_AddBrick", typeof(void),
-                    new[] { typeof(object), typeof(int), typeof(int), typeof(int), typeof(object) },
-                    typeof(Plugin).Module, skipVisibility: true);
-                var abIl = abDm.GetILGenerator();
-                abIl.Emit(OpCodes.Ldarg_0); abIl.Emit(OpCodes.Castclass, fieldT);
-                abIl.Emit(OpCodes.Ldfld, _vfBricksField);
-                abIl.Emit(OpCodes.Ldarg_1); abIl.Emit(OpCodes.Ldarg_2); abIl.Emit(OpCodes.Ldarg_3);
-                abIl.Emit(OpCodes.Newobj, _int3Ctor);
-                abIl.Emit(OpCodes.Ldarg_S, (byte)4); abIl.Emit(OpCodes.Castclass, _brickType);
-                abIl.Emit(OpCodes.Callvirt, setItem);
-                abIl.Emit(OpCodes.Ret);
-                _addBrick = (Action<object, int, int, int, object>)
-                    abDm.CreateDelegate(typeof(Action<object, int, int, int, object>));
-                Log.LogInfo("[ProceduralTerrain] Direct brick write path ready.");
-            }
-            else Log.LogWarning("[ProceduralTerrain] Direct brick write unavailable — falling back to per-voxel Set.");
-
             _int3FieldX = int3T.GetField("X", BindingFlags.Public | BindingFlags.Instance)
                           ?? int3T.GetField("x", BindingFlags.Public | BindingFlags.Instance);
             _int3FieldY = int3T.GetField("Y", BindingFlags.Public | BindingFlags.Instance)
