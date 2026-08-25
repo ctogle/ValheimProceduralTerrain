@@ -294,9 +294,7 @@ namespace ProceduralTerrain
             _bakePending.Clear();
             _bakeData = null;
             _bakeLoadAttempted = false;
-            _zoneObjects.Clear();
             _zoneParams.Clear();
-            _zoneMaxY.Clear();
             _zoneExtHi.Clear();
             _sdfCache.Clear();
             _heightCache.Clear();
@@ -325,89 +323,43 @@ namespace ProceduralTerrain
 
         static void RecarveAll()
         {
-            Log.LogInfo($"[ProceduralTerrain] Hot-reload: re-voxelizing {_zoneParams.Count} zone(s).");
-            // Clear all config-derived and geometry-derived caches so the re-voxelization
-            // starts from a clean slate. _zoneParams and _zoneObjects are kept because
-            // they are the iteration target — the zone objects and geometry metadata
-            // (origin, width, yLo/yHi) are world-geometry facts, not profile-dependent.
             _sdfCache.Clear();
             _heightCache.Clear();
             lock (_surfHCache) _surfHCache.Clear();
-            _zoneMaxY.Clear();
             _zoneExtHi.Clear();
             _zoneFaceCache.Clear();
-            // Re-voxelization of active zones on config hot-reload requires Voxheim to
-            // expose a way to re-run the generator pipeline on a live zone. Until that
-            // API exists, we clear caches and rebuild meshes only — zones reload fully
-            // on next unload/reload cycle.
-            bool canRemesh = _enqueueMeshMethod != null && _finishSkinNowMethod != null && _int3Ctor != null;
-            if (!canRemesh)
-                Log.LogWarning("[ProceduralTerrain] EnqueueMesh/FinishSkinNow unavailable — mesh rebuild skipped.");
 
-            var snapshot = new List<(string key, (int ox, int oz, int w, int yLo, int yHi) zp)>(_zoneParams.Count);
-            foreach (var kv in _zoneParams) snapshot.Add((kv.Key, kv.Value));
-
-            // ── Pre-pass: reset _yScanHi to baseline so it accurately reflects the new config ──
-            // We only ever raise _yScanHi, so stale high values from a previous profile
-            // (e.g., mode B active → now off) would leave Voxheim scanning above the new
-            // terrain ceiling, producing mesh artifacts. Reset to yHi now; the between-passes
-            // step will re-extend it if mode C raises terrain above that.
-            if (_yScanHiField != null)
+            if (_activateMethod == null || _unskinMethod == null || _hmapField == null || _finishSkinNowMethod == null)
             {
-                foreach (var (key, zp) in snapshot)
-                {
-                    if (!_zoneObjects.TryGetValue(key, out var zo)) continue;
-                    if (zo is UnityEngine.Object u && !u) continue;
-                    _yScanHiField.SetValue(zo, zp.yHi);
-                }
+                Log.LogWarning("[ProceduralTerrain] Hot-reload reflection handles missing — skipping.");
+                return;
             }
 
-            // ── Extend _yScanHi for zones where Mode C raises terrain ────────────
-            // CompletePatch only runs on fresh zone load, so hot-reload must do this itself.
-            if (_yScanHiField != null)
+            var voxelZoneType = FindType("Voxheim.Unity.VoxelZone", "Voxheim");
+            if (voxelZoneType == null) return;
+            var zones = UnityEngine.Resources.FindObjectsOfTypeAll(voxelZoneType);
+            Log.LogInfo($"[ProceduralTerrain] Hot-reload: re-activating {zones.Length} zone(s).");
+
+            foreach (var zoneObj in zones)
             {
-                foreach (var (key, _) in snapshot)
+                if (zoneObj is not UnityEngine.Object uObj || !uObj) continue;
+                var hmap = _hmapField.GetValue(zoneObj);
+                if (hmap == null) { Log.LogWarning("[ProceduralTerrain] Hot-reload: zone has no hmap, skipping."); continue; }
+                string key = "";
+                if (_zoneOriginX != null && _zoneOriginZ != null)
                 {
-                    if (!_zoneMaxY.TryGetValue(key, out int maxY)) continue;
-                    _zoneMaxY.Remove(key);
-                    if (!_zoneObjects.TryGetValue(key, out var zo)) continue;
-                    if (zo is UnityEngine.Object u && !u) continue;
-                    int cur = (int)_yScanHiField.GetValue(zo)!;
-                    if (maxY > cur) _yScanHiField.SetValue(zo, maxY);
+                    int ox = (int)_zoneOriginX.GetValue(zoneObj)!;
+                    int oz = (int)_zoneOriginZ.GetValue(zoneObj)!;
+                    key = $"{ox},{oz}";
                 }
-            }
-
-            if (!canRemesh) return;
-
-            // ── Pass 2: rebuild meshes now that all VoxelFields are current ────────
-            foreach (var (key, zp) in snapshot)
-            {
-                if (!_zoneObjects.TryGetValue(key, out var zoneObj)) continue;
-                if (zoneObj is UnityEngine.Object uObj && !uObj) continue;
-
-                int extLo = zp.yLo - 24;
-                int extHi = _zoneExtHi.TryGetValue(key, out int hiMark2) ? hiMark2 : zp.yHi + 24;
-
-                int bx0 = zp.ox >> 4, bx1 = (zp.ox + zp.w - 1) >> 4;
-                int bz0 = zp.oz >> 4, bz1 = (zp.oz + zp.w - 1) >> 4;
-                int by0 = extLo >> 4, by1 = extHi >> 4;
-                int queued = 0;
-                for (int bx = bx0; bx <= bx1; bx++)
-                for (int by = by0; by <= by1; by++)
-                for (int bz = bz0; bz <= bz1; bz++)
+                try
                 {
-                    try
-                    {
-                        var i3 = _int3Ctor!.Invoke(new object[] { bx, by, bz });
-                        _enqueueMeshMethod!.Invoke(zoneObj, new[] { i3 });
-                        queued++;
-                    }
-                    catch (Exception e) { Log.LogWarning($"[ProceduralTerrain] EnqueueMesh {key}: {e.Message}"); break; }
+                    _unskinMethod.Invoke(zoneObj, null);
+                    _activateMethod.Invoke(zoneObj, new[] { hmap });
+                    _finishSkinNowMethod.Invoke(zoneObj, null);
+                    Log.LogDebug($"[ProceduralTerrain] Hot-reload: re-activated zone {key}.");
                 }
-                Log.LogDebug($"[ProceduralTerrain] Queued {queued} bricks for zone {key}.");
-
-                try { _finishSkinNowMethod!.Invoke(zoneObj, null); }
-                catch (Exception e) { Log.LogWarning($"[ProceduralTerrain] FinishSkinNow {key}: {e.Message}"); }
+                catch (Exception e) { Log.LogWarning($"[ProceduralTerrain] Hot-reload zone {key}: {e.Message}"); }
             }
         }
     }

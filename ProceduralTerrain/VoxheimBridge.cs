@@ -59,19 +59,22 @@ namespace ProceduralTerrain
                 BindingFlags.NonPublic | BindingFlags.Instance);
             _finishSkinNowMethod = zoneT?.GetMethod("FinishSkinNow",
                 BindingFlags.NonPublic | BindingFlags.Instance);
+            _activateMethod      = zoneT?.GetMethod("Activate",
+                BindingFlags.NonPublic | BindingFlags.Instance);
+            _unskinMethod        = zoneT?.GetMethod("Unskin",
+                BindingFlags.NonPublic | BindingFlags.Instance);
+            _hmapField           = zoneT?.GetField("_hmap",
+                BindingFlags.NonPublic | BindingFlags.Instance);
             if (_enqueueMeshMethod   == null) Log.LogWarning("[ProceduralTerrain] EnqueueMesh not found.");
             if (_finishSkinNowMethod == null) Log.LogWarning("[ProceduralTerrain] FinishSkinNow not found.");
+            if (_activateMethod      == null) Log.LogWarning("[ProceduralTerrain] Activate not found — hot-reload will not work.");
+            if (_unskinMethod        == null) Log.LogWarning("[ProceduralTerrain] Unskin not found — hot-reload will not work.");
+            if (_hmapField           == null) Log.LogWarning("[ProceduralTerrain] _hmap field not found — hot-reload will not work.");
 
-            _zoneOriginX         = zoneT?.GetField("_originX",
-                BindingFlags.NonPublic | BindingFlags.Instance);
-            _zoneOriginZ         = zoneT?.GetField("_originZ",
-                BindingFlags.NonPublic | BindingFlags.Instance);
-            _yScanHiField        = zoneT?.GetField("_yScanHi",
-                BindingFlags.NonPublic | BindingFlags.Instance);
+            _zoneOriginX = zoneT?.GetField("_originX", BindingFlags.NonPublic | BindingFlags.Instance);
+            _zoneOriginZ = zoneT?.GetField("_originZ", BindingFlags.NonPublic | BindingFlags.Instance);
             if (_zoneOriginX == null || _zoneOriginZ == null)
                 Log.LogWarning("[ProceduralTerrain] Zone origin fields missing.");
-            if (_yScanHiField == null)
-                Log.LogWarning("[ProceduralTerrain] _yScanHi not found — Mode C ceiling extension disabled.");
 
             _locationInstancesField =
                 typeof(ZoneSystem).GetField("m_locationInstances",
@@ -80,15 +83,6 @@ namespace ProceduralTerrain
                     BindingFlags.Public    | BindingFlags.Instance);
             if (_locationInstancesField == null)
                 Log.LogWarning("[ProceduralTerrain] m_locationInstances not found — location protection off.");
-
-            _int3FieldX = int3T.GetField("X", BindingFlags.Public | BindingFlags.Instance)
-                          ?? int3T.GetField("x", BindingFlags.Public | BindingFlags.Instance);
-            _int3FieldY = int3T.GetField("Y", BindingFlags.Public | BindingFlags.Instance)
-                          ?? int3T.GetField("y", BindingFlags.Public | BindingFlags.Instance);
-            _int3FieldZ = int3T.GetField("Z", BindingFlags.Public | BindingFlags.Instance)
-                          ?? int3T.GetField("z", BindingFlags.Public | BindingFlags.Instance);
-            if (_int3FieldX == null || _int3FieldY == null || _int3FieldZ == null)
-                Log.LogWarning("[ProceduralTerrain] Int3 X/Y/Z fields not found — FallbackDensity patch will use vanilla.");
 
             // HeightGrid delegates — Scale property and [x,z] indexer
             var gridT      = FindType("Voxheim.Core.HeightGrid", "Voxheim.Core");
@@ -129,61 +123,6 @@ namespace ProceduralTerrain
     // ── Harmony patches ───────────────────────────────────────────────────────────
 
     [HarmonyPatch]
-    // AUTHOR NOTE FOR VOXHEIM — API gaps this patch works around:
-    //
-    // 1. Y EXTENT DECLARATION: Our generator writes solid voxels ABOVE the vanilla
-    //    heightmap surface (Mode C — overhangs, arches). Voxheim finalizes the zone's
-    //    render extent (_yScanHi) before the generator runs, so that geometry is clipped.
-    //    We patch Complete() to bump _yScanHi to our actual max Y after the fact.
-    //    Ideally IVoxelBaselineGenerator would let us declare a Y extent upfront so
-    //    Voxheim allocates the correct range before finalizing.
-    //
-    // 2. LIVE ZONE REGENERATION: When the user changes terrain config at runtime, we need
-    //    to re-run the generator on already-active zones so changes are visible immediately
-    //    without a full reload. No API for this exists today, so hot-reload only clears
-    //    caches — zones pick up the new config on next unload/reload cycle.
-    //
-    // 3. LOCATION TERRAIN FLATTENING: Voxheim patches TerrainOp.Awake to route all
-    //    terrain ops (level/raise/smooth) through the authority system as voxel deltas,
-    //    suppressing direct heightmap modification. This means hmap.m_heights — and
-    //    therefore context.Heights passed to the generator — contains only raw world
-    //    generator heights with no terrain ops applied. Location flattening arrives as
-    //    authority deltas on top of the baseline, after the generator has already run.
-    //    Our location-protection fader suppresses PT's deviation from vanilla heights,
-    //    but the reference surface at a location is unflattened world terrain, not the
-    //    flat floor the location expects. The generator has no way to know where terrain
-    //    ops will be applied, so it cannot account for location footprints upfront.
-    //    A possible solution: expose pending TerrainOperationIntents (or their baked
-    //    result) as part of VoxelBaselineContext so generators can treat those areas
-    //    as authority-owned and leave them alone.
-    [HarmonyPatch]
-    static class CompletePatch
-    {
-        static MethodBase? TargetMethod()
-        {
-            var t = Plugin.FindType("Voxheim.Unity.VoxelZone", "Voxheim");
-            return t?.GetMethod("Complete", BindingFlags.NonPublic | BindingFlags.Instance);
-        }
-
-        static void Prefix(object __instance)
-        {
-            if (Plugin._zoneOriginX == null || Plugin._zoneOriginZ == null) return;
-            int ox = (int)Plugin._zoneOriginX.GetValue(__instance)!;
-            int oz = (int)Plugin._zoneOriginZ.GetValue(__instance)!;
-            string key = $"{ox},{oz}";
-
-            Plugin._zoneObjects[key] = __instance;
-
-            if (Plugin._yScanHiField != null && Plugin._zoneMaxY.TryGetValue(key, out int maxY))
-            {
-                int cur = (int)Plugin._yScanHiField.GetValue(__instance)!;
-                if (maxY > cur) Plugin._yScanHiField.SetValue(__instance, maxY);
-                Plugin._zoneMaxY.Remove(key);
-            }
-        }
-    }
-
-    [HarmonyPatch]
     static class VoxelZoneDestroyPatch
     {
         static MethodBase? TargetMethod()
@@ -200,42 +139,8 @@ namespace ProceduralTerrain
             string key = $"{ox},{oz}";
             Plugin._zoneParams.Remove(key);
             Plugin._sdfCache.Remove(key);
-            Plugin._zoneObjects.Remove(key);
-            Plugin._zoneMaxY.Remove(key);
             Plugin._zoneExtHi.Remove(key);
             lock (Plugin._surfHCache) Plugin._surfHCache.Remove((ox, oz));
-        }
-    }
-
-    // Patches StitchedSource.FallbackDensity (private nested class inside VoxelZone).
-    // FallbackDensity is called when a boundary voxel's zone is absent or inactive in s_zones.
-    // We return our own SDF so boundary bricks are built correctly on first mesh — no post-hoc repair needed.
-    [HarmonyPatch]
-    static class FallbackDensityPatch
-    {
-        static MethodBase? TargetMethod()
-        {
-            var zoneT     = Plugin.FindType("Voxheim.Unity.VoxelZone", "Voxheim");
-            var stitchedT = zoneT?.GetNestedType("StitchedSource", BindingFlags.NonPublic);
-            var m         = stitchedT?.GetMethod("FallbackDensity", BindingFlags.NonPublic | BindingFlags.Instance);
-            if (m == null) Plugin.Log.LogWarning("[ProceduralTerrain] FallbackDensity not found — cross-zone boundary density will be vanilla.");
-            return m;
-        }
-
-        // __0 is the Int3 voxel parameter, boxed because we can't reference the type at compile time.
-        static bool Prefix(ref sbyte __result, object __0)
-        {
-            if (Plugin._int3FieldX == null || Plugin._int3FieldY == null || Plugin._int3FieldZ == null)
-                return true;
-            int vx = (int)Plugin._int3FieldX.GetValue(__0)!;
-            int vy = (int)Plugin._int3FieldY.GetValue(__0)!;
-            int vz = (int)Plugin._int3FieldZ.GetValue(__0)!;
-            if (Plugin.TryComputePointSDF(vx, vy, vz, out sbyte r))
-            {
-                __result = r;
-                return false;
-            }
-            return true;
         }
     }
 
@@ -261,6 +166,10 @@ namespace ProceduralTerrain
                 catch (Exception e) { Plugin.Log.LogError($"[PT] Carve ({ox},{oz}): {e.Message}"); return; }
                 if (!Plugin._sdfCache.TryGetValue(zoneKey, out c)) return;
             }
+
+            // Ensure _zoneParams is populated even when SDF came from bake cache (Carve() was skipped).
+            if (!Plugin._zoneParams.ContainsKey(zoneKey))
+                Plugin._zoneParams[zoneKey] = (ox, oz, width, context.InitialScanLo, context.InitialScanHi);
 
             for (int ci = 0; ci < width; ci++)
             for (int ri = 0; ri < width; ri++)

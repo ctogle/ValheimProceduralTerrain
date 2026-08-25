@@ -140,9 +140,11 @@ namespace ProceduralTerrain
         // ── Zone tracking for hot-reload ──────────────────────────────────────────
         internal static readonly Dictionary<string, (int ox, int oz, int w, int yLo, int yHi)>
             _zoneParams = new();
-        internal static readonly Dictionary<string, object> _zoneObjects = new();
         internal static MethodInfo? _enqueueMeshMethod;
         internal static MethodInfo? _finishSkinNowMethod;
+        internal static MethodInfo? _activateMethod;
+        internal static MethodInfo? _unskinMethod;
+        internal static FieldInfo?  _hmapField;
 
         // ── Noise ─────────────────────────────────────────────────────────────────
         // All noise objects use frequency=1.0; call sites scale coordinates by
@@ -169,10 +171,7 @@ namespace ProceduralTerrain
         internal static ConstructorInfo? _int3Ctor;
         internal static FieldInfo?       _zoneOriginX;
         internal static FieldInfo?       _zoneOriginZ;
-        internal static FieldInfo?       _yScanHiField;
-        // VoxelBounds fields — used to construct the changed-bounds arg for PokeNeighbors
-        internal static readonly Dictionary<string, int> _zoneMaxY  = new();
-        internal static readonly Dictionary<string, int> _zoneExtHi = new(); // highest voxel Y ever written; used to size the reset range in hot-reload
+        internal static readonly Dictionary<string, int> _zoneExtHi = new();
 
         // Scratch buffers for BFS biome blend.
         // _biomeFrac: supersampled fractional biome weights per padded coarse cell.
@@ -202,7 +201,6 @@ namespace ProceduralTerrain
         internal static readonly Dictionary<(int ox, int oz), (int bw, int extLo, float s, float[] surfH)> _surfHCache = new();
 
         // Int3 field accessors — used by FallbackDensityPatch to extract X/Y/Z from boxed struct.
-        internal static FieldInfo? _int3FieldX, _int3FieldY, _int3FieldZ;
 
         // ── Cross-zone grounding face cache ──────────────────────────────────────
         // Indexed by (ox, oz) territory origin (same coordinates as _zoneParams).

@@ -504,11 +504,6 @@ namespace ProceduralTerrain
 
             if (!_parallelBakeActive)
             {
-            if (maxYC > yHi)
-            {
-                if (!_zoneMaxY.TryGetValue(zoneKey, out int prevMaxY) || maxYC > prevMaxY)
-                    _zoneMaxY[zoneKey] = maxYC;
-            }
             int anyHiMark = Math.Max(maxYC, maxYAny);
             if (anyHiMark > yHi)
             {
@@ -1179,19 +1174,6 @@ namespace ProceduralTerrain
         }
 
         // ── Per-point SDF for FallbackDensity patch ───────────────────────────────
-        internal static bool TryComputePointSDF(int vx, int vy, int vz, out sbyte result)
-        {
-            result = sbyte.MaxValue;
-            int ox = vx - ((vx % 64 + 64) % 64);
-            int oz = vz - ((vz % 64 + 64) % 64);
-            if (!_sdfCache.TryGetValue($"{ox},{oz}", out var c)) return false;
-            int ci = vx - ox, ri = vz - oz, cy = vy - c.extLo;
-            if (ci < 0 || ci >= c.width || ri < 0 || ri >= c.width || cy < 0 || cy >= c.bh)
-                return false;
-            result = c.data[(ci * c.bh + cy) * c.width + ri];
-            return true;
-        }
-
         // ── Placement height ──────────────────────────────────────────────────────
         internal static float FindCarvedSurfaceY(float worldX, float originalY, float worldZ)
         {
