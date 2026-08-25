@@ -69,7 +69,6 @@ namespace ProceduralTerrain
             float zoneZ = (oz + width * 0.5f) * s;
 
             string zoneKey = $"{ox},{oz}";
-            if (!_parallelBakeActive) _zoneParams[zoneKey] = (ox, oz, width, yLo, yHi);
 
             const int overlap = 4;
             int bwEarly = width + 2 * overlap;
@@ -502,16 +501,6 @@ namespace ProceduralTerrain
 
             if (!_parallelBakeActive) _sdfCache[zoneKey] = (extLo, bh, width, cacheData);
 
-            if (!_parallelBakeActive)
-            {
-            int anyHiMark = Math.Max(maxYC, maxYAny);
-            if (anyHiMark > yHi)
-            {
-                int hiMark = anyHiMark + 8;
-                if (!_zoneExtHi.TryGetValue(zoneKey, out int prevHiMark) || hiMark > prevHiMark)
-                    _zoneExtHi[zoneKey] = hiMark;
-            }
-            }
             }
 
             long _t3 = _sw.ElapsedMilliseconds;

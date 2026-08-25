@@ -29,34 +29,12 @@ namespace ProceduralTerrain
         // ── Delegate compilation ──────────────────────────────────────────────────
         static bool BuildDelegates()
         {
-            var fieldT = FindType("Voxheim.Core.VoxelField", "Voxheim.Core");
-            var int3T  = FindType("Voxheim.Core.Int3",       "Voxheim.Core");
-            var zoneT  = FindType("Voxheim.Unity.VoxelZone", "Voxheim");
-
-            if (fieldT == null || int3T == null)
-            {
-                Log.LogError("[ProceduralTerrain] VoxelField or Int3 type not found.");
-                return false;
-            }
-
-            _int3Ctor = int3T.GetConstructor(new[] { typeof(int), typeof(int), typeof(int) });
-            var get = fieldT.GetMethod("Get", BindingFlags.Public | BindingFlags.Instance,
-                          null, new[] { int3T }, null);
-            var set = fieldT.GetMethod("Set", BindingFlags.Public | BindingFlags.Instance,
-                          null, new[] { int3T, typeof(sbyte) }, null);
-
-            if (_int3Ctor == null || get == null || set == null)
-            {
-                Log.LogError("[ProceduralTerrain] Int3 ctor / Get / Set not found.");
-                return false;
-            }
+            var zoneT = FindType("Voxheim.Unity.VoxelZone", "Voxheim");
 
             _scaleField = zoneT?.GetField("s_scale",
                 BindingFlags.NonPublic | BindingFlags.Static);
             if (_scaleField == null) Log.LogWarning("[ProceduralTerrain] s_scale not found, will assume 1.");
 
-            _enqueueMeshMethod   = zoneT?.GetMethod("EnqueueMesh",
-                BindingFlags.NonPublic | BindingFlags.Instance);
             _finishSkinNowMethod = zoneT?.GetMethod("FinishSkinNow",
                 BindingFlags.NonPublic | BindingFlags.Instance);
             _activateMethod      = zoneT?.GetMethod("Activate",
@@ -65,7 +43,6 @@ namespace ProceduralTerrain
                 BindingFlags.NonPublic | BindingFlags.Instance);
             _hmapField           = zoneT?.GetField("_hmap",
                 BindingFlags.NonPublic | BindingFlags.Instance);
-            if (_enqueueMeshMethod   == null) Log.LogWarning("[ProceduralTerrain] EnqueueMesh not found.");
             if (_finishSkinNowMethod == null) Log.LogWarning("[ProceduralTerrain] FinishSkinNow not found.");
             if (_activateMethod      == null) Log.LogWarning("[ProceduralTerrain] Activate not found — hot-reload will not work.");
             if (_unskinMethod        == null) Log.LogWarning("[ProceduralTerrain] Unskin not found — hot-reload will not work.");
@@ -84,25 +61,9 @@ namespace ProceduralTerrain
             if (_locationInstancesField == null)
                 Log.LogWarning("[ProceduralTerrain] m_locationInstances not found — location protection off.");
 
-            // HeightGrid delegates — Scale property and [x,z] indexer
+            // HeightGrid Scale delegate
             var gridT      = FindType("Voxheim.Core.HeightGrid", "Voxheim.Core");
-            var gridGet    = gridT?.GetMethod("get_Item",
-                BindingFlags.Public | BindingFlags.Instance,
-                null, new[] { typeof(int), typeof(int) }, null);
             var gridScaleP = gridT?.GetProperty("Scale", BindingFlags.Public | BindingFlags.Instance);
-            if (gridT != null && gridGet != null)
-            {
-                var gdm = new DynamicMethod("HG_Get", typeof(float),
-                    new[] { typeof(object), typeof(int), typeof(int) },
-                    typeof(Plugin).Module, skipVisibility: true);
-                var ggi = gdm.GetILGenerator();
-                ggi.Emit(OpCodes.Ldarg_0); ggi.Emit(OpCodes.Castclass, gridT);
-                ggi.Emit(OpCodes.Ldarg_1); ggi.Emit(OpCodes.Ldarg_2);
-                ggi.Emit(OpCodes.Callvirt, gridGet);
-                ggi.Emit(OpCodes.Ret);
-                _gridGet = (Func<object,int,int,float>)gdm.CreateDelegate(typeof(Func<object,int,int,float>));
-            }
-            else { Log.LogWarning("[ProceduralTerrain] HeightGrid.get_Item not found — pt_probe_grid unavailable."); }
             if (gridT != null && gridScaleP?.GetMethod != null)
             {
                 var sdm = new DynamicMethod("HG_Scale", typeof(float),
@@ -137,9 +98,7 @@ namespace ProceduralTerrain
             int ox = (int)Plugin._zoneOriginX.GetValue(__instance)!;
             int oz = (int)Plugin._zoneOriginZ.GetValue(__instance)!;
             string key = $"{ox},{oz}";
-            Plugin._zoneParams.Remove(key);
             Plugin._sdfCache.Remove(key);
-            Plugin._zoneExtHi.Remove(key);
             lock (Plugin._surfHCache) Plugin._surfHCache.Remove((ox, oz));
         }
     }
@@ -166,10 +125,6 @@ namespace ProceduralTerrain
                 catch (Exception e) { Plugin.Log.LogError($"[PT] Carve ({ox},{oz}): {e.Message}"); return; }
                 if (!Plugin._sdfCache.TryGetValue(zoneKey, out c)) return;
             }
-
-            // Ensure _zoneParams is populated even when SDF came from bake cache (Carve() was skipped).
-            if (!Plugin._zoneParams.ContainsKey(zoneKey))
-                Plugin._zoneParams[zoneKey] = (ox, oz, width, context.InitialScanLo, context.InitialScanHi);
 
             for (int ci = 0; ci < width; ci++)
             for (int ri = 0; ri < width; ri++)

@@ -79,8 +79,7 @@ namespace ProceduralTerrain
     {
         internal static ManualLogSource Log = null!;
 
-        // HeightGrid delegates. Built in BuildDelegates.
-        internal static Func<object, int, int, float>?        _gridGet;
+        // HeightGrid scale delegate. Built in BuildDelegates.
         internal static Func<object, float>?                  _gridScale;
 
         // World units per voxel — read lazily, Voxheim initialises it after plugin load.
@@ -138,9 +137,6 @@ namespace ProceduralTerrain
         const float LocProtectR = 10f; // minimum protection radius when exteriorRadius is unavailable
 
         // ── Zone tracking for hot-reload ──────────────────────────────────────────
-        internal static readonly Dictionary<string, (int ox, int oz, int w, int yLo, int yHi)>
-            _zoneParams = new();
-        internal static MethodInfo? _enqueueMeshMethod;
         internal static MethodInfo? _finishSkinNowMethod;
         internal static MethodInfo? _activateMethod;
         internal static MethodInfo? _unskinMethod;
@@ -168,10 +164,8 @@ namespace ProceduralTerrain
         internal static FastNoiseLite? _mbNoise;        // Mode B: 3D wall perturbation
 
         // ── Per-brick SDF cache ───────────────────────────────────────────────────
-        internal static ConstructorInfo? _int3Ctor;
         internal static FieldInfo?       _zoneOriginX;
         internal static FieldInfo?       _zoneOriginZ;
-        internal static readonly Dictionary<string, int> _zoneExtHi = new();
 
         // Scratch buffers for BFS biome blend.
         // _biomeFrac: supersampled fractional biome weights per padded coarse cell.
@@ -200,10 +194,8 @@ namespace ProceduralTerrain
         // Includes overlap region so border columns near zone edges are correct.
         internal static readonly Dictionary<(int ox, int oz), (int bw, int extLo, float s, float[] surfH)> _surfHCache = new();
 
-        // Int3 field accessors — used by FallbackDensityPatch to extract X/Y/Z from boxed struct.
-
         // ── Cross-zone grounding face cache ──────────────────────────────────────
-        // Indexed by (ox, oz) territory origin (same coordinates as _zoneParams).
+        // Indexed by (ox, oz) territory origin.
         // Each face array is [bh * bw] bytes: 0=air, 1=grounded solid.
         // Faces are at the territory boundary: negX=cx=overlap, posX=cx=overlap+w-1, etc.
         internal struct ZoneFaceCache {
@@ -424,14 +416,6 @@ namespace ProceduralTerrain
 
         internal static int _dumpZonesRemaining = 0;
 
-        // Voxheim queue diagnostic — reflected once, logged periodically
-        static System.Reflection.FieldInfo? _vhPendingZones;
-        static System.Reflection.FieldInfo? _vhDeferredRemeshes;
-        static System.Reflection.FieldInfo? _vhSZones;
-        static System.Reflection.FieldInfo? _vhIsActive;
-        static System.Reflection.FieldInfo? _vhIsPending;
-        static int _diagFrame;
-
         static int _pollFrame;
         void Update()
         {
@@ -439,48 +423,6 @@ namespace ProceduralTerrain
             {
                 _hotReloadPending = false;
                 RecarveAll();
-            }
-
-            // Voxheim mesh queue diagnostic — log every ~10 s
-            if (++_diagFrame % 600 == 0)
-            {
-                try
-                {
-                    if (_vhPendingZones == null || _vhDeferredRemeshes == null)
-                    {
-                        var flags = System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance;
-                        var voxelZoneType = System.AppDomain.CurrentDomain.GetAssemblies()
-                            .SelectMany(a => { try { return a.GetTypes(); } catch { return System.Array.Empty<System.Type>(); } })
-                            .FirstOrDefault(t => t.Name == "VoxelZone");
-                        if (voxelZoneType != null)
-                        {
-                            _vhPendingZones     = voxelZoneType.GetField("s_pendingZones",     System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic);
-                            _vhDeferredRemeshes = voxelZoneType.GetField("s_deferredRemeshes", System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic);
-                            _vhSZones           = voxelZoneType.GetField("s_zones",            System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic);
-                            _vhIsActive         = voxelZoneType.GetField("_isActive",          System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
-                            _vhIsPending        = voxelZoneType.GetField("_pending",           System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
-                        }
-                    }
-                    if (_vhPendingZones != null && _vhDeferredRemeshes != null)
-                    {
-                        var pending  = _vhPendingZones.GetValue(null)    as System.Collections.ICollection;
-                        var deferred = _vhDeferredRemeshes.GetValue(null) as System.Collections.ICollection;
-                        int active = 0, pend = 0, stale = 0;
-                        if (_vhSZones != null && _vhIsActive != null && _vhIsPending != null)
-                        {
-                            var szones = _vhSZones.GetValue(null) as System.Collections.IDictionary;
-                            if (szones != null)
-                                foreach (var v in szones.Values)
-                                {
-                                    bool ia = (bool)(_vhIsActive.GetValue(v) ?? false);
-                                    bool ip = (bool)(_vhIsPending.GetValue(v) ?? false);
-                                    if (ia) active++; else if (ip) pend++; else stale++;
-                                }
-                        }
-                        Log.LogDebug($"[ProceduralTerrain] Voxheim queues: pending={pending?.Count ?? -1} deferred={deferred?.Count ?? -1} zones(active={active} pending={pend} stale={stale})");
-                    }
-                }
-                catch (System.Exception e) { Log.LogWarning($"[ProceduralTerrain] diag error: {e.Message}"); }
             }
 
             // Fast-poll while waiting for location data (zone modifications are deferred

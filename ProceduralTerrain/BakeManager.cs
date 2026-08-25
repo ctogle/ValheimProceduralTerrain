@@ -294,8 +294,6 @@ namespace ProceduralTerrain
             _bakePending.Clear();
             _bakeData = null;
             _bakeLoadAttempted = false;
-            _zoneParams.Clear();
-            _zoneExtHi.Clear();
             _sdfCache.Clear();
             _heightCache.Clear();
             lock (_surfHCache) _surfHCache.Clear();
@@ -326,7 +324,6 @@ namespace ProceduralTerrain
             _sdfCache.Clear();
             _heightCache.Clear();
             lock (_surfHCache) _surfHCache.Clear();
-            _zoneExtHi.Clear();
             _zoneFaceCache.Clear();
 
             if (_activateMethod == null || _unskinMethod == null || _hmapField == null || _finishSkinNowMethod == null)
