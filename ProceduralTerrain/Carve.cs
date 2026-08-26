@@ -39,6 +39,9 @@ namespace ProceduralTerrain
     {
         [ThreadStatic] static CarveBuffers _cb;
 
+        static float BL(float[] a, int i00, int i10, int i01, int i11, float fx, float fz) =>
+            Mathf.Lerp(Mathf.Lerp(a[i00], a[i10], fx), Mathf.Lerp(a[i01], a[i11], fx), fz);
+
         // ── Carve pass ────────────────────────────────────────────────────────────
         internal static void Carve(object? grid, int ox, int oz, int width, int yLo, int yHi, float gridScale = 0f)
         {
@@ -1339,12 +1342,9 @@ namespace ProceduralTerrain
                     float bfx2 = (cx & 3) * 0.25f, bfz2 = (cz & 3) * 0.25f;
                     int b00 = cx4 * cw4 + cz4, b10 = cx4b * cw4 + cz4;
                     int b01 = cx4 * cw4 + cz4b, b11 = cx4b * cw4 + cz4b;
-                    static float BL2(float[] a, int i00, int i10, int i01, int i11, float fx, float fz) =>
-                        Mathf.Lerp(Mathf.Lerp(a[i00], a[i10], fx),
-                                   Mathf.Lerp(a[i01], a[i11], fx), fz);
-                    float wf    = BL2(_cb.bk2dMbwf!, b00, b10, b01, b11, bfx2, bfz2);
-                    float wa    = BL2(_cb.bk2dMbwa!, b00, b10, b01, b11, bfx2, bfz2);
-                    float yo    = BL2(_cb.bk2dMbyo!, b00, b10, b01, b11, bfx2, bfz2);
+                    float wf    = BL(_cb.bk2dMbwf!, b00, b10, b01, b11, bfx2, bfz2);
+                    float wa    = BL(_cb.bk2dMbwa!, b00, b10, b01, b11, bfx2, bfz2);
+                    float yo    = BL(_cb.bk2dMbyo!, b00, b10, b01, b11, bfx2, bfz2);
                     float locF2 = LocationFactor(wx, wz, nearbyLocs);
                     float dx    = _hmWarpX!.GetNoise(wx * wf, wz * wf) * (wa * locF2);
                     float dz2   = _hmWarpZ!.GetNoise(wx * wf, wz * wf) * (wa * locF2);
@@ -1375,8 +1375,7 @@ namespace ProceduralTerrain
                 int b201 =  cx4  * cw4 + cz4b, b211 =  cx4b * cw4 + cz4b;
                 int bb00 = b200 * bh, bb10 = b210 * bh, bb01 = b201 * bh, bb11 = b211 * bh;
 
-                static float BL(float[] a, int i00, int i10, int i01, int i11, float fx, float fz) =>
-                    Mathf.Lerp(Mathf.Lerp(a[i00], a[i10], fx), Mathf.Lerp(a[i01], a[i11], fx), fz);
+
 
                 float profMcT    = BL(_cb.bk2dMcT!,     b200, b210, b201, b211, bfx, bfz);
                 float profMcFlare= BL(_cb.bk2dMcFlare!, b200, b210, b201, b211, bfx, bfz);

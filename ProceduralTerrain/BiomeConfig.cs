@@ -429,15 +429,15 @@ namespace ProceduralTerrain
         }
 
         // ── voxcaves_probe: biome blend breakdown logged to console ──────────────────
-        static void ProbeBlend(float worldX, float worldZ, WorldGenerator wg, float s)
+        static Dictionary<int, int> SetupPointBlend(float worldX, float worldZ, WorldGenerator wg, float s,
+            out float coarseStep, out int pcw, out int pgSize, out int maxHops, out int center)
         {
-            var   profs      = _biomeProfiles;
-            float coarseStep = 4f * s;
-            int   pad        = (int)(_biomeBlendRadius / coarseStep) + 2;
-            int   pcw        = 1 + 2 * pad;
-            int   pgSize     = pcw * pcw;
-            int   maxHops    = (int)(_biomeBlendRadius / coarseStep) + 1;
-            int   center     = pad * pcw + pad;
+            coarseStep = 4f * s;
+            int pad  = (int)(_biomeBlendRadius / coarseStep) + 2;
+            pcw      = 1 + 2 * pad;
+            pgSize   = pcw * pcw;
+            maxHops  = (int)(_biomeBlendRadius / coarseStep) + 1;
+            center   = pad * pcw + pad;
 
             int fracStride = pgSize * MaxBiomeSlots;
             if (_biomeFrac == null || _biomeFrac.Length < fracStride) _biomeFrac = new float[fracStride];
@@ -467,6 +467,14 @@ namespace ProceduralTerrain
                     _biomeFrac[cellBase + slot] += subWeight;
                 }
             }
+            return biomeSlot;
+        }
+
+        static void ProbeBlend(float worldX, float worldZ, WorldGenerator wg, float s)
+        {
+            var profs     = _biomeProfiles;
+            var biomeSlot = SetupPointBlend(worldX, worldZ, wg, s,
+                out float coarseStep, out int pcw, out int pgSize, out int maxHops, out int center);
 
             // Center cell fractions (what fraction of sub-samples at this exact cell are each biome)
             var sb = new System.Text.StringBuilder();
@@ -520,42 +528,9 @@ namespace ProceduralTerrain
         // Used by callers that need a blend for a single world point (e.g. hot-reload ceiling estimate).
         static CaveProfile PointBlendProfile(float worldX, float worldZ, WorldGenerator wg, float s)
         {
-            var   profs      = _biomeProfiles;
-            float coarseStep = 4f * s;
-            int   pad        = (int)(_biomeBlendRadius / coarseStep) + 2;
-            int   pcw        = 1 + 2 * pad;
-            int   pgSize     = pcw * pcw;
-            int   maxHops    = (int)(_biomeBlendRadius / coarseStep) + 1;
-            int   center     = pad * pcw + pad;
-
-            int fracStride = pgSize * MaxBiomeSlots;
-            if (_biomeFrac == null || _biomeFrac.Length < fracStride) _biomeFrac = new float[fracStride];
-            Array.Clear(_biomeFrac, 0, fracStride);
-            if (_biomeDist == null || _biomeDist.Length < pgSize) _biomeDist = new int[pgSize];
-            if (_biomeBfsQ == null || _biomeBfsQ.Length < pgSize) _biomeBfsQ = new int[pgSize];
-
-            var biomeSlot = new Dictionary<int, int>(MaxBiomeSlots);
-            float subWeight = 1f / (SuperN * SuperN);
-            for (int px = 0; px < pcw; px++)
-            for (int pz = 0; pz < pcw; pz++)
-            {
-                float cx = worldX + (px - pad) * coarseStep;
-                float cz = worldZ + (pz - pad) * coarseStep;
-                int cellBase = (px * pcw + pz) * MaxBiomeSlots;
-                for (int si = 0; si < SuperN; si++)
-                for (int sk = 0; sk < SuperN; sk++)
-                {
-                    int b = (int)wg.GetBiome(cx + (si + 0.5f) * coarseStep / SuperN,
-                                             cz + (sk + 0.5f) * coarseStep / SuperN);
-                    if (!biomeSlot.TryGetValue(b, out int slot))
-                    {
-                        if (biomeSlot.Count >= MaxBiomeSlots) continue;
-                        slot = biomeSlot.Count;
-                        biomeSlot[b] = slot;
-                    }
-                    _biomeFrac[cellBase + slot] += subWeight;
-                }
-            }
+            var profs     = _biomeProfiles;
+            var biomeSlot = SetupPointBlend(worldX, worldZ, wg, s,
+                out float coarseStep, out int pcw, out int pgSize, out int maxHops, out int center);
 
             var   result = new CaveProfile();
             float totW   = 0f;
