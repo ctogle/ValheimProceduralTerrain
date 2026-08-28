@@ -98,23 +98,25 @@ namespace ProceduralTerrain
                     nearbyLocs.Add(loc);
             }
 
-            int hiMargin = 24;
+            int hiMargin = 24, loMargin = 24;
             {
-                float maxExtM = 0f;
+                float maxExtM = 0f, maxFloor = 0f;
                 void CheckProf(CaveProfile cp) {
-                    if (cp.modeC_noiseAmp <= 0f) return;
-                    float a = cp.modeC_noiseAmp * Mathf.Max(1f, 1f + cp.modeC_ampVary);
-                    float e = Mathf.Max(0f, 1f - cp.modeC_threshold) * a + cp.modeC_warpAmp;
-                    if (e > maxExtM) maxExtM = e;
+                    if (cp.modeC_noiseAmp > 0f) {
+                        float a = cp.modeC_noiseAmp * Mathf.Max(1f, 1f + cp.modeC_ampVary);
+                        float e = Mathf.Max(0f, 1f - cp.modeC_threshold) * a + cp.modeC_warpAmp;
+                        if (e > maxExtM) maxExtM = e;
+                    }
+                    if (cp.floorDepth > maxFloor) maxFloor = cp.floorDepth;
                 }
                 CheckProf(centerProf);
                 CheckProf(ProfAt(0,       0      )); CheckProf(ProfAt(lastC, 0      ));
                 CheckProf(ProfAt(0,       lastC  )); CheckProf(ProfAt(lastC, lastC  ));
-                if (maxExtM > 0f)
-                    hiMargin = Mathf.Max(24, (int)Mathf.Ceil(maxExtM / s) + 8);
+                if (maxExtM  > 0f) hiMargin = Mathf.Max(24, (int)Mathf.Ceil(maxExtM  / s) + 8);
+                if (maxFloor > 0f) loMargin = Mathf.Max(24, (int)Mathf.Ceil(maxFloor / s) + 4);
             }
 
-            int extLo   = yLo - 24, extHi = yHi + hiMargin;
+            int extLo   = yLo - loMargin, extHi = yHi + hiMargin;
             int bw      = width + 2 * overlap;
             int bh      = extHi - extLo + 1;
             int bufSize = bw * bh * bw;
@@ -688,26 +690,29 @@ namespace ProceduralTerrain
 
             if (wg != null) BakeBlendedProfiles(cw4, ox, oz, overlap, s, wg);
 
-            int hiMargin = 24;
+            int hiMargin = 24, loMargin = 24;
             if (_blendedProfs != null)
             {
-                float maxExtM = 0f;
+                float maxExtM = 0f, maxFloor = 0f;
                 int   lastC   = cw4 - 1;
                 void CheckCP(int ci, int cj) {
                     int idx = ci * cw4 + cj;
                     if (idx >= _blendedProfs.Length) return;
                     var cp = _blendedProfs[idx];
-                    if (cp.modeC_noiseAmp <= 0f) return;
-                    float a = cp.modeC_noiseAmp * Mathf.Max(1f, 1f + cp.modeC_ampVary);
-                    float e = Mathf.Max(0f, 1f - cp.modeC_threshold) * a + cp.modeC_warpAmp;
-                    if (e > maxExtM) maxExtM = e;
+                    if (cp.modeC_noiseAmp > 0f) {
+                        float a = cp.modeC_noiseAmp * Mathf.Max(1f, 1f + cp.modeC_ampVary);
+                        float e = Mathf.Max(0f, 1f - cp.modeC_threshold) * a + cp.modeC_warpAmp;
+                        if (e > maxExtM) maxExtM = e;
+                    }
+                    if (cp.floorDepth > maxFloor) maxFloor = cp.floorDepth;
                 }
                 CheckCP(cw4/2, cw4/2);
                 CheckCP(0, 0); CheckCP(lastC, 0); CheckCP(0, lastC); CheckCP(lastC, lastC);
-                if (maxExtM > 0f) hiMargin = Mathf.Max(24, (int)Mathf.Ceil(maxExtM / s) + 8);
+                if (maxExtM  > 0f) hiMargin = Mathf.Max(24, (int)Mathf.Ceil(maxExtM  / s) + 8);
+                if (maxFloor > 0f) loMargin = Mathf.Max(24, (int)Mathf.Ceil(maxFloor / s) + 4);
             }
 
-            int extLo  = yLo - 24;
+            int extLo  = yLo - loMargin;
             int extHi  = yHi + hiMargin;
             int bhZ    = extHi - extLo + 1;
             int bufSz  = bwZ * bhZ * bwZ;

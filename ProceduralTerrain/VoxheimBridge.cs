@@ -115,8 +115,6 @@ namespace ProceduralTerrain
             int oz    = context.OriginZ;
             int width = context.Width;
 
-            builder.SetFloor(context.Floor);
-
             string zoneKey = $"{ox},{oz}";
             if (!Plugin._sdfCache.TryGetValue(zoneKey, out var c))
             {
@@ -125,6 +123,9 @@ namespace ProceduralTerrain
                 catch (Exception e) { Plugin.Log.LogError($"[PT] Carve ({ox},{oz}): {e.Message}"); return; }
                 if (!Plugin._sdfCache.TryGetValue(zoneKey, out c)) return;
             }
+
+            builder.SetFloor(context.Floor);
+            builder.IncludeY(c.extLo, c.extLo + c.bh - 1);
 
             for (int ci = 0; ci < width; ci++)
             for (int ri = 0; ri < width; ri++)

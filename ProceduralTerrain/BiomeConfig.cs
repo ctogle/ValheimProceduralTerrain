@@ -35,6 +35,49 @@ namespace ProceduralTerrain
             Path.Combine(BepInEx.Paths.ConfigPath, "procedural_terrain_biomes.cfg");
 
         // Apply a flat key→value list on top of a base CaveProfile (struct copy).
+        // Parses "profA * w + profB * w + ..." into a normalized blended profile.
+        // Profiles are resolved from `named`; unknown names are silently skipped.
+        // Coefficient may appear on either side of *. Order of terms in cfg matters:
+        // a profile can only reference profiles defined above it.
+        static CaveProfile ParseBlendExpression(string expr, Dictionary<string, CaveProfile> named)
+        {
+            var inv = System.Globalization.CultureInfo.InvariantCulture;
+            var result = new CaveProfile();
+            float totW = 0f;
+            foreach (var term in expr.Split('+'))
+            {
+                var t = term.Trim();
+                float weight = 1f;
+                string profName = t;
+                int star = t.LastIndexOf('*');
+                if (star >= 0)
+                {
+                    var left  = t.Substring(0, star).Trim();
+                    var right = t.Substring(star + 1).Trim();
+                    if (float.TryParse(right, System.Globalization.NumberStyles.Float, inv, out float wr))
+                    { weight = wr; profName = left; }
+                    else if (float.TryParse(left, System.Globalization.NumberStyles.Float, inv, out float wl))
+                    { weight = wl; profName = right; }
+                    else continue;
+                }
+                if (!named.TryGetValue(profName, out var prof))
+                {
+                    Log.LogWarning($"[ProceduralTerrain] base blend: profile '{profName}' not found.");
+                    continue;
+                }
+                AccumulateProfile(ref result, ref totW, in prof, weight);
+            }
+            // Structural params must not be summed from components — reset to defaults
+            // so they are strictly controlled by the real profile's own key overrides.
+            var d = CaveProfile.Default;
+            result.floorDepth   = d.floorDepth;
+            result.floorFade    = d.floorFade;
+            result.blur_passes  = d.blur_passes;
+            result.perona_k     = d.perona_k;
+            result.perona_lambda = d.perona_lambda;
+            return result;
+        }
+
         static CaveProfile ApplyProfile(
             IEnumerable<(string key, string val)> kvs, CaveProfile p)
         {
@@ -129,12 +172,18 @@ namespace ProceduralTerrain
             }
 
             // Pass 1: named profiles  [Profile:name]
+            // A profile may include: base = profA * w + profB * w + ...
+            // which sets a blended starting point before per-key overrides.
+            // Profiles may only reference profiles defined earlier in the file.
             var named = new Dictionary<string, CaveProfile>(StringComparer.OrdinalIgnoreCase);
             foreach (var (name, kvs) in sections)
             {
                 if (!name.StartsWith("Profile:", StringComparison.OrdinalIgnoreCase)) continue;
                 string profName = name.Substring(8).Trim();
-                named[profName] = ApplyProfile(kvs, CaveProfile.Default);
+                CaveProfile baseProf = CaveProfile.Default;
+                foreach (var (k, v) in kvs)
+                    if (k == "base") { baseProf = ParseBlendExpression(v, named); break; }
+                named[profName] = ApplyProfile(kvs, baseProf);
             }
 
             // Pass 2: debug + biome assignments
@@ -211,6 +260,9 @@ namespace ProceduralTerrain
             sb.AppendLine("# Define profiles with [Profile:name], assign to biomes with:");
             sb.AppendLine("#   profile = name");
             sb.AppendLine("# Params listed directly in a [BiomeName] section override the profile.");
+            sb.AppendLine("# Profiles may blend others as a base layer (must be defined above):");
+            sb.AppendLine("#   base = profileA * 0.5 + profileB * 2.0");
+            sb.AppendLine("# Per-param overrides are applied on top of the blended base.");
             sb.AppendLine("#");
             sb.AppendLine("# ── Full parameter reference (copy to start a new profile) ─────────────");
             sb.AppendLine("# [Profile:my_profile]");
@@ -222,7 +274,7 @@ namespace ProceduralTerrain
             sb.AppendLine("# modeB_radius          = 6      # half-thickness of carved band (world units)");
             sb.AppendLine("# modeB_warpAmp         = 80     # XZ warp displacement (world units)");
             sb.AppendLine("# modeB_warpFrequency   = 0.005  # spatial frequency of XZ warp");
-            sb.AppendLine("# modeB_vScale          = 0.5    # Y scale for 3D wall-noise (low=flat, high=vertical)");
+            sb.AppendLine("# modeB_vScale          = 0.5    # Y scale in noise space (low=vertical walls, high=horizontal banding)");
             sb.AppendLine("# modeB_noiseAmp        = 0      # 3D SDF perturbation on band walls (world units; 0=off)");
             sb.AppendLine("# modeB_yOffset         = 0      # push band centre N units below surface (0=trench; >mbR=enclosed cave)");
             sb.AppendLine("# # Mode A — 3D noise tunnel network (punches through Mode C solid)");
@@ -232,7 +284,7 @@ namespace ProceduralTerrain
             sb.AppendLine("# modeA_warpAmp         = 5      # 3D domain-warp displacement XZ (world units)");
             sb.AppendLine("# modeA_warpAmpY        = 0      # 3D domain-warp displacement Y/vertical (world units; 0=no Y bend)");
             sb.AppendLine("# modeA_warpFrequency   = 0.02   # spatial frequency of domain warp");
-            sb.AppendLine("# modeA_vScale          = 0.1    # Y stretch (low=flat, high=vertical)");
+            sb.AppendLine("# modeA_vScale          = 0.1    # Y scale in noise space (low=vertical shafts, high=horizontal caverns)");
             sb.AppendLine("# modeA_widthVary       = 1      # tunnel-width spatial variation (0=uniform)");
             sb.AppendLine("# modeA_widthFrequency  = 0.02   # spatial frequency of width variation");
             sb.AppendLine("# # Mode C — 3D density field raising solid terrain above the heightmap");
