@@ -120,6 +120,8 @@ namespace ProceduralTerrain
                     case "modec_ampfrequency":    p.modeC_ampFrequency    = v; break;
                     case "modec_flare":           p.modeC_flare           = v; break;
                     case "modec_yoffset":         p.modeC_yOffset         = v; break;
+                    case "moded_noiseamp":        p.modeD_noiseAmp        = v; break;
+                    case "moded_frequency":       p.modeD_frequency       = v; break;
                     case "blur_passes":            p.blur_passes            = v; break;
                     case "perona_k":              p.perona_k              = v; break;
                     case "perona_lambda":         p.perona_lambda         = v; break;
@@ -454,6 +456,8 @@ namespace ProceduralTerrain
             acc.modeC_ampFrequency   += w * prof.modeC_ampFrequency;
             acc.modeC_flare          += w * prof.modeC_flare;
             acc.modeC_yOffset        += w * prof.modeC_yOffset;
+            acc.modeD_noiseAmp       += w * prof.modeD_noiseAmp;
+            acc.modeD_frequency      += w * prof.modeD_frequency;
             acc.blur_passes          += w * prof.blur_passes;
             acc.perona_k             += w * prof.perona_k;
             acc.perona_lambda        += w * prof.perona_lambda;
@@ -476,6 +480,7 @@ namespace ProceduralTerrain
             p.modeC_warpFrequency  *= rcp; p.modeC_vScale        *= rcp;
             p.modeC_twist          *= rcp; p.modeC_twistVary     *= rcp; p.modeC_twistFrequency *= rcp;
             p.modeC_ampVary        *= rcp; p.modeC_ampFrequency  *= rcp; p.modeC_flare *= rcp; p.modeC_yOffset *= rcp;
+            p.modeD_noiseAmp       *= rcp; p.modeD_frequency     *= rcp;
             p.blur_passes          *= rcp; p.perona_k            *= rcp;
             p.perona_lambda        *= rcp; p.floorDepth          *= rcp; p.floorFade *= rcp;
         }

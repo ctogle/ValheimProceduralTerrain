@@ -45,6 +45,10 @@ namespace ProceduralTerrain
         public float modeC_flare;          // widens feature toward top (positive) or narrows (negative)
         public float modeC_yOffset;        // shift density field anchor this many units below the heightmap (0=surface)
 
+        // ── Mode D: diagnostic sine-wave terrain modulation ──────────────────────────
+        public float modeD_noiseAmp;       // height of sine-wave ridges (world units; 0=off)
+        public float modeD_frequency;      // spatial frequency (rad/wu; default 2π/50 ≈ 0.1257)
+
         public float modeB_vScale;      // Y scale when sampling 3D wall-noise (low=flat, high=vertical)
         public float modeB_noiseAmp;   // amplitude of 3D SDF perturbation on Mode B walls (world units; 0=off)
         public float modeB_yOffset;    // push band centre this many units below the terrain surface (0=on surface; >mbR = enclosed cave)
@@ -69,6 +73,7 @@ namespace ProceduralTerrain
             modeC_warpAmp      = 8f,     modeC_warpFrequency = 0.005f, modeC_vScale       = 0.4f,
             modeC_twist        = 0f,     modeC_twistVary     = 0f,     modeC_twistFrequency = 0.003f,
             modeC_ampVary      = 0f,     modeC_ampFrequency  = 0.003f, modeC_flare          = 0f,
+            modeD_noiseAmp = 0f, modeD_frequency = 0.1257f,
             floorDepth      = 8f,
         };
     }

@@ -953,7 +953,8 @@ namespace ProceduralTerrain
             float mbWarpedH, float mbR, float mbNA, float mbVS, float mbWF, float mbTwist,
             int bb00, int bb10, int bb01, int bb11, float bfx, float bfz,
             float mAwf, float mAwa, float mAway, float mAf, float mAvs, float mAw, float mAwv, float mAwvf,
-            float worldX, float worldZ, bool bakeC, bool bakeA)
+            float worldX, float worldZ, bool bakeC, bool bakeA,
+            float mdAmp, float mdFreq)
         {
             int cyMbLo = bh, cyMbHi = -1;
             if (mbR > 0f)
@@ -968,72 +969,13 @@ namespace ProceduralTerrain
                 }
             }
 
-            for (int cy = 0; cy < cyMbLo; cy++)
+            for (int cy = 0; cy < bh; cy++)
             {
                 float worldY   = (extLo + cy) * s;
                 float baseSDF  = worldY - h;
                 float combined = baseSDF;
 
-                if (mcActive)
-                {
-                    float relY = worldY - addH;
-                    float n;
-                    {
-                        float n0 = _cb.noiseBuf![bb00+cy] + (_cb.noiseBuf[bb10+cy] - _cb.noiseBuf![bb00+cy]) * bfx;
-                        float n1 = _cb.noiseBuf![bb01+cy] + (_cb.noiseBuf[bb11+cy] - _cb.noiseBuf![bb01+cy]) * bfx;
-                        n = n0 + (n1-n0) * bfz;
-                    }
-                    float _ft = Mathf.Clamp01(relY / localAmp);
-                    float effMcT = profMcT - profMcFlare * (4f * _ft * (1f - _ft));
-                    float sdf = relY - (n - effMcT) * localAmp;
-                    combined = combined < sdf ? combined : sdf;
-                }
-
-                if (mAw > 0f)
-                {
-                    float na, nb, wn;
-                    if (bakeA)
-                    {
-                        float t0 = _cb.tunBuf![bb00+cy]  + (_cb.tunBuf[bb10+cy]  - _cb.tunBuf[bb00+cy])  * bfx;
-                        float t1 = _cb.tunBuf![bb01+cy]  + (_cb.tunBuf[bb11+cy]  - _cb.tunBuf[bb01+cy])  * bfx;
-                        na = t0 + (t1 - t0) * bfz;
-                        float t0b = _cb.tunBuf2![bb00+cy] + (_cb.tunBuf2[bb10+cy] - _cb.tunBuf2[bb00+cy]) * bfx;
-                        float t1b = _cb.tunBuf2![bb01+cy] + (_cb.tunBuf2[bb11+cy] - _cb.tunBuf2[bb01+cy]) * bfx;
-                        nb = t0b + (t1b - t0b) * bfz;
-                        float w0 = _cb.tunWBuf![bb00+cy] + (_cb.tunWBuf[bb10+cy] - _cb.tunWBuf[bb00+cy]) * bfx;
-                        float w1 = _cb.tunWBuf![bb01+cy] + (_cb.tunWBuf[bb11+cy] - _cb.tunWBuf[bb01+cy]) * bfx;
-                        wn = w0 + (w1 - w0) * bfz;
-                    }
-                    else
-                    {
-                        float sy  = worldY * mAvs;
-                        float wx  = _warpX! .GetNoise(worldX * mAwf, sy * mAwf, worldZ * mAwf) * mAwa;
-                        float wz  = _warpZ! .GetNoise(worldX * mAwf, sy * mAwf, worldZ * mAwf) * mAwa;
-                        float wy  = _warpY! .GetNoise(worldX * mAwf, sy * mAwf, worldZ * mAwf) * mAway;
-                        float wx2 = _warpX2!.GetNoise(worldX * mAwf, sy * mAwf, worldZ * mAwf) * mAwa;
-                        float wz2 = _warpZ2!.GetNoise(worldX * mAwf, sy * mAwf, worldZ * mAwf) * mAwa;
-                        float wy2 = _warpY2!.GetNoise(worldX * mAwf, sy * mAwf, worldZ * mAwf) * mAway;
-                        na = _caveNoise! .GetNoise((worldX + wx)  * mAf, (sy + wy)  * mAf, (worldZ + wz)  * mAf);
-                        nb = _caveNoise2!.GetNoise((worldX + wx2) * mAf, (sy + wy2) * mAf, (worldZ + wz2) * mAf);
-                        wn = _widthNoise!.GetNoise(worldX * mAwvf, (worldY * mAvs) * mAwvf, worldZ * mAwvf);
-                    }
-                    float localWidth = Mathf.Max(mAw * (1f + mAwv * wn), 0.001f);
-                    float dist      = Mathf.Sqrt(na * na + nb * nb) * 0.7071f;
-                    float tunnelSDF = (localWidth - dist) / localWidth * 4f * s;
-                    float sdf = Mathf.Min(tunnelSDF, worldY - floorY);
-                    combined = SmoothMax(combined, sdf, 2f * s);
-                }
-
-                float _fade = floorFade > 0f ? Mathf.Clamp01((worldY - floorY) / floorFade) : 1f;
-                buf[(cx * bh + cy) * bw + cz] = baseSDF + (combined - baseSDF) * locFac * _fade;
-            }
-
-            for (int cy = cyMbLo; cy <= cyMbHi; cy++)
-            {
-                float worldY   = (extLo + cy) * s;
-                float baseSDF  = worldY - h;
-                float combined = baseSDF;
-
+                if (mbR > 0f && cy >= cyMbLo && cy <= cyMbHi)
                 {
                     float bandSDF = mbR - Mathf.Abs(worldY - mbWarpedH);
                     if (mbNA > 0f)
@@ -1054,66 +996,12 @@ namespace ProceduralTerrain
                     if (sdf > combined) combined = sdf;
                 }
 
-                if (mcActive)
+                if (mdAmp > 0f)
                 {
-                    float relY = worldY - addH;
-                    float n;
-                    {
-                        float n0 = _cb.noiseBuf![bb00+cy] + (_cb.noiseBuf[bb10+cy] - _cb.noiseBuf![bb00+cy]) * bfx;
-                        float n1 = _cb.noiseBuf![bb01+cy] + (_cb.noiseBuf[bb11+cy] - _cb.noiseBuf![bb01+cy]) * bfx;
-                        n = n0 + (n1-n0) * bfz;
-                    }
-                    float _ft = Mathf.Clamp01(relY / localAmp);
-                    float effMcT = profMcT - profMcFlare * (4f * _ft * (1f - _ft));
-                    float sdf = relY - (n - effMcT) * localAmp;
-                    combined = combined < sdf ? combined : sdf;
+                    float mdn   = Mathf.Sin(worldX * mdFreq) * 0.5f + 0.5f;
+                    float mdSdf = (worldY - h) - mdn * mdAmp;
+                    combined = combined < mdSdf ? combined : mdSdf;
                 }
-
-                if (mAw > 0f)
-                {
-                    float na, nb, wn;
-                    if (bakeA)
-                    {
-                        float t0 = _cb.tunBuf![bb00+cy]  + (_cb.tunBuf[bb10+cy]  - _cb.tunBuf[bb00+cy])  * bfx;
-                        float t1 = _cb.tunBuf![bb01+cy]  + (_cb.tunBuf[bb11+cy]  - _cb.tunBuf[bb01+cy])  * bfx;
-                        na = t0 + (t1 - t0) * bfz;
-                        float t0b = _cb.tunBuf2![bb00+cy] + (_cb.tunBuf2[bb10+cy] - _cb.tunBuf2[bb00+cy]) * bfx;
-                        float t1b = _cb.tunBuf2![bb01+cy] + (_cb.tunBuf2[bb11+cy] - _cb.tunBuf2[bb01+cy]) * bfx;
-                        nb = t0b + (t1b - t0b) * bfz;
-                        float w0 = _cb.tunWBuf![bb00+cy] + (_cb.tunWBuf[bb10+cy] - _cb.tunWBuf[bb00+cy]) * bfx;
-                        float w1 = _cb.tunWBuf![bb01+cy] + (_cb.tunWBuf[bb11+cy] - _cb.tunWBuf[bb01+cy]) * bfx;
-                        wn = w0 + (w1 - w0) * bfz;
-                    }
-                    else
-                    {
-                        float sy  = worldY * mAvs;
-                        float wx  = _warpX! .GetNoise(worldX * mAwf, sy * mAwf, worldZ * mAwf) * mAwa;
-                        float wz  = _warpZ! .GetNoise(worldX * mAwf, sy * mAwf, worldZ * mAwf) * mAwa;
-                        float wy  = _warpY! .GetNoise(worldX * mAwf, sy * mAwf, worldZ * mAwf) * mAway;
-                        float wx2 = _warpX2!.GetNoise(worldX * mAwf, sy * mAwf, worldZ * mAwf) * mAwa;
-                        float wz2 = _warpZ2!.GetNoise(worldX * mAwf, sy * mAwf, worldZ * mAwf) * mAwa;
-                        float wy2 = _warpY2!.GetNoise(worldX * mAwf, sy * mAwf, worldZ * mAwf) * mAway;
-                        na = _caveNoise! .GetNoise((worldX + wx)  * mAf, (sy + wy)  * mAf, (worldZ + wz)  * mAf);
-                        nb = _caveNoise2!.GetNoise((worldX + wx2) * mAf, (sy + wy2) * mAf, (worldZ + wz2) * mAf);
-                        wn = _widthNoise!.GetNoise(worldX * mAwvf, (worldY * mAvs) * mAwvf, worldZ * mAwvf);
-                    }
-                    float localWidth = Mathf.Max(mAw * (1f + mAwv * wn), 0.001f);
-                    float dist      = Mathf.Sqrt(na * na + nb * nb) * 0.7071f;
-                    float tunnelSDF = (localWidth - dist) / localWidth * 4f * s;
-                    float sdf = Mathf.Min(tunnelSDF, worldY - floorY);
-                    combined = SmoothMax(combined, sdf, 2f * s);
-                }
-
-                float _fade = floorFade > 0f ? Mathf.Clamp01((worldY - floorY) / floorFade) : 1f;
-                buf[(cx * bh + cy) * bw + cz] = baseSDF + (combined - baseSDF) * locFac * _fade;
-            }
-
-            int cy3Start = cyMbHi < cyMbLo ? cyMbLo : cyMbHi + 1;
-            for (int cy = cy3Start; cy < bh; cy++)
-            {
-                float worldY   = (extLo + cy) * s;
-                float baseSDF  = worldY - h;
-                float combined = baseSDF;
 
                 if (mcActive)
                 {
@@ -1170,8 +1058,7 @@ namespace ProceduralTerrain
             }
         }
 
-        // ── Per-point SDF for FallbackDensity patch ───────────────────────────────
-        // ── Placement height ──────────────────────────────────────────────────────
+        // ── Placement height ──────────────────────────────────────────────────────────
         internal static float FindCarvedSurfaceY(float worldX, float originalY, float worldZ)
         {
             float s = _scale is { } v && v > 0f ? v
@@ -1362,12 +1249,12 @@ namespace ProceduralTerrain
             int ox, int oz, int overlap, bool bakeC, bool bakeA, bool anyMbActive, WorldGenerator? wg, int cw4,
             List<(Vector2 pos, float extR)> nearbyLocs)
         {
-            long _setupTicks = 0L, _yloopTicks = 0L;
-            long _freq = System.Diagnostics.Stopwatch.Frequency;
+            int   ctrIdx = (cw4 / 2) * cw4 + (cw4 / 2);
+            float mdAmp  = _blendedProfs != null && _blendedProfs.Length > ctrIdx ? _blendedProfs[ctrIdx].modeD_noiseAmp  : 0f;
+            float mdFreq = _blendedProfs != null && _blendedProfs.Length > ctrIdx ? _blendedProfs[ctrIdx].modeD_frequency : 0.1257f;
             for (int cx = 0; cx < bw; cx++)
             for (int cz = 0; cz < bw; cz++)
             {
-                long _ta = System.Diagnostics.Stopwatch.GetTimestamp();
                 int   gx     = ox - overlap + cx, gz = oz - overlap + cz;
                 float worldX = gx * s,            worldZ = gz * s;
 
@@ -1442,18 +1329,15 @@ namespace ProceduralTerrain
                     mAwvf = BL(_cb.bk2dMawvf!, b200, b210, b201, b211, bfx, bfz);
                 }
 
-                long _tb = System.Diagnostics.Stopwatch.GetTimestamp();
-                _setupTicks += _tb - _ta;
                 FillYColumn(buf, bw, bh, extLo, s, cx, cz,
                     effectiveH, addH, profMcT, profMcFlare, localAmp, localAmp > 0f && bakeC,
                     locFac, floorY, profFlFade,
                     mbWarpedH, mbR, mbNA, mbVS, mbWF, mbTwist,
                     bb00, bb10, bb01, bb11, bfx, bfz,
                     mAwf, mAwa, mAway, mAf, mAvs, mAw, mAwv, mAwvf,
-                    worldX, worldZ, bakeC, bakeA);
-                _yloopTicks += System.Diagnostics.Stopwatch.GetTimestamp() - _tb;
+                    worldX, worldZ, bakeC, bakeA,
+                    mdAmp, mdFreq);
             }
-            Log.LogInfo($"[ProceduralTerrain] Ph1 breakdown: setup={_setupTicks*1000/_freq}ms yloop={_yloopTicks*1000/_freq}ms");
         }
     }
 
