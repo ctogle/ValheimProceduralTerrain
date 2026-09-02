@@ -317,6 +317,7 @@ namespace ProceduralTerrain
             _widthNoise      = null;
             _twistVaryNoise  = null;
             _mbNoise         = null;
+            _mdNoise         = null;
         }
 
         static void RecarveAll()

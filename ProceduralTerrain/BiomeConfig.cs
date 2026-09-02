@@ -121,7 +121,12 @@ namespace ProceduralTerrain
                     case "modec_flare":           p.modeC_flare           = v; break;
                     case "modec_yoffset":         p.modeC_yOffset         = v; break;
                     case "moded_noiseamp":        p.modeD_noiseAmp        = v; break;
-                    case "moded_frequency":       p.modeD_frequency       = v; break;
+                    case "moded_freqt":           p.modeD_freqT           = v; break;
+                    case "moded_freqn":           p.modeD_freqN           = v; break;
+                    case "moded_blurradius":      p.modeD_blurRadius      = v; break;
+                    case "moded_alignment":       p.modeD_alignment       = v; break;
+                    case "moded_vscale":          p.modeD_vScale          = v; break;
+                    case "moded_gradfade":        p.modeD_gradFade        = v; break;
                     case "blur_passes":            p.blur_passes            = v; break;
                     case "perona_k":              p.perona_k              = v; break;
                     case "perona_lambda":         p.perona_lambda         = v; break;
@@ -378,6 +383,7 @@ namespace ProceduralTerrain
             _addVaryNoise   = MakeNoise(10); // Mode C amplitude modulation
             _twistVaryNoise = MakeNoise(11); // Mode C twist scale modulation
             _mbNoise        = MakeNoise(12); // Mode B 3D wall perturbation
+            _mdNoise        = MakeNoise(17); // Mode D anisotropic noise field
         }
 
         // ── Per-column analytic floor ─────────────────────────────────────────────
@@ -457,7 +463,13 @@ namespace ProceduralTerrain
             acc.modeC_flare          += w * prof.modeC_flare;
             acc.modeC_yOffset        += w * prof.modeC_yOffset;
             acc.modeD_noiseAmp       += w * prof.modeD_noiseAmp;
-            acc.modeD_frequency      += w * prof.modeD_frequency;
+            float wdAmp = w * prof.modeD_noiseAmp;
+            acc.modeD_freqT          += wdAmp * prof.modeD_freqT;
+            acc.modeD_freqN          += wdAmp * prof.modeD_freqN;
+            acc.modeD_blurRadius     += wdAmp * prof.modeD_blurRadius;
+            acc.modeD_alignment      += wdAmp * prof.modeD_alignment;
+            acc.modeD_vScale         += wdAmp * prof.modeD_vScale;
+            acc.modeD_gradFade       += wdAmp * prof.modeD_gradFade;
             acc.blur_passes          += w * prof.blur_passes;
             acc.perona_k             += w * prof.perona_k;
             acc.perona_lambda        += w * prof.perona_lambda;
@@ -480,7 +492,10 @@ namespace ProceduralTerrain
             p.modeC_warpFrequency  *= rcp; p.modeC_vScale        *= rcp;
             p.modeC_twist          *= rcp; p.modeC_twistVary     *= rcp; p.modeC_twistFrequency *= rcp;
             p.modeC_ampVary        *= rcp; p.modeC_ampFrequency  *= rcp; p.modeC_flare *= rcp; p.modeC_yOffset *= rcp;
-            p.modeD_noiseAmp       *= rcp; p.modeD_frequency     *= rcp;
+            float mdAmpSum = p.modeD_noiseAmp;
+            p.modeD_noiseAmp *= rcp;
+            if (mdAmpSum > 0f) { p.modeD_freqT /= mdAmpSum; p.modeD_freqN /= mdAmpSum; p.modeD_blurRadius /= mdAmpSum; p.modeD_alignment /= mdAmpSum; p.modeD_vScale /= mdAmpSum; p.modeD_gradFade /= mdAmpSum; }
+            else { p.modeD_freqT = CaveProfile.Default.modeD_freqT; p.modeD_freqN = CaveProfile.Default.modeD_freqN; p.modeD_blurRadius = CaveProfile.Default.modeD_blurRadius; p.modeD_alignment = CaveProfile.Default.modeD_alignment; p.modeD_vScale = CaveProfile.Default.modeD_vScale; p.modeD_gradFade = CaveProfile.Default.modeD_gradFade; }
             p.blur_passes          *= rcp; p.perona_k            *= rcp;
             p.perona_lambda        *= rcp; p.floorDepth          *= rcp; p.floorFade *= rcp;
         }

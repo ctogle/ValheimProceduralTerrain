@@ -46,8 +46,13 @@ namespace ProceduralTerrain
         public float modeC_yOffset;        // shift density field anchor this many units below the heightmap (0=surface)
 
         // ── Mode D: diagnostic sine-wave terrain modulation ──────────────────────────
-        public float modeD_noiseAmp;       // height of sine-wave ridges (world units; 0=off)
-        public float modeD_frequency;      // spatial frequency (rad/wu; default 2π/50 ≈ 0.1257)
+        public float modeD_noiseAmp;       // amplitude of anisotropic noise ridges (world units; 0=off)
+        public float modeD_freqT;          // spatial frequency along T axis (tangential / dot(world,T))
+        public float modeD_freqN;          // spatial frequency along N axis (radial / blurH)
+        public float modeD_blurRadius;     // blur radius for gradient field (world units; default 128)
+        public float modeD_alignment;      // 0=radial ridges (freqT fast), 1=coast-parallel (freqN fast)
+        public float modeD_vScale;         // Y scale for 3D noise (low=flat/surface, high=volumetric)
+        public float modeD_gradFade;       // gradMag threshold below which amp fades to zero (0=off)
 
         public float modeB_vScale;      // Y scale when sampling 3D wall-noise (low=flat, high=vertical)
         public float modeB_noiseAmp;   // amplitude of 3D SDF perturbation on Mode B walls (world units; 0=off)
@@ -73,7 +78,7 @@ namespace ProceduralTerrain
             modeC_warpAmp      = 8f,     modeC_warpFrequency = 0.005f, modeC_vScale       = 0.4f,
             modeC_twist        = 0f,     modeC_twistVary     = 0f,     modeC_twistFrequency = 0.003f,
             modeC_ampVary      = 0f,     modeC_ampFrequency  = 0.003f, modeC_flare          = 0f,
-            modeD_noiseAmp = 0f, modeD_frequency = 0.1257f,
+            modeD_noiseAmp = 0f, modeD_freqT = 0.02f, modeD_freqN = 0.02f, modeD_blurRadius = 128f, modeD_alignment = 0f, modeD_vScale = 0.1f, modeD_gradFade = 0f,
             floorDepth      = 8f,
         };
     }
@@ -167,6 +172,7 @@ namespace ProceduralTerrain
         internal static FastNoiseLite? _widthNoise;      // Mode A: tunnel width modulation
         internal static FastNoiseLite? _twistVaryNoise; // Mode C: twist scale modulation
         internal static FastNoiseLite? _mbNoise;        // Mode B: 3D wall perturbation
+        internal static FastNoiseLite? _mdNoise;        // Mode D: anisotropic noise field
 
         // ── Per-brick SDF cache ───────────────────────────────────────────────────
         internal static FieldInfo?       _zoneOriginX;
@@ -409,6 +415,88 @@ namespace ProceduralTerrain
                 string summary = $"[PT] final LocationFactor = {LocationFactor(wx, wz, _locationPositions):F3}";
                 Console.instance?.Print(summary); Log.LogInfo(summary);
             });
+            new Terminal.ConsoleCommand("pt_gradmap", "pt_gradmap [zones] [blurRadius] — save height/smooth/gradient PNGs at terrain coarse resolution (4wu/px); zones=half-radius in zones (default 3), blurRadius in wu (default 64)", args =>
+            {
+                var wg = WorldGenerator.instance;
+                if (wg == null) { Console.instance?.Print("[PT] WorldGenerator not ready."); return; }
+                var player = Player.m_localPlayer;
+                if (player == null) { Console.instance?.Print("[PT] No player."); return; }
+                int   N      = (args.Length >= 2 && int.TryParse(args[1], out int nArg))    ? nArg    : 3;
+                float blurWu = (args.Length >= 3 && float.TryParse(args[2], out float bArg)) ? bArg   : 64f;
+                // cw: coarse grid width — same formula as terrain (zones * 16 coarse cells per zone, + 1)
+                // Each coarse cell = 4wu, so cw = (2*N+1)*16+1 covers (2*N+1) zones at 64wu each
+                int   cw     = (2 * N + 1) * 16 + 1;
+                const float hStep = 4f;
+                float cWx    = player.transform.position.x;
+                float cWz    = player.transform.position.z;
+                float originX = cWx - (cw / 2) * hStep;
+                float originZ = cWz - (cw / 2) * hStep;
+                string dir   = Paths.BepInExRootPath;
+
+                // Raw height at each coarse point (no blur, no padding needed)
+                var heights  = new float[cw * cw];
+                float hMin = float.MaxValue, hMax = float.MinValue;
+                for (int cx = 0; cx < cw; cx++)
+                for (int cz2 = 0; cz2 < cw; cz2++)
+                {
+                    float h = wg.GetHeight(originX + cx * hStep, originZ + cz2 * hStep);
+                    heights[cx * cw + cz2] = h;
+                    if (h < hMin) hMin = h; if (h > hMax) hMax = h;
+                }
+
+                // Gradient field — identical algorithm to BakeSdfSetup via ComputeGradField
+                var tgX     = new float[cw * cw];
+                var tgZ     = new float[cw * cw];
+                var blurH   = new float[cw * cw];
+                var gradMag = new float[cw * cw];
+                ComputeGradField(wg, originX, originZ, cw, blurWu, hStep, tgX, tgZ, blurH, gradMag);
+
+                void SaveGray(float[] data, string name)
+                {
+                    float lo = float.MaxValue, hi2 = float.MinValue;
+                    foreach (var v in data) { if (v < lo) lo = v; if (v > hi2) hi2 = v; }
+                    float rng = Mathf.Max(hi2 - lo, 0.001f);
+                    var t = new Texture2D(cw, cw, TextureFormat.RGB24, false);
+                    for (int cx = 0; cx < cw; cx++)
+                    for (int cz2 = 0; cz2 < cw; cz2++)
+                    { float v = (data[cx * cw + cz2] - lo) / rng; t.SetPixel(cx, cz2, new Color(v, v, v)); }
+                    t.Apply();
+                    System.IO.File.WriteAllBytes(System.IO.Path.Combine(dir, name), t.EncodeToPNG());
+                    UnityEngine.Object.Destroy(t);
+                }
+                SaveGray(heights, "gradmap_height.png");
+                SaveGray(blurH,   "gradmap_smooth.png");
+
+                float magMax = 0.00001f;
+                foreach (var m in gradMag) if (m > magMax) magMax = m;
+                var tex = new Texture2D(cw, cw, TextureFormat.RGB24, false);
+                for (int cx = 0; cx < cw; cx++)
+                for (int cz2 = 0; cz2 < cw; cz2++)
+                {
+                    int idx = cx * cw + cz2;
+                    float angle  = (Mathf.Atan2(tgZ[idx], tgX[idx]) / (2f * Mathf.PI) + 1f) % 1f;
+                    float bright = gradMag[idx] / magMax;
+                    float H = angle * 6f; int hi = (int)H; float f = H - hi;
+                    float vv = bright, q = vv*(1f-f), t2 = vv*f;
+                    float r2, g2, b2;
+                    switch (hi % 6) {
+                        case 0: r2=vv; g2=t2; b2=0f; break;
+                        case 1: r2=q;  g2=vv; b2=0f; break;
+                        case 2: r2=0f; g2=vv; b2=t2; break;
+                        case 3: r2=0f; g2=q;  b2=vv; break;
+                        case 4: r2=t2; g2=0f; b2=vv; break;
+                        default:r2=vv; g2=0f; b2=q;  break;
+                    }
+                    tex.SetPixel(cx, cz2, new Color(r2, g2, b2));
+                }
+                tex.Apply();
+                System.IO.File.WriteAllBytes(System.IO.Path.Combine(dir, "gradmap_field.png"), tex.EncodeToPNG());
+                UnityEngine.Object.Destroy(tex);
+
+                string msg = $"[PT] saved gradmap_height/smooth/field.png  ({cw}x{cw}px @ 4wu/px, blur={blurWu}wu)";
+                Console.instance?.Print(msg); Log.LogInfo(msg);
+            });
+
             Log.LogInfo("[ProceduralTerrain] Ready.");
         }
 

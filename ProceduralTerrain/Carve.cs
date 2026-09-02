@@ -25,6 +25,7 @@ namespace ProceduralTerrain
         // BakeSdfSetup 2D coarse param grids [cw4 × cw4]
         public float[]? bk2dAddH, bk2dLAmp;
         public float[]? bk2dMcS, bk2dMcT, bk2dMcFlare;
+        public float[]? bk2dTgX, bk2dTgZ, bk2dBlurH, bk2dGradMag, bk2dMdAmp;
         public float[]? bk2dFlD, bk2dFlFade;
         public float[]? bk2dMbwf, bk2dMbwa, bk2dMbr, bk2dMbvs, bk2dMbna, bk2dMbyo, bk2dMbtwist;
         public float[]? bk2dMawf, bk2dMawa, bk2dMaway, bk2dMaf, bk2dMavs, bk2dMaw, bk2dMawv, bk2dMawvf, bk2dMayo;
@@ -49,7 +50,7 @@ namespace ProceduralTerrain
             if (gridScale > 0f)
             {
                 s = gridScale;
-                if (_scale == null || _scale.Value <= 0f) _scale = s;
+                if (_scale == null || _scale.Value <= 0f) { _scale = s; Log.LogInfo($"[ProceduralTerrain] gridScale resolved to {s}"); }
             }
             else
             {
@@ -615,6 +616,7 @@ namespace ProceduralTerrain
         }
 
         static int _lastFixpointHops = 0;
+        [ThreadStatic] static float _mdPeakX, _mdPeakZ;
 
         static readonly (int dx, int dz, int inFace)[] FaceHops = {
             (-1,  0, 1),
@@ -954,7 +956,7 @@ namespace ProceduralTerrain
             int bb00, int bb10, int bb01, int bb11, float bfx, float bfz,
             float mAwf, float mAwa, float mAway, float mAf, float mAvs, float mAw, float mAwv, float mAwvf,
             float worldX, float worldZ, bool bakeC, bool bakeA,
-            float mdAmp, float mdFreq)
+            float mdAmp, float mdTCoord, float mdNCoord, float mdVScale)
         {
             int cyMbLo = bh, cyMbHi = -1;
             if (mbR > 0f)
@@ -998,7 +1000,7 @@ namespace ProceduralTerrain
 
                 if (mdAmp > 0f)
                 {
-                    float mdn   = Mathf.Sin(worldX * mdFreq) * 0.5f + 0.5f;
+                    float mdn   = _mdNoise!.GetNoise(mdTCoord, worldY * mdVScale, mdNCoord) * 0.5f + 0.5f;
                     float mdSdf = (worldY - h) - mdn * mdAmp;
                     combined = combined < mdSdf ? combined : mdSdf;
                 }
@@ -1096,6 +1098,12 @@ namespace ProceduralTerrain
             if (_cb.bk2dMcS     == null || _cb.bk2dMcS.Length     < nb2Size) _cb.bk2dMcS     = new float[nb2Size];
             if (_cb.bk2dMcT     == null || _cb.bk2dMcT.Length     < nb2Size) _cb.bk2dMcT     = new float[nb2Size];
             if (_cb.bk2dMcFlare == null || _cb.bk2dMcFlare.Length < nb2Size) _cb.bk2dMcFlare = new float[nb2Size];
+            int mdSize = (cw4 + 1) * (cw4 + 1);
+            if (_cb.bk2dTgX     == null || _cb.bk2dTgX.Length     < mdSize) _cb.bk2dTgX     = new float[mdSize];
+            if (_cb.bk2dTgZ     == null || _cb.bk2dTgZ.Length     < mdSize) _cb.bk2dTgZ     = new float[mdSize];
+            if (_cb.bk2dBlurH   == null || _cb.bk2dBlurH.Length   < mdSize) _cb.bk2dBlurH   = new float[mdSize];
+            if (_cb.bk2dGradMag == null || _cb.bk2dGradMag.Length < mdSize) _cb.bk2dGradMag = new float[mdSize];
+            if (_cb.bk2dMdAmp   == null || _cb.bk2dMdAmp.Length   < nb2Size) _cb.bk2dMdAmp  = new float[nb2Size];
             if (_cb.bk2dFlD    == null || _cb.bk2dFlD.Length    < nb2Size) _cb.bk2dFlD    = new float[nb2Size];
             if (_cb.bk2dFlFade == null || _cb.bk2dFlFade.Length < nb2Size) _cb.bk2dFlFade = new float[nb2Size];
             if (_cb.bk2dMbwf  == null || _cb.bk2dMbwf.Length  < nb2Size) _cb.bk2dMbwf  = new float[nb2Size];
@@ -1123,6 +1131,32 @@ namespace ProceduralTerrain
                     if (_blendedProfs[i].modeA_width    > 0f) bakeA = true;
                     if (_blendedProfs[i].modeB_radius   > 0f) anyMbActive = true;
                     if (bakeC && bakeA && anyMbActive) break;
+                }
+            }
+
+            int   ctrIdx2     = (cw4 / 2) * cw4 + (cw4 / 2);
+            float mdBlurRadius = (_blendedProfs != null && ctrIdx2 < _blendedProfs.Length)
+                                 ? _blendedProfs[ctrIdx2].modeD_blurRadius : 128f;
+            mdBlurRadius = Mathf.Clamp(mdBlurRadius, 16f, 2048f);
+
+            // blur-then-differentiate gradient pre-pass
+            bool anyMdActive = false;
+            if (_blendedProfs != null)
+                for (int i = 0; i < nb2Size && i < _blendedProfs.Length; i++)
+                    if (_blendedProfs[i].modeD_noiseAmp > 0f) { anyMdActive = true; break; }
+
+            if (anyMdActive && wg != null)
+            {
+                ComputeGradField(wg, (ox - overlap) * s, (oz - overlap) * s, cw4 + 1, mdBlurRadius, 4f * s,
+                                 _cb.bk2dTgX!, _cb.bk2dTgZ!, _cb.bk2dBlurH!, _cb.bk2dGradMag!);
+                // estimate island center as peak of blurH in coarse grid
+                float peakH = float.MinValue;
+                _mdPeakX = 0f; _mdPeakZ = 0f;
+                for (int cx4 = 0; cx4 < cw4; cx4++)
+                for (int cz4 = 0; cz4 < cw4; cz4++)
+                {
+                    float h = _cb.bk2dBlurH![cx4 * cw4 + cz4];
+                    if (h > peakH) { peakH = h; _mdPeakX = (ox - overlap + cx4 * 4) * s; _mdPeakZ = (oz - overlap + cz4 * 4) * s; }
                 }
             }
 
@@ -1158,6 +1192,7 @@ namespace ProceduralTerrain
                 _cb.bk2dMawv![idx2] = p4.modeA_widthVary;
                 _cb.bk2dMawvf![idx2]= p4.modeA_widthFrequency;
                 _cb.bk2dMayo! [idx2]= p4.modeA_yOffset;
+                _cb.bk2dMdAmp![idx2] = p4.modeD_noiseAmp;
 
                 if (bakeC && p4.modeC_noiseAmp > 0f)
                 {
@@ -1221,6 +1256,8 @@ namespace ProceduralTerrain
                 }
             }
 
+
+
             if (anyMbActive && wg != null)
             {
                 int fullSz = bw * bw;
@@ -1245,13 +1282,78 @@ namespace ProceduralTerrain
             }
         }
 
+        // Shared gradient field computation used by both BakeSdfSetup and pt_gradmap.
+        // originX/Z: world position of coarse cell (0,0). cw: grid width (cw4). blurRadius: wu.
+        // Output arrays are cw*cw, indexed [cx*cw+cz]. tgX/tgZ: normalized gradient (uphill dir).
+        // blurH: smoothed height at each coarse point. gradMag: raw gradient magnitude (height/wu).
+        // hStep: world-unit spacing between samples (pass 4*s from BakeSdfSetup; 4f when s≈1)
+        internal static void ComputeGradField(WorldGenerator wg, float originX, float originZ,
+            int cw, float blurRadius, float hStep, float[] tgX, float[] tgZ, float[] blurH, float[] gradMag)
+        {
+            int blurCells     = (int)(Mathf.Clamp(blurRadius, 16f, 2048f) / hStep);
+            int padCells      = blurCells + 1;
+            int gw2           = cw + 2 * padCells;
+            float wxOrig      = originX - padCells * hStep;
+            float wzOrig      = originZ - padCells * hStep;
+
+            var hGrid    = new float[gw2 * gw2];
+            var hTmp     = new float[gw2 * gw2];
+            var blurGrid = new float[gw2 * gw2];
+
+            for (int gi = 0; gi < gw2; gi++)
+            for (int gj = 0; gj < gw2; gj++)
+                hGrid[gi * gw2 + gj] = wg.GetHeight(wxOrig + gi * hStep, wzOrig + gj * hStep);
+
+            for (int gj = 0; gj < gw2; gj++)
+            {
+                float sum = 0f; int cnt = 0;
+                for (int gi = 0; gi < blurCells && gi < gw2; gi++) { sum += hGrid[gi * gw2 + gj]; cnt++; }
+                for (int gi = 0; gi < gw2; gi++)
+                {
+                    if (gi + blurCells < gw2) { sum += hGrid[(gi + blurCells) * gw2 + gj]; cnt++; }
+                    if (gi - blurCells - 1 >= 0) { sum -= hGrid[(gi - blurCells - 1) * gw2 + gj]; cnt--; }
+                    hTmp[gi * gw2 + gj] = sum / cnt;
+                }
+            }
+            for (int gi = 0; gi < gw2; gi++)
+            {
+                float sum = 0f; int cnt = 0;
+                for (int gj = 0; gj < blurCells && gj < gw2; gj++) { sum += hTmp[gi * gw2 + gj]; cnt++; }
+                for (int gj = 0; gj < gw2; gj++)
+                {
+                    if (gj + blurCells < gw2) { sum += hTmp[gi * gw2 + gj + blurCells]; cnt++; }
+                    if (gj - blurCells - 1 >= 0) { sum -= hTmp[gi * gw2 + gj - blurCells - 1]; cnt--; }
+                    blurGrid[gi * gw2 + gj] = sum / cnt;
+                }
+            }
+
+            for (int cx = 0; cx < cw; cx++)
+            for (int cz = 0; cz < cw; cz++)
+            {
+                int gi = cx + padCells, gj = cz + padCells;
+                float gdx = (blurGrid[(gi + 1) * gw2 + gj] - blurGrid[(gi - 1) * gw2 + gj]) * 0.5f;
+                float gdz = (blurGrid[gi * gw2 + gj + 1]   - blurGrid[gi * gw2 + gj - 1])   * 0.5f;
+                float gdm = Mathf.Sqrt(gdx * gdx + gdz * gdz);
+                int cidx = cx * cw + cz;
+                gradMag[cidx] = gdm;
+                if (gdm > 0.001f) { gdx /= gdm; gdz /= gdm; } else { gdx = 1f; gdz = 0f; }
+                tgX[cidx]   = gdx;
+                tgZ[cidx]   = gdz;
+                blurH[cidx] = blurGrid[gi * gw2 + gj];
+            }
+        }
+
         static void FillPhase1(float[] buf, int bw, int bh, int extLo, float s,
             int ox, int oz, int overlap, bool bakeC, bool bakeA, bool anyMbActive, WorldGenerator? wg, int cw4,
             List<(Vector2 pos, float extR)> nearbyLocs)
         {
-            int   ctrIdx = (cw4 / 2) * cw4 + (cw4 / 2);
-            float mdAmp  = _blendedProfs != null && _blendedProfs.Length > ctrIdx ? _blendedProfs[ctrIdx].modeD_noiseAmp  : 0f;
-            float mdFreq = _blendedProfs != null && _blendedProfs.Length > ctrIdx ? _blendedProfs[ctrIdx].modeD_frequency : 0.1257f;
+            int   ctrIdx      = (cw4 / 2) * cw4 + (cw4 / 2);
+            float mdFreqT     = _blendedProfs != null && _blendedProfs.Length > ctrIdx ? _blendedProfs[ctrIdx].modeD_freqT       : 0.02f;
+            float mdFreqN     = _blendedProfs != null && _blendedProfs.Length > ctrIdx ? _blendedProfs[ctrIdx].modeD_freqN       : 0.02f;
+            float mdAlignment = _blendedProfs != null && _blendedProfs.Length > ctrIdx ? _blendedProfs[ctrIdx].modeD_alignment    : 0f;
+            float mdVScale    = _blendedProfs != null && _blendedProfs.Length > ctrIdx ? _blendedProfs[ctrIdx].modeD_vScale       : 0.1f;
+            float mdGradFade   = _blendedProfs != null && _blendedProfs.Length > ctrIdx ? _blendedProfs[ctrIdx].modeD_gradFade     : 0f;
+            float mdBlurRadius = _blendedProfs != null && _blendedProfs.Length > ctrIdx ? Mathf.Max(_blendedProfs[ctrIdx].modeD_blurRadius, 1f) : 128f;
             for (int cx = 0; cx < bw; cx++)
             for (int cz = 0; cz < bw; cz++)
             {
@@ -1329,6 +1431,28 @@ namespace ProceduralTerrain
                     mAwvf = BL(_cb.bk2dMawvf!, b200, b210, b201, b211, bfx, bfz);
                 }
 
+                // mode D uses a (cw4+1)×(cw4+1) coarse grid — unclamped indices to avoid zone-edge seams
+                int mdCw   = cw4 + 1;
+                int mdCx4  = cx / 4, mdCz4 = cz / 4;
+                int md200  = mdCx4 * mdCw + mdCz4,       md210 = (mdCx4 + 1) * mdCw + mdCz4;
+                int md201  = mdCx4 * mdCw + (mdCz4 + 1), md211 = (mdCx4 + 1) * mdCw + (mdCz4 + 1);
+                float nmX = BL(_cb.bk2dTgX!, md200, md210, md201, md211, bfx, bfz);
+                float nmZ = BL(_cb.bk2dTgZ!, md200, md210, md201, md211, bfx, bfz);
+                float nmLen = Mathf.Sqrt(nmX * nmX + nmZ * nmZ);
+                if (nmLen > 0.001f) { nmX /= nmLen; nmZ /= nmLen; } else { nmX = 1f; nmZ = 0f; }
+                float mdBlurH  = BL(_cb.bk2dBlurH!,   md200, md210, md201, md211, bfx, bfz);
+                float mdGradMg = BL(_cb.bk2dGradMag!, md200, md210, md201, md211, bfx, bfz);
+                // taper frequency to 0 near singularity
+                float mdAmp      = BL(_cb.bk2dMdAmp!, b200, b210, b201, b211, bfx, bfz);
+                float gradFactor = mdGradFade > 0f ? Mathf.SmoothStep(0f, mdGradFade, mdGradMg) : 1f;
+                // normalize blurH by blurRadius (stable, no amplification of height noise near singularity)
+                float mdRadial = mdBlurH / mdBlurRadius;
+                // alignment=0 → fast along T (radial ridges), 1 → fast along N (coast-parallel)
+                float freqT = Mathf.Lerp(mdFreqT, mdFreqN, mdAlignment);
+                float freqN = Mathf.Lerp(mdFreqN, mdFreqT, mdAlignment);
+                float mdTCoord = (worldX * (-nmZ) + worldZ * nmX) * freqT * gradFactor;
+                float mdNCoord = mdRadial * freqN * gradFactor;
+                float mdLocalAmp = mdAmp;
                 FillYColumn(buf, bw, bh, extLo, s, cx, cz,
                     effectiveH, addH, profMcT, profMcFlare, localAmp, localAmp > 0f && bakeC,
                     locFac, floorY, profFlFade,
@@ -1336,7 +1460,7 @@ namespace ProceduralTerrain
                     bb00, bb10, bb01, bb11, bfx, bfz,
                     mAwf, mAwa, mAway, mAf, mAvs, mAw, mAwv, mAwvf,
                     worldX, worldZ, bakeC, bakeA,
-                    mdAmp, mdFreq);
+                    mdLocalAmp, mdTCoord, mdNCoord, mdVScale);
             }
         }
     }
