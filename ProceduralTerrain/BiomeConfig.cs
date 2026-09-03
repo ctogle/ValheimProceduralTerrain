@@ -34,74 +34,82 @@ namespace ProceduralTerrain
         static string ConfigPath =>
             Path.Combine(BepInEx.Paths.ConfigPath, "procedural_terrain_biomes.cfg");
 
-        // Parse a [Mode:name] section into a ModeDefinition.
+        // Parse a [Mode:name] section into a ModeDefinition subclass.
         static ModeDefinition? ParseModeDefinition(string name, List<(string key, string val)> kvs)
         {
             var inv = System.Globalization.CultureInfo.InvariantCulture;
-            ModeType? type = null;
+            string? typeStr = null;
             foreach (var (k, v) in kvs)
             {
                 if (k != "type") continue;
-                type = v.Trim().ToUpperInvariant() switch { "A" => ModeType.A, "B" => ModeType.B, "C" => ModeType.C, "D" => ModeType.D, _ => (ModeType?)null };
+                typeStr = v.Trim().ToUpperInvariant();
                 break;
             }
-            if (type == null) { Log.LogWarning($"[ProceduralTerrain] Mode '{name}': missing or invalid type."); return null; }
+            if (typeStr == null) { Log.LogWarning($"[ProceduralTerrain] Mode '{name}': missing or invalid type."); return null; }
 
-            var md = new ModeDefinition { Name = name, Type = type.Value };
+            ModeDefinition md = typeStr switch {
+                "A" => new ModeADef { Name = name },
+                "B" => new ModeBDef { Name = name },
+                "C" => new ModeCDef { Name = name },
+                "D" => new ModeDDef { Name = name },
+                _ => (ModeDefinition?)null!
+            };
+            if (md == null) { Log.LogWarning($"[ProceduralTerrain] Mode '{name}': unknown type '{typeStr}'."); return null; }
+
             foreach (var (k, v) in kvs)
             {
                 if (k == "type") continue;
                 if (!float.TryParse(v, System.Globalization.NumberStyles.Float, inv, out float fv)) continue;
                 if (k == "amplitude") { md.Amplitude = fv; continue; }
-                switch (type.Value)
+                switch (md)
                 {
-                    case ModeType.A:
+                    case ModeADef a:
                         switch (k) {
-                            case "frequency":      md.A_frequency      = fv; break;
-                            case "warpamp":        md.A_warpAmp        = fv; break;
-                            case "warpampy":       md.A_warpAmpY       = fv; break;
-                            case "warpfrequency":  md.A_warpFrequency  = fv; break;
-                            case "vscale":         md.A_vScale         = fv; break;
-                            case "widthvary":      md.A_widthVary      = fv; break;
-                            case "widthfrequency": md.A_widthFrequency = fv; break;
-                            case "yoffset":        md.A_yOffset        = fv; break;
+                            case "frequency":      a.Frequency      = fv; break;
+                            case "warpamp":        a.WarpAmp        = fv; break;
+                            case "warpampy":       a.WarpAmpY       = fv; break;
+                            case "warpfrequency":  a.WarpFrequency  = fv; break;
+                            case "vscale":         a.VScale         = fv; break;
+                            case "widthvary":      a.WidthVary      = fv; break;
+                            case "widthfrequency": a.WidthFrequency = fv; break;
+                            case "yoffset":        a.YOffset        = fv; break;
                         }
                         break;
-                    case ModeType.B:
+                    case ModeBDef b:
                         switch (k) {
-                            case "warpamp":       md.B_warpAmp       = fv; break;
-                            case "warpfrequency": md.B_warpFrequency = fv; break;
-                            case "vscale":        md.B_vScale        = fv; break;
-                            case "noiseamp":      md.B_noiseAmp      = fv; break;
-                            case "yoffset":       md.B_yOffset       = fv; break;
-                            case "twist":         md.B_twist         = fv; break;
+                            case "warpamp":       b.WarpAmp       = fv; break;
+                            case "warpfrequency": b.WarpFrequency = fv; break;
+                            case "vscale":        b.VScale        = fv; break;
+                            case "noiseamp":      b.NoiseAmp      = fv; break;
+                            case "yoffset":       b.YOffset       = fv; break;
+                            case "twist":         b.Twist         = fv; break;
                         }
                         break;
-                    case ModeType.C:
+                    case ModeCDef c:
                         switch (k) {
-                            case "threshold":      md.C_threshold      = fv; break;
-                            case "frequency":      md.C_frequency      = fv; break;
-                            case "warpamp":        md.C_warpAmp        = fv; break;
-                            case "warpfrequency":  md.C_warpFrequency  = fv; break;
-                            case "vscale":         md.C_vScale         = fv; break;
-                            case "twist":          md.C_twist          = fv; break;
-                            case "twistvary":      md.C_twistVary      = fv; break;
-                            case "twistfrequency": md.C_twistFrequency = fv; break;
-                            case "ampvary":        md.C_ampVary        = fv; break;
-                            case "ampfrequency":   md.C_ampFrequency   = fv; break;
-                            case "flare":          md.C_flare          = fv; break;
-                            case "yoffset":        md.C_yOffset        = fv; break;
+                            case "threshold":      c.Threshold      = fv; break;
+                            case "frequency":      c.Frequency      = fv; break;
+                            case "warpamp":        c.WarpAmp        = fv; break;
+                            case "warpfrequency":  c.WarpFrequency  = fv; break;
+                            case "vscale":         c.VScale         = fv; break;
+                            case "twist":          c.Twist          = fv; break;
+                            case "twistvary":      c.TwistVary      = fv; break;
+                            case "twistfrequency": c.TwistFrequency = fv; break;
+                            case "ampvary":        c.AmpVary        = fv; break;
+                            case "ampfrequency":   c.AmpFrequency   = fv; break;
+                            case "flare":          c.Flare          = fv; break;
+                            case "yoffset":        c.YOffset        = fv; break;
                         }
                         break;
-                    case ModeType.D:
+                    case ModeDDef d:
                         switch (k) {
-                            case "freqt":      md.D_freqT      = fv; break;
-                            case "freqn":      md.D_freqN      = fv; break;
-                            case "blurradius": md.D_blurRadius = fv; break;
-                            case "alignment":  md.D_alignment  = fv; break;
-                            case "vscale":     md.D_vScale     = fv; break;
-                            case "gradfade":   md.D_gradFade   = fv; break;
-                            case "seafade":    md.D_seaFade    = fv; break;
+                            case "freqt":      d.FreqT      = fv; break;
+                            case "freqn":      d.FreqN      = fv; break;
+                            case "blurradius": d.BlurRadius = fv; break;
+                            case "alignment":  d.Alignment  = fv; break;
+                            case "vscale":     d.VScale     = fv; break;
+                            case "gradfade":   d.GradFade   = fv; break;
+                            case "seafade":    d.SeaFade    = fv; break;
                         }
                         break;
                 }
@@ -214,6 +222,7 @@ namespace ProceduralTerrain
 
             // Pass 3: Debug, Bake, and biome assignments
             var profiles = BuildDefaultProfiles();
+            var biomeProfileMap = new Dictionary<Heightmap.Biome, TerrainProfile>();
             foreach (var (secName, kvs) in sections)
             {
                 if (secName.Equals("Debug", StringComparison.OrdinalIgnoreCase))
@@ -256,24 +265,53 @@ namespace ProceduralTerrain
                 }
                 if (secName.StartsWith("Mode:", StringComparison.OrdinalIgnoreCase)) continue;
                 if (secName.StartsWith("Profile:", StringComparison.OrdinalIgnoreCase)) continue;
+                if (secName.Equals("Pipeline", StringComparison.OrdinalIgnoreCase)) continue;
                 if (!Enum.TryParse<Heightmap.Biome>(secName, out var biome)) continue;
 
                 TerrainProfile tp = TerrainProfile.Default;
                 foreach (var (k, v) in kvs)
                     if (k == "profile" && namedProfiles.TryGetValue(v.Trim(), out var np)) { tp = np; break; }
                 profiles[biome] = tp.ToCaveProfile(modeDefs);
+                biomeProfileMap[biome] = tp;
             }
+
+            // Build pipeline from [Pipeline] section or all named modes
+            var pipelineNames = new List<string>();
+            foreach (var (secName, kvs) in sections)
+            {
+                if (!secName.Equals("Pipeline", StringComparison.OrdinalIgnoreCase)) continue;
+                foreach (var (k, v) in kvs)
+                    if (k == "modes")
+                        foreach (var mn in v.Split(',')) { var t = mn.Trim(); if (t.Length > 0) pipelineNames.Add(t); }
+            }
+            if (pipelineNames.Count == 0)
+            {
+                var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach (var tp in namedProfiles.Values)
+                    foreach (var mn in tp.ModeNames)
+                        if (seen.Add(mn)) pipelineNames.Add(mn);
+            }
+            var pipelineList = new List<ModeDefinition>();
+            foreach (var mn in pipelineNames)
+                if (modeDefs.TryGetValue(mn, out var pmd)) { pmd.PipelineIndex = pipelineList.Count; pipelineList.Add(pmd); }
+            _pipeline = pipelineList.ToArray();
+
+            // Build _biomeAmps
+            var newBiomeAmps = new Dictionary<Heightmap.Biome, float[]>();
+            foreach (var (biome2, tp) in biomeProfileMap)
+            {
+                var amps = new float[_pipeline.Length];
+                foreach (var mn in tp.ModeNames)
+                    if (modeDefs.TryGetValue(mn, out var pmd) && pmd.PipelineIndex >= 0)
+                        amps[pmd.PipelineIndex] = pmd.Amplitude;
+                newBiomeAmps[biome2] = amps;
+            }
+            _biomeAmps = newBiomeAmps;
 
             _modeDefinitions = modeDefs;
             _namedProfiles   = namedProfiles;
             _biomeProfiles   = profiles;
-            Log.LogInfo($"[ProceduralTerrain] Config reloaded: {modeDefs.Count} modes, {namedProfiles.Count} profiles, {profiles.Count} biomes.");
-            foreach (var kv in profiles)
-            {
-                var p = kv.Value;
-                if (p.modeA_width > 0f || p.modeB_radius > 0f || p.modeC_noiseAmp > 0f || p.modeD_noiseAmp > 0f)
-                    Log.LogInfo($"[ProceduralTerrain]   {kv.Key}: mB_r={p.modeB_radius:F1} mA_w={p.modeA_width:F2} mC_amp={p.modeC_noiseAmp:F1} mD_amp={p.modeD_noiseAmp:F1}");
-            }
+            Log.LogInfo($"[ProceduralTerrain] Config reloaded: {modeDefs.Count} modes, {namedProfiles.Count} profiles, {profiles.Count} biomes, pipeline={_pipeline.Length}.");
         }
 
         static void WriteDefaultBiomeConfig(string path)
@@ -389,7 +427,7 @@ namespace ProceduralTerrain
 
         // C1-continuous max — rounds the crease where two SDF fields meet, over a blend width of k.
         // Identical to max(a,b) when |a-b| > k; adds at most k/4 at the join centre.
-        static float SmoothMax(float a, float b, float k)
+        internal static float SmoothMax(float a, float b, float k)
         {
             float h = Mathf.Max(k - Mathf.Abs(a - b), 0f) / k;
             return Mathf.Max(a, b) + h * h * k * 0.25f;
@@ -425,72 +463,22 @@ namespace ProceduralTerrain
         static void AccumulateProfile(ref CaveProfile acc, ref float totW, in CaveProfile prof, float w)
         {
             totW += w;
-            acc.modeB_radius         += w * prof.modeB_radius;
-            acc.modeB_warpAmp        += w * prof.modeB_warpAmp;
-            acc.modeB_warpFrequency  += w * prof.modeB_warpFrequency;
-            acc.modeB_vScale         += w * prof.modeB_vScale;
-            acc.modeB_noiseAmp       += w * prof.modeB_noiseAmp;
-            acc.modeB_yOffset        += w * prof.modeB_yOffset;
-            acc.modeB_twist          += w * prof.modeB_twist;
-            acc.modeA_width          += w * prof.modeA_width;
-            acc.modeA_frequency      += w * prof.modeA_frequency;
-            acc.modeA_warpAmp        += w * prof.modeA_warpAmp;
-            acc.modeA_warpAmpY       += w * prof.modeA_warpAmpY;
-            acc.modeA_warpFrequency  += w * prof.modeA_warpFrequency;
-            acc.modeA_vScale         += w * prof.modeA_vScale;
-            acc.modeA_widthVary      += w * prof.modeA_widthVary;
-            acc.modeA_widthFrequency += w * prof.modeA_widthFrequency;
-            acc.modeA_yOffset        += w * prof.modeA_yOffset;
-            acc.modeC_threshold      += w * prof.modeC_threshold;
-            acc.modeC_noiseAmp       += w * prof.modeC_noiseAmp;
-            acc.modeC_frequency      += w * prof.modeC_frequency;
-            acc.modeC_warpAmp        += w * prof.modeC_warpAmp;
-            acc.modeC_warpFrequency  += w * prof.modeC_warpFrequency;
-            acc.modeC_vScale         += w * prof.modeC_vScale;
-            acc.modeC_twist          += w * prof.modeC_twist;
-            acc.modeC_twistVary      += w * prof.modeC_twistVary;
-            acc.modeC_twistFrequency += w * prof.modeC_twistFrequency;
-            acc.modeC_ampVary        += w * prof.modeC_ampVary;
-            acc.modeC_ampFrequency   += w * prof.modeC_ampFrequency;
-            acc.modeC_flare          += w * prof.modeC_flare;
-            acc.modeC_yOffset        += w * prof.modeC_yOffset;
-            acc.modeD_noiseAmp       += w * prof.modeD_noiseAmp;
-            float wdAmp = w * prof.modeD_noiseAmp;
-            acc.modeD_freqT          += wdAmp * prof.modeD_freqT;
-            acc.modeD_freqN          += wdAmp * prof.modeD_freqN;
-            acc.modeD_blurRadius     += wdAmp * prof.modeD_blurRadius;
-            acc.modeD_alignment      += wdAmp * prof.modeD_alignment;
-            acc.modeD_vScale         += wdAmp * prof.modeD_vScale;
-            acc.modeD_gradFade       += wdAmp * prof.modeD_gradFade;
-            acc.modeD_seaFade        += wdAmp * prof.modeD_seaFade;
-            acc.blur_passes          += w * prof.blur_passes;
-            acc.perona_k             += w * prof.perona_k;
-            acc.perona_lambda        += w * prof.perona_lambda;
-            acc.floorDepth           += w * prof.floorDepth;
-            acc.floorFade            += w * prof.floorFade;
+            acc.blur_passes   += w * prof.blur_passes;
+            acc.perona_k      += w * prof.perona_k;
+            acc.perona_lambda += w * prof.perona_lambda;
+            acc.floorDepth    += w * prof.floorDepth;
+            acc.floorFade     += w * prof.floorFade;
         }
 
         static void NormalizeProfile(ref CaveProfile p, float totW)
         {
             if (totW <= 0f) return;
             float rcp = 1f / totW;
-            p.modeB_radius         *= rcp; p.modeB_warpAmp       *= rcp;
-            p.modeB_warpFrequency  *= rcp; p.modeB_vScale        *= rcp;
-            p.modeB_noiseAmp       *= rcp; p.modeB_yOffset       *= rcp; p.modeB_twist *= rcp;
-            p.modeA_width          *= rcp; p.modeA_frequency     *= rcp;
-            p.modeA_warpAmp        *= rcp; p.modeA_warpAmpY      *= rcp; p.modeA_warpFrequency *= rcp;
-            p.modeA_vScale         *= rcp; p.modeA_widthVary     *= rcp; p.modeA_widthFrequency *= rcp; p.modeA_yOffset *= rcp;
-            p.modeC_threshold      *= rcp; p.modeC_noiseAmp      *= rcp;
-            p.modeC_frequency      *= rcp; p.modeC_warpAmp       *= rcp;
-            p.modeC_warpFrequency  *= rcp; p.modeC_vScale        *= rcp;
-            p.modeC_twist          *= rcp; p.modeC_twistVary     *= rcp; p.modeC_twistFrequency *= rcp;
-            p.modeC_ampVary        *= rcp; p.modeC_ampFrequency  *= rcp; p.modeC_flare *= rcp; p.modeC_yOffset *= rcp;
-            float mdAmpSum = p.modeD_noiseAmp;
-            p.modeD_noiseAmp *= rcp;
-            if (mdAmpSum > 0f) { p.modeD_freqT /= mdAmpSum; p.modeD_freqN /= mdAmpSum; p.modeD_blurRadius /= mdAmpSum; p.modeD_alignment /= mdAmpSum; p.modeD_vScale /= mdAmpSum; p.modeD_gradFade /= mdAmpSum; p.modeD_seaFade /= mdAmpSum; }
-            else { p.modeD_freqT = CaveProfile.Default.modeD_freqT; p.modeD_freqN = CaveProfile.Default.modeD_freqN; p.modeD_blurRadius = CaveProfile.Default.modeD_blurRadius; p.modeD_alignment = CaveProfile.Default.modeD_alignment; p.modeD_vScale = CaveProfile.Default.modeD_vScale; p.modeD_gradFade = CaveProfile.Default.modeD_gradFade; p.modeD_seaFade = CaveProfile.Default.modeD_seaFade; }
-            p.blur_passes          *= rcp; p.perona_k            *= rcp;
-            p.perona_lambda        *= rcp; p.floorDepth          *= rcp; p.floorFade *= rcp;
+            p.blur_passes   *= rcp;
+            p.perona_k      *= rcp;
+            p.perona_lambda *= rcp;
+            p.floorDepth    *= rcp;
+            p.floorFade     *= rcp;
         }
 
         // ── voxcaves_probe: biome blend breakdown logged to console ──────────────────
@@ -577,19 +565,14 @@ namespace ProceduralTerrain
             {
                 float normW = w / totW;
                 float worldDist = distCells * coarseStep;
-                Log.LogInfo($"  [{name}]  dist={worldDist:F0}wu ({distCells} hops)  seedFrac={frac:F2}  weight={w:F3}  normW={normW:P0}  mcAmp={prof.modeC_noiseAmp:F1}  mbR={prof.modeB_radius:F1}  mdAmp={prof.modeD_noiseAmp:F1}  blur={prof.blur_passes:F0}");
-                if (prof.modeD_noiseAmp > 0f)
-                    Log.LogInfo($"    D: freqT={prof.modeD_freqT} freqN={prof.modeD_freqN} blurR={prof.modeD_blurRadius} align={prof.modeD_alignment} vScale={prof.modeD_vScale} gradFade={prof.modeD_gradFade} seaFade={prof.modeD_seaFade}");
+                Log.LogInfo($"  [{name}]  dist={worldDist:F0}wu ({distCells} hops)  seedFrac={frac:F2}  weight={w:F3}  normW={normW:P0}  blur={prof.blur_passes:F0}  floorDepth={prof.floorDepth:F1}");
             }
 
             // Blended result
             float rcp = 1f / totW;
-            float blendMcAmp = contributions.Sum(c => c.w * c.prof.modeC_noiseAmp) * rcp;
-            float blendMbR   = contributions.Sum(c => c.w * c.prof.modeB_radius)   * rcp;
-            float blendMdAmp = contributions.Sum(c => c.w * c.prof.modeD_noiseAmp) * rcp;
             float blendBlur  = contributions.Sum(c => c.w * c.prof.blur_passes)    * rcp;
             float blendFloor = contributions.Sum(c => c.w * c.prof.floorDepth)     * rcp;
-            Log.LogInfo($"  → blended: mcAmp={blendMcAmp:F2}  mbRadius={blendMbR:F2}  mdAmp={blendMdAmp:F2}  blur={blendBlur:F1}  floorDepth={blendFloor:F1}");
+            Log.LogInfo($"  → blended: blur={blendBlur:F1}  floorDepth={blendFloor:F1}  pipeline={_pipeline.Length} modes");
         }
 
         // ── Point-query biome blend — same supersampled fractional approach as BakeBlendedProfiles ──
@@ -681,12 +664,28 @@ namespace ProceduralTerrain
             if (_biomeDist == null || _biomeDist.Length < pgSize) _biomeDist = new int[pgSize];
             if (_biomeBfsQ == null || _biomeBfsQ.Length < pgSize) _biomeBfsQ = new int[pgSize];
 
+            var pipeline = _pipeline;
+            int pLen     = pipeline.Length;
+            var biomeAmps = _biomeAmps;
+
+            // Ensure mode amplitude arrays
+            if (_cb.bk2dModeAmps == null || _cb.bk2dModeAmps.Length < pLen)
+                _cb.bk2dModeAmps = new float[pLen][];
+            for (int mi = 0; mi < pLen; mi++)
+                if (_cb.bk2dModeAmps[mi] == null || _cb.bk2dModeAmps[mi].Length < cellCount)
+                    _cb.bk2dModeAmps[mi] = new float[cellCount];
+
+            // Local accumulator for mode amps
+            var modeAmpAcc = new float[pLen * cellCount];
+
             foreach (var (biomeInt, slot) in biomeSlot)
             {
                 var prof = GetP((Heightmap.Biome)biomeInt);
 
                 // Multi-source BFS: seed from every cell that has any fraction of this biome.
                 RunBiomeBFS(slot, pcw, pgSize, maxHops);
+
+                float[] bAmp = biomeAmps.TryGetValue((Heightmap.Biome)biomeInt, out var ba) ? ba : Array.Empty<float>();
 
                 // Accumulate weighted profile into each inner coarse cell.
                 // At distance 0, scale by fractional membership so a cell that is 50% BF
@@ -708,6 +707,12 @@ namespace ProceduralTerrain
                     int idx = cx4 * cw4 + cz4;
                     ref var acc = ref _blendedProfs![idx];
                     AccumulateProfile(ref acc, ref _biomeTotW![idx], in prof, w);
+                    // Accumulate mode amps
+                    for (int mi = 0; mi < pLen; mi++)
+                    {
+                        float ma = mi < bAmp.Length ? bAmp[mi] : 0f;
+                        modeAmpAcc[mi * cellCount + idx] += w * ma;
+                    }
                 }
             }
 
@@ -719,6 +724,7 @@ namespace ProceduralTerrain
             {
                 const float SeaLevel = 30f;
                 var oceanProf = GetP(Heightmap.Biome.Ocean);
+                float[] oceanAmp = biomeAmps.TryGetValue(Heightmap.Biome.Ocean, out var oa) ? oa : Array.Empty<float>();
                 for (int cx4 = 0; cx4 < cw4; cx4++)
                 for (int cz4 = 0; cz4 < cw4; cz4++)
                 {
@@ -730,6 +736,11 @@ namespace ProceduralTerrain
                     int idx = cx4 * cw4 + cz4;
                     ref var acc = ref _blendedProfs![idx];
                     AccumulateProfile(ref acc, ref _biomeTotW![idx], in oceanProf, coastW);
+                    for (int mi = 0; mi < pLen; mi++)
+                    {
+                        float ma = mi < oceanAmp.Length ? oceanAmp[mi] : 0f;
+                        modeAmpAcc[mi * cellCount + idx] += coastW * ma;
+                    }
                 }
             }
 
@@ -737,7 +748,10 @@ namespace ProceduralTerrain
             for (int idx = 0; idx < cellCount; idx++)
             {
                 ref var p = ref _blendedProfs![idx];
-                NormalizeProfile(ref p, _biomeTotW![idx]);
+                float tw = _biomeTotW![idx];
+                NormalizeProfile(ref p, tw);
+                for (int mi = 0; mi < pLen; mi++)
+                    _cb.bk2dModeAmps![mi][idx] = tw > 0f ? modeAmpAcc[mi * cellCount + idx] / tw : 0f;
             }
         }
     }

@@ -20,27 +20,25 @@ namespace ProceduralTerrain
         public float[]? bufA, bufB, bufC;
         // ComputeZoneFaceCache working buffer (kept separate to avoid clobbering Carve's buf)
         public float[]? precomputeBuf;
-        // BakeSdfSetup coarse 4× noise grids [cw4 × bh × cw4]
-        public float[]? noiseBuf, tunBuf, tunBuf2, tunWBuf;
         // BakeSdfSetup 2D coarse param grids [cw4 × cw4]
-        public float[]? bk2dAddH, bk2dLAmp;
-        public float[]? bk2dMcS, bk2dMcT, bk2dMcFlare;
-        public float[]? bk2dTgX, bk2dTgZ, bk2dBlurH, bk2dGradMag, bk2dMdAmp;
+        public float[]? bk2dTgX, bk2dTgZ, bk2dBlurH, bk2dGradMag;
         public float[]? bk2dFlD, bk2dFlFade;
-        public float[]? bk2dMbwf, bk2dMbwa, bk2dMbr, bk2dMbvs, bk2dMbna, bk2dMbyo, bk2dMbtwist;
-        public float[]? bk2dMawf, bk2dMawa, bk2dMaway, bk2dMaf, bk2dMavs, bk2dMaw, bk2dMawv, bk2dMawvf, bk2dMayo;
         // Full-res Mode B warped heightmap [bw × bw]
         public float[]? bkWarpedH;
         // Island/pocket BFS (bool and int queues)
         public bool[]? visitedBuf, percolVisited;
         public int[]?  islandQueue;
+        // Pipeline mode amplitude grids [pipelineIdx][cellIdx]
+        public float[][]? bk2dModeAmps;
+        // Pipeline mode auxiliary data [pipelineIdx][auxIdx][dataIdx]
+        public float[][][]? bkModeAux;
     }
 
     public partial class Plugin
     {
         [ThreadStatic] static CarveBuffers _cb;
 
-        static float BL(float[] a, int i00, int i10, int i01, int i11, float fx, float fz) =>
+        internal static float BL(float[] a, int i00, int i10, int i01, int i11, float fx, float fz) =>
             Mathf.Lerp(Mathf.Lerp(a[i00], a[i10], fx), Mathf.Lerp(a[i01], a[i11], fx), fz);
 
         // ── Carve pass ────────────────────────────────────────────────────────────
@@ -87,7 +85,7 @@ namespace ProceduralTerrain
             var centerProf = ProfAt(cw4Early / 2, cw4Early / 2);
 
             var centerBiome = wg?.GetBiome(zoneX, zoneZ) ?? Heightmap.Biome.None;
-            Log.LogDebug($"[ProceduralTerrain] zone ({ox},{oz}) biome={centerBiome} mB_r={centerProf.modeB_radius:F1} mA_w={centerProf.modeA_width:F2} mC_amp={centerProf.modeC_noiseAmp:F1} mC_flare={centerProf.modeC_flare:F3}");
+            Log.LogDebug($"[ProceduralTerrain] zone ({ox},{oz}) biome={centerBiome} pipeline={_pipeline.Length} modes blur={centerProf.blur_passes:F1} floorDepth={centerProf.floorDepth:F1}");
 
             float searchR = width * s * 0.5f + 200f + LocFadeR;
             var nearbyLocs = new List<(Vector2 pos, float extR)>();
@@ -102,17 +100,19 @@ namespace ProceduralTerrain
             int hiMargin = 24, loMargin = 24;
             {
                 float maxExtM = 0f, maxFloor = 0f;
-                void CheckProf(CaveProfile cp) {
-                    if (cp.modeC_noiseAmp > 0f) {
-                        float a = cp.modeC_noiseAmp * Mathf.Max(1f, 1f + cp.modeC_ampVary);
-                        float e = Mathf.Max(0f, 1f - cp.modeC_threshold) * a + cp.modeC_warpAmp;
+                // Floor margin from blended profile-level params
+                for (int i = 0; i < cw4Early * cw4Early && _blendedProfs != null && i < _blendedProfs.Length; i++)
+                    if (_blendedProfs[i].floorDepth > maxFloor) maxFloor = _blendedProfs[i].floorDepth;
+                // Height extension from pipeline Mode C params (worst case)
+                foreach (var mode in _pipeline)
+                {
+                    if (mode is ModeCDef mc)
+                    {
+                        float a = mc.Amplitude * Mathf.Max(1f, 1f + mc.AmpVary);
+                        float e = Mathf.Max(0f, 1f - mc.Threshold) * a + mc.WarpAmp;
                         if (e > maxExtM) maxExtM = e;
                     }
-                    if (cp.floorDepth > maxFloor) maxFloor = cp.floorDepth;
                 }
-                CheckProf(centerProf);
-                CheckProf(ProfAt(0,       0      )); CheckProf(ProfAt(lastC, 0      ));
-                CheckProf(ProfAt(0,       lastC  )); CheckProf(ProfAt(lastC, lastC  ));
                 if (maxExtM  > 0f) hiMargin = Mathf.Max(24, (int)Mathf.Ceil(maxExtM  / s) + 8);
                 if (maxFloor > 0f) loMargin = Mathf.Max(24, (int)Mathf.Ceil(maxFloor / s) + 4);
             }
@@ -127,7 +127,6 @@ namespace ProceduralTerrain
             if (_cb.bufC == null || _cb.bufC.Length < bufSize) _cb.bufC = new float[bufSize];
             float[] buf = _cb.bufA, tmp = _cb.bufB, orig = _cb.bufC;
 
-            bool bakeC = false, bakeA = false, anyMbActive = false;
             bool fromBake = _bakeData != null && TryPopulateFromBake(ox, oz, bw, bh, extLo, s, buf);
             long _t0 = 0, _t1 = 0, _t1b = 0, _t2 = 0, _tFix = 0;
             var _sw = System.Diagnostics.Stopwatch.StartNew();
@@ -137,12 +136,13 @@ namespace ProceduralTerrain
             InitNoise();
 
             int   cw4     = cw4Early;
-            BakeSdfSetup(ox, oz, overlap, s, extLo, bh, bw, cw4, wg, nearbyLocs,
-                out bakeC, out bakeA, out anyMbActive);
+            BakeSdfSetup(ox, oz, overlap, s, extLo, bh, bw, cw4, wg, nearbyLocs);
 
             _t0 = _sw.ElapsedMilliseconds;
 
-            FillPhase1(buf, bw, bh, extLo, s, ox, oz, overlap, bakeC, bakeA, anyMbActive, wg, cw4, nearbyLocs);
+            bool anyPipelineActive = _pipeline.Length > 0 && _cb.bk2dModeAmps != null &&
+                _pipeline.Any(m => _cb.bk2dModeAmps![m.PipelineIndex].Any(v => v > 0f));
+            FillPhase1(buf, bw, bh, extLo, s, ox, oz, overlap, wg, cw4, nearbyLocs);
             _t1 = _sw.ElapsedMilliseconds;
 
             _t1b = _sw.ElapsedMilliseconds;
@@ -153,7 +153,7 @@ namespace ProceduralTerrain
                 int cCx = cw4 / 2, cCz = cw4 / 2;
                 blurProf = _blendedProfs[cCx * cw4 + cCz];
             }
-            int blurPasses = (bakeC || bakeA || anyMbActive)
+            int blurPasses = anyPipelineActive
                 ? Mathf.Max(Mathf.CeilToInt(blurProf.blur_passes), _transitionBlurPasses)
                 : 0;
 
@@ -518,7 +518,7 @@ namespace ProceduralTerrain
             }
 
             var _centerBiome = WorldGenerator.instance?.GetBiome((ox + width / 2) * (float)(_scale ?? 1f), (oz + width / 2) * (float)(_scale ?? 1f)) ?? Heightmap.Biome.None;
-            Log.LogDebug($"[ProceduralTerrain] zone ({ox},{oz}) biome={_centerBiome} bakeC={bakeC} bakeA={bakeA} voxels={bw}x{bh}x{bw} fixHops={_lastFixpointHops} Ph0={_t0}ms Ph1={_t1-_t0}ms blur={_t1b-_t1}ms Ph2={_t2-_t1b}ms fix={_tFix}ms Ph3={_t3-_t2}ms total={_t3}ms");
+            Log.LogDebug($"[ProceduralTerrain] zone ({ox},{oz}) biome={_centerBiome} pipeline={_pipeline.Length} voxels={bw}x{bh}x{bw} fixHops={_lastFixpointHops} Ph0={_t0}ms Ph1={_t1-_t0}ms blur={_t1b-_t1}ms Ph2={_t2-_t1b}ms fix={_tFix}ms Ph3={_t3-_t2}ms total={_t3}ms");
         }
 
         // ── Zone data dump ───────────────────────────────────────────────────────
@@ -564,12 +564,9 @@ namespace ProceduralTerrain
                     int biomeRaw = -1;
                     if (_biomeFrac != null) { float domF2=0f; for(int sl=0;sl<MaxBiomeSlots;sl++){float f=_biomeFrac[pIdx2*MaxBiomeSlots+sl];if(f>domF2){domF2=f;biomeRaw=sl;}} }
                     float totW  = (_biomeTotW    != null && idx < _biomeTotW.Length)    ? _biomeTotW[idx]    : -1f;
-                    float mcAmp = (_blendedProfs != null && idx < _blendedProfs.Length) ? _blendedProfs[idx].modeC_noiseAmp : -1f;
-                    float mbR2  = (_blendedProfs != null && idx < _blendedProfs.Length) ? _blendedProfs[idx].modeB_radius   : -1f;
                     float blur  = (_blendedProfs != null && idx < _blendedProfs.Length) ? _blendedProfs[idx].blur_passes    : -1f;
-                    float addH  = (_cb.bk2dAddH    != null && idx < _cb.bk2dAddH.Length)     ? _cb.bk2dAddH[idx]    : -1f;
-                    float bk2dS = (_cb.bk2dMcS     != null && idx < _cb.bk2dMcS.Length)      ? _cb.bk2dMcS[idx]     : -1f;
-                    sb.AppendLine($"    {{\"cx4\":{cx4},\"cz4\":{cz4},\"wx\":{wx:F1},\"wz\":{wz:F1},\"biome\":{biomeRaw},\"totW\":{totW:F3},\"mcAmp\":{mcAmp:F2},\"mbR\":{mbR2:F2},\"blur\":{blur:F2},\"addH\":{addH:F1},\"bk2dMcAmp\":{bk2dS:F3}}}{(last ? "" : ",")}");
+                    float flD   = (_blendedProfs != null && idx < _blendedProfs.Length) ? _blendedProfs[idx].floorDepth : -1f;
+                    sb.AppendLine($"    {{\"cx4\":{cx4},\"cz4\":{cz4},\"wx\":{wx:F1},\"wz\":{wz:F1},\"biome\":{biomeRaw},\"totW\":{totW:F3},\"blur\":{blur:F2},\"floorDepth\":{flD:F2}}}{(last ? "" : ",")}");
                 }
                 sb.AppendLine("  ],");
 
@@ -693,23 +690,20 @@ namespace ProceduralTerrain
             if (wg != null) BakeBlendedProfiles(cw4, ox, oz, overlap, s, wg);
 
             int hiMargin = 24, loMargin = 24;
-            if (_blendedProfs != null)
             {
                 float maxExtM = 0f, maxFloor = 0f;
-                int   lastC   = cw4 - 1;
-                void CheckCP(int ci, int cj) {
-                    int idx = ci * cw4 + cj;
-                    if (idx >= _blendedProfs.Length) return;
-                    var cp = _blendedProfs[idx];
-                    if (cp.modeC_noiseAmp > 0f) {
-                        float a = cp.modeC_noiseAmp * Mathf.Max(1f, 1f + cp.modeC_ampVary);
-                        float e = Mathf.Max(0f, 1f - cp.modeC_threshold) * a + cp.modeC_warpAmp;
+                int nb2 = cw4 * cw4;
+                for (int i = 0; i < nb2 && _blendedProfs != null && i < _blendedProfs.Length; i++)
+                    if (_blendedProfs[i].floorDepth > maxFloor) maxFloor = _blendedProfs[i].floorDepth;
+                foreach (var mode in _pipeline)
+                {
+                    if (mode is ModeCDef mc)
+                    {
+                        float a = mc.Amplitude * Mathf.Max(1f, 1f + mc.AmpVary);
+                        float e = Mathf.Max(0f, 1f - mc.Threshold) * a + mc.WarpAmp;
                         if (e > maxExtM) maxExtM = e;
                     }
-                    if (cp.floorDepth > maxFloor) maxFloor = cp.floorDepth;
                 }
-                CheckCP(cw4/2, cw4/2);
-                CheckCP(0, 0); CheckCP(lastC, 0); CheckCP(0, lastC); CheckCP(lastC, lastC);
                 if (maxExtM  > 0f) hiMargin = Mathf.Max(24, (int)Mathf.Ceil(maxExtM  / s) + 8);
                 if (maxFloor > 0f) loMargin = Mathf.Max(24, (int)Mathf.Ceil(maxFloor / s) + 4);
             }
@@ -735,9 +729,8 @@ namespace ProceduralTerrain
                 if (dx * dx + dz * dz < (searchR + locSearchR) * (searchR + locSearchR)) nearby.Add(loc);
             }
 
-            BakeSdfSetup(ox, oz, overlap, s, extLo, bhZ, bwZ, cw4, wg, nearby,
-                out bool bakeC, out bool bakeA, out bool anyMbActive);
-            FillPhase1(buf, bwZ, bhZ, extLo, s, ox, oz, overlap, bakeC, bakeA, anyMbActive, wg, cw4, nearby);
+            BakeSdfSetup(ox, oz, overlap, s, extLo, bhZ, bwZ, cw4, wg, nearby);
+            FillPhase1(buf, bwZ, bhZ, extLo, s, ox, oz, overlap, wg, cw4, nearby);
 
             int stX   = bhZ * bwZ;
             int bufSz2 = bwZ * bhZ * bwZ;
@@ -949,117 +942,6 @@ namespace ProceduralTerrain
             _zoneFaceCache[(ox, oz)] = cache;
         }
 
-        static void FillYColumn(float[] buf, int bw, int bh, int extLo, float s, int cx, int cz,
-            float h, float addH, float profMcT, float profMcFlare, float localAmp, bool mcActive,
-            float locFac, float floorY, float floorFade,
-            float mbWarpedH, float mbR, float mbNA, float mbVS, float mbWF, float mbTwist,
-            int bb00, int bb10, int bb01, int bb11, float bfx, float bfz,
-            float mAwf, float mAwa, float mAway, float mAf, float mAvs, float mAw, float mAwv, float mAwvf,
-            float worldX, float worldZ, bool bakeC, bool bakeA,
-            float mdAmp, float mdTCoord, float mdNCoord, float mdVScale)
-        {
-            int cyMbLo = bh, cyMbHi = -1;
-            if (mbR > 0f)
-            {
-                float yLo = mbWarpedH - mbR - mbNA;
-                if (yLo < floorY) yLo = floorY;
-                float yHi = mbWarpedH + mbR + mbNA;
-                if (yHi > yLo)
-                {
-                    cyMbLo = Math.Max(0,    (int)(yLo / s) - extLo);
-                    cyMbHi = Math.Min(bh-1, (int)(yHi / s) - extLo + 1);
-                }
-            }
-
-            for (int cy = 0; cy < bh; cy++)
-            {
-                float worldY   = (extLo + cy) * s;
-                float baseSDF  = worldY - h;
-                float combined = baseSDF;
-
-                if (mbR > 0f && cy >= cyMbLo && cy <= cyMbHi)
-                {
-                    float bandSDF = mbR - Mathf.Abs(worldY - mbWarpedH);
-                    if (mbNA > 0f)
-                    {
-                        float sy = worldY * mbVS;
-                        float nx = worldX, nz = worldZ;
-                        if (mbTwist != 0f)
-                        {
-                            float ang = worldY * mbTwist;
-                            float c = Mathf.Cos(ang), ss = Mathf.Sin(ang);
-                            nx = worldX * c - worldZ * ss;
-                            nz = worldX * ss + worldZ * c;
-                        }
-                        bandSDF += _mbNoise!.GetNoise(nx * mbWF, sy * mbWF, nz * mbWF) * mbNA;
-                    }
-                    float fd = worldY - floorY;
-                    float sdf = bandSDF < fd ? bandSDF : fd;
-                    if (sdf > combined) combined = sdf;
-                }
-
-                if (mdAmp > 0f)
-                {
-                    float mdn   = _mdNoise!.GetNoise(mdTCoord, worldY * mdVScale, mdNCoord) * 0.5f + 0.5f;
-                    float mdSdf = (worldY - h) - mdn * mdAmp;
-                    combined = combined < mdSdf ? combined : mdSdf;
-                }
-
-                if (mcActive)
-                {
-                    float relY = worldY - addH;
-                    float n;
-                    {
-                        float n0 = _cb.noiseBuf![bb00+cy] + (_cb.noiseBuf[bb10+cy] - _cb.noiseBuf![bb00+cy]) * bfx;
-                        float n1 = _cb.noiseBuf![bb01+cy] + (_cb.noiseBuf[bb11+cy] - _cb.noiseBuf![bb01+cy]) * bfx;
-                        n = n0 + (n1-n0) * bfz;
-                    }
-                    float _ft = Mathf.Clamp01(relY / localAmp);
-                    float effMcT = profMcT - profMcFlare * (4f * _ft * (1f - _ft));
-                    float sdf = relY - (n - effMcT) * localAmp;
-                    combined = combined < sdf ? combined : sdf;
-                }
-
-                if (mAw > 0f)
-                {
-                    float na, nb, wn;
-                    if (bakeA)
-                    {
-                        float t0 = _cb.tunBuf![bb00+cy]  + (_cb.tunBuf[bb10+cy]  - _cb.tunBuf[bb00+cy])  * bfx;
-                        float t1 = _cb.tunBuf![bb01+cy]  + (_cb.tunBuf[bb11+cy]  - _cb.tunBuf[bb01+cy])  * bfx;
-                        na = t0 + (t1 - t0) * bfz;
-                        float t0b = _cb.tunBuf2![bb00+cy] + (_cb.tunBuf2[bb10+cy] - _cb.tunBuf2[bb00+cy]) * bfx;
-                        float t1b = _cb.tunBuf2![bb01+cy] + (_cb.tunBuf2[bb11+cy] - _cb.tunBuf2[bb01+cy]) * bfx;
-                        nb = t0b + (t1b - t0b) * bfz;
-                        float w0 = _cb.tunWBuf![bb00+cy] + (_cb.tunWBuf[bb10+cy] - _cb.tunWBuf[bb00+cy]) * bfx;
-                        float w1 = _cb.tunWBuf![bb01+cy] + (_cb.tunWBuf[bb11+cy] - _cb.tunWBuf[bb01+cy]) * bfx;
-                        wn = w0 + (w1 - w0) * bfz;
-                    }
-                    else
-                    {
-                        float sy  = worldY * mAvs;
-                        float wx  = _warpX! .GetNoise(worldX * mAwf, sy * mAwf, worldZ * mAwf) * mAwa;
-                        float wz  = _warpZ! .GetNoise(worldX * mAwf, sy * mAwf, worldZ * mAwf) * mAwa;
-                        float wy  = _warpY! .GetNoise(worldX * mAwf, sy * mAwf, worldZ * mAwf) * mAway;
-                        float wx2 = _warpX2!.GetNoise(worldX * mAwf, sy * mAwf, worldZ * mAwf) * mAwa;
-                        float wz2 = _warpZ2!.GetNoise(worldX * mAwf, sy * mAwf, worldZ * mAwf) * mAwa;
-                        float wy2 = _warpY2!.GetNoise(worldX * mAwf, sy * mAwf, worldZ * mAwf) * mAway;
-                        na = _caveNoise! .GetNoise((worldX + wx)  * mAf, (sy + wy)  * mAf, (worldZ + wz)  * mAf);
-                        nb = _caveNoise2!.GetNoise((worldX + wx2) * mAf, (sy + wy2) * mAf, (worldZ + wz2) * mAf);
-                        wn = _widthNoise!.GetNoise(worldX * mAwvf, (worldY * mAvs) * mAwvf, worldZ * mAwvf);
-                    }
-                    float localWidth = Mathf.Max(mAw * (1f + mAwv * wn), 0.001f);
-                    float dist      = Mathf.Sqrt(na * na + nb * nb) * 0.7071f;
-                    float tunnelSDF = (localWidth - dist) / localWidth * 4f * s;
-                    float sdf = Mathf.Min(tunnelSDF, worldY - floorY);
-                    combined = SmoothMax(combined, sdf, 2f * s);
-                }
-
-                float _fade = floorFade > 0f ? Mathf.Clamp01((worldY - floorY) / floorFade) : 1f;
-                buf[(cx * bh + cy) * bw + cz] = baseSDF + (combined - baseSDF) * locFac * _fade;
-            }
-        }
-
         // ── Placement height ──────────────────────────────────────────────────────────
         internal static float FindCarvedSurfaceY(float worldX, float originalY, float worldZ)
         {
@@ -1083,67 +965,55 @@ namespace ProceduralTerrain
         // ── BakeSdfSetup ─────────────────────────────────────────────────────────
         static void BakeSdfSetup(
             int ox, int oz, int overlap, float s, int extLo, int bh, int bw, int cw4,
-            WorldGenerator? wg, List<(Vector2 pos, float extR)> nearbyLocs,
-            out bool bakeC, out bool bakeA, out bool anyMbActive)
+            WorldGenerator? wg, List<(Vector2 pos, float extR)> nearbyLocs)
         {
-            bakeC = false; bakeA = false; anyMbActive = false;
-            int nb4Size = cw4 * cw4 * bh;
-            int nb2Size = cw4 * cw4;
-            if (_cb.noiseBuf  == null || _cb.noiseBuf.Length  < nb4Size) _cb.noiseBuf  = new float[nb4Size];
-            if (_cb.tunBuf    == null || _cb.tunBuf.Length    < nb4Size) _cb.tunBuf    = new float[nb4Size];
-            if (_cb.tunBuf2   == null || _cb.tunBuf2.Length   < nb4Size) _cb.tunBuf2   = new float[nb4Size];
-            if (_cb.tunWBuf   == null || _cb.tunWBuf.Length   < nb4Size) _cb.tunWBuf   = new float[nb4Size];
-            if (_cb.bk2dAddH  == null || _cb.bk2dAddH.Length  < nb2Size) _cb.bk2dAddH  = new float[nb2Size];
-            if (_cb.bk2dLAmp  == null || _cb.bk2dLAmp.Length  < nb2Size) _cb.bk2dLAmp  = new float[nb2Size];
-            if (_cb.bk2dMcS     == null || _cb.bk2dMcS.Length     < nb2Size) _cb.bk2dMcS     = new float[nb2Size];
-            if (_cb.bk2dMcT     == null || _cb.bk2dMcT.Length     < nb2Size) _cb.bk2dMcT     = new float[nb2Size];
-            if (_cb.bk2dMcFlare == null || _cb.bk2dMcFlare.Length < nb2Size) _cb.bk2dMcFlare = new float[nb2Size];
+            var pipeline = _pipeline;
+            int pLen     = pipeline.Length;
+            int nb2Size  = cw4 * cw4;
+
+            // Ensure bk2dModeAmps sized
+            if (_cb.bk2dModeAmps == null || _cb.bk2dModeAmps.Length < pLen)
+                _cb.bk2dModeAmps = new float[pLen][];
+            for (int mi = 0; mi < pLen; mi++)
+                if (_cb.bk2dModeAmps[mi] == null || _cb.bk2dModeAmps[mi].Length < nb2Size)
+                    _cb.bk2dModeAmps[mi] = new float[nb2Size];
+
+            // Ensure bkModeAux sized
+            if (_cb.bkModeAux == null || _cb.bkModeAux.Length < pLen)
+                _cb.bkModeAux = new float[pLen][][];
+            for (int mi = 0; mi < pLen; mi++)
+                if (_cb.bkModeAux[mi] == null)
+                    _cb.bkModeAux[mi] = Array.Empty<float[]>();
+
+            // Gradient arrays sized based on cw4+1 grid
             int mdSize = (cw4 + 1) * (cw4 + 1);
             if (_cb.bk2dTgX     == null || _cb.bk2dTgX.Length     < mdSize) _cb.bk2dTgX     = new float[mdSize];
             if (_cb.bk2dTgZ     == null || _cb.bk2dTgZ.Length     < mdSize) _cb.bk2dTgZ     = new float[mdSize];
             if (_cb.bk2dBlurH   == null || _cb.bk2dBlurH.Length   < mdSize) _cb.bk2dBlurH   = new float[mdSize];
             if (_cb.bk2dGradMag == null || _cb.bk2dGradMag.Length < mdSize) _cb.bk2dGradMag = new float[mdSize];
-            if (_cb.bk2dMdAmp   == null || _cb.bk2dMdAmp.Length   < nb2Size) _cb.bk2dMdAmp  = new float[nb2Size];
+
+            // Floor depth/fade grids
             if (_cb.bk2dFlD    == null || _cb.bk2dFlD.Length    < nb2Size) _cb.bk2dFlD    = new float[nb2Size];
             if (_cb.bk2dFlFade == null || _cb.bk2dFlFade.Length < nb2Size) _cb.bk2dFlFade = new float[nb2Size];
-            if (_cb.bk2dMbwf  == null || _cb.bk2dMbwf.Length  < nb2Size) _cb.bk2dMbwf  = new float[nb2Size];
-            if (_cb.bk2dMbwa  == null || _cb.bk2dMbwa.Length  < nb2Size) _cb.bk2dMbwa  = new float[nb2Size];
-            if (_cb.bk2dMbr   == null || _cb.bk2dMbr.Length   < nb2Size) _cb.bk2dMbr   = new float[nb2Size];
-            if (_cb.bk2dMbvs  == null || _cb.bk2dMbvs.Length  < nb2Size) _cb.bk2dMbvs  = new float[nb2Size];
-            if (_cb.bk2dMbna  == null || _cb.bk2dMbna.Length  < nb2Size) _cb.bk2dMbna  = new float[nb2Size];
-            if (_cb.bk2dMbyo    == null || _cb.bk2dMbyo.Length    < nb2Size) _cb.bk2dMbyo    = new float[nb2Size];
-            if (_cb.bk2dMbtwist == null || _cb.bk2dMbtwist.Length < nb2Size) _cb.bk2dMbtwist = new float[nb2Size];
-            if (_cb.bk2dMawf  == null || _cb.bk2dMawf.Length  < nb2Size) _cb.bk2dMawf  = new float[nb2Size];
-            if (_cb.bk2dMawa  == null || _cb.bk2dMawa.Length  < nb2Size) _cb.bk2dMawa  = new float[nb2Size];
-            if (_cb.bk2dMaway == null || _cb.bk2dMaway.Length < nb2Size) _cb.bk2dMaway = new float[nb2Size];
-            if (_cb.bk2dMaf   == null || _cb.bk2dMaf.Length   < nb2Size) _cb.bk2dMaf   = new float[nb2Size];
-            if (_cb.bk2dMavs  == null || _cb.bk2dMavs.Length  < nb2Size) _cb.bk2dMavs  = new float[nb2Size];
-            if (_cb.bk2dMaw   == null || _cb.bk2dMaw.Length   < nb2Size) _cb.bk2dMaw   = new float[nb2Size];
-            if (_cb.bk2dMawv  == null || _cb.bk2dMawv.Length  < nb2Size) _cb.bk2dMawv  = new float[nb2Size];
-            if (_cb.bk2dMawvf == null || _cb.bk2dMawvf.Length < nb2Size) _cb.bk2dMawvf = new float[nb2Size];
-            if (_cb.bk2dMayo  == null || _cb.bk2dMayo.Length  < nb2Size) _cb.bk2dMayo  = new float[nb2Size];
 
-            if (_blendedProfs != null)
+            // Populate floor arrays from blended profiles
+            for (int i = 0; i < nb2Size && _blendedProfs != null && i < _blendedProfs.Length; i++)
             {
-                for (int i = 0; i < nb2Size && i < _blendedProfs.Length; i++)
-                {
-                    if (_blendedProfs[i].modeC_noiseAmp > 0f) bakeC = true;
-                    if (_blendedProfs[i].modeA_width    > 0f) bakeA = true;
-                    if (_blendedProfs[i].modeB_radius   > 0f) anyMbActive = true;
-                    if (bakeC && bakeA && anyMbActive) break;
-                }
+                _cb.bk2dFlD!  [i] = _blendedProfs[i].floorDepth;
+                _cb.bk2dFlFade![i] = _blendedProfs[i].floorFade;
             }
 
-            int   ctrIdx2     = (cw4 / 2) * cw4 + (cw4 / 2);
-            float mdBlurRadius = (_blendedProfs != null && ctrIdx2 < _blendedProfs.Length)
-                                 ? _blendedProfs[ctrIdx2].modeD_blurRadius : 128f;
-            mdBlurRadius = Mathf.Clamp(mdBlurRadius, 16f, 2048f);
+            // BakeBegin for each mode
+            foreach (var mode in pipeline)
+                mode.BakeBegin(ref _cb, nb2Size, bh, cw4);
 
-            // blur-then-differentiate gradient pre-pass
-            bool anyMdActive = false;
-            if (_blendedProfs != null)
-                for (int i = 0; i < nb2Size && i < _blendedProfs.Length; i++)
-                    if (_blendedProfs[i].modeD_noiseAmp > 0f) { anyMdActive = true; break; }
+            // Check if any Mode D (gradient) is active
+            bool anyMdActive = pipeline.OfType<ModeDDef>().Any(m =>
+                _cb.bk2dModeAmps != null && m.PipelineIndex >= 0 &&
+                _cb.bk2dModeAmps[m.PipelineIndex].Any(v => v > 0f));
+
+            float mdBlurRadius = pipeline.OfType<ModeDDef>().Select(m => m.BlurRadius).DefaultIfEmpty(128f).Max();
+            mdBlurRadius = Mathf.Clamp(mdBlurRadius, 16f, 2048f);
 
             if (anyMdActive && wg != null)
             {
@@ -1160,6 +1030,7 @@ namespace ProceduralTerrain
                 }
             }
 
+            // Main coarse cell loop
             for (int cx4 = 0; cx4 < cw4; cx4++)
             for (int cz4 = 0; cz4 < cw4; cz4++)
             {
@@ -1167,98 +1038,26 @@ namespace ProceduralTerrain
                 int   cz4w  = Math.Min(cz4 * 4, bw - 1);
                 int   gx4   = ox - overlap + cx4w, gz4 = oz - overlap + cz4w;
                 float wx4   = gx4 * s, wz4 = gz4 * s;
-                int   idx2  = cx4 * cw4 + cz4;
-                var   p4    = (wg != null && _blendedProfs != null && idx2 < _blendedProfs.Length)
-                              ? _blendedProfs[idx2] : CaveProfile.Default;
+                int   cellIdx = cx4 * cw4 + cz4;
 
-                _cb.bk2dMcS!    [idx2] = p4.modeC_noiseAmp;
-                _cb.bk2dMcT!    [idx2] = p4.modeC_threshold;
-                _cb.bk2dMcFlare![idx2] = p4.modeC_flare;
-                _cb.bk2dFlD!   [idx2] = p4.floorDepth;
-                _cb.bk2dFlFade![idx2] = p4.floorFade;
-                _cb.bk2dMbwf![idx2] = p4.modeB_warpFrequency;
-                _cb.bk2dMbwa![idx2] = p4.modeB_warpAmp;
-                _cb.bk2dMbr! [idx2] = p4.modeB_radius;
-                _cb.bk2dMbvs![idx2] = p4.modeB_vScale;
-                _cb.bk2dMbna![idx2] = p4.modeB_noiseAmp;
-                _cb.bk2dMbyo![idx2]    = p4.modeB_yOffset;
-                _cb.bk2dMbtwist![idx2] = p4.modeB_twist;
-                _cb.bk2dMawf![idx2] = p4.modeA_warpFrequency;
-                _cb.bk2dMawa![idx2] = p4.modeA_warpAmp;
-                _cb.bk2dMaway![idx2] = p4.modeA_warpAmpY;
-                _cb.bk2dMaf! [idx2] = p4.modeA_frequency;
-                _cb.bk2dMavs![idx2] = p4.modeA_vScale;
-                _cb.bk2dMaw! [idx2] = p4.modeA_width;
-                _cb.bk2dMawv![idx2] = p4.modeA_widthVary;
-                _cb.bk2dMawvf![idx2]= p4.modeA_widthFrequency;
-                _cb.bk2dMayo! [idx2]= p4.modeA_yOffset;
-                _cb.bk2dMdAmp![idx2] = p4.modeD_noiseAmp;
+                var args = new BakeCellArgs {
+                    worldX = wx4, worldZ = wz4,
+                    cx4 = cx4, cz4 = cz4, cellIdx = cellIdx, cw4 = cw4, bh = bh,
+                    s = s, extLoS = extLo * s,
+                    wg = wg!
+                };
 
-                if (bakeC && p4.modeC_noiseAmp > 0f)
-                {
-                    float awf4  = p4.modeC_warpFrequency;
-                    float awx4  = _hmAddWarpX!.GetNoise(wx4 * awf4, wz4 * awf4) * p4.modeC_warpAmp;
-                    float awz4  = _hmAddWarpZ!.GetNoise(wx4 * awf4, wz4 * awf4) * p4.modeC_warpAmp;
-                    float addH4    = wg!.GetHeight(wx4 + awx4, wz4 + awz4) - p4.modeC_yOffset;
-                    float avf4  = p4.modeC_ampFrequency;
-                    _cb.bk2dAddH![idx2] = addH4;
-                    _cb.bk2dLAmp![idx2] = Mathf.Max(p4.modeC_noiseAmp * (1f + p4.modeC_ampVary
-                                           * _addVaryNoise!.GetNoise(wx4 * avf4, wz4 * avf4)), 0f);
-                    float ts4 = 1f + p4.modeC_twistVary
-                        * _twistVaryNoise!.GetNoise(wx4 * p4.modeC_twistFrequency, wz4 * p4.modeC_twistFrequency);
-                    float af4 = p4.modeC_frequency, vs4 = p4.modeC_vScale, tw4 = p4.modeC_twist;
-                    int baseIdx = cx4 * cw4 * bh + cz4 * bh;
-                    for (int cy = 0; cy < bh; cy++)
-                    {
-                        float wy4  = (extLo + cy) * s;
-                        float sy4  = (wy4 - addH4) * vs4;
-                        float ang4 = wy4 * tw4 * ts4;
-                        float cos4 = Mathf.Cos(ang4), sin4 = Mathf.Sin(ang4);
-                        float tx4  = wx4 * cos4 - wz4 * sin4;
-                        float tz4  = wx4 * sin4 + wz4 * cos4;
-                        _cb.noiseBuf[baseIdx + cy] = _addNoise!.GetNoise(tx4 * af4, sy4 * af4, tz4 * af4);
-                    }
-                }
-                else if (bakeC)
-                {
-                    _cb.bk2dAddH![idx2] = wg!.GetHeight(wx4, wz4);
-                    _cb.bk2dLAmp![idx2] = 0f;
-                    int baseIdx = cx4 * cw4 * bh + cz4 * bh;
-                    for (int cy = 0; cy < bh; cy++) _cb.noiseBuf[baseIdx + cy] = 0f;
-                }
-
-                if (bakeA && p4.modeA_width > 0f)
-                {
-                    float mawf4  = _cb.bk2dMawf! [idx2];
-                    float mawa4  = _cb.bk2dMawa! [idx2];
-                    float maf4   = _cb.bk2dMaf!  [idx2];
-                    float mavs4  = _cb.bk2dMavs! [idx2];
-                    float mawvf4 = _cb.bk2dMawvf![idx2];
-                    float mayo4  = p4.modeA_yOffset;
-                    float addHA4 = mayo4 > 0f ? wg!.GetHeight(wx4, wz4) : 0f;
-                    int baseIdxA = cx4 * cw4 * bh + cz4 * bh;
-                    for (int cy = 0; cy < bh; cy++)
-                    {
-                        float sy4   = ((extLo + cy) * s - addHA4 + mayo4) * mavs4;
-                        float awx4  = _warpX! .GetNoise(wx4 * mawf4, sy4 * mawf4, wz4 * mawf4) * mawa4;
-                        float awz4  = _warpZ! .GetNoise(wx4 * mawf4, sy4 * mawf4, wz4 * mawf4) * mawa4;
-                        float awx4b = _warpX2!.GetNoise(wx4 * mawf4, sy4 * mawf4, wz4 * mawf4) * mawa4;
-                        float awz4b = _warpZ2!.GetNoise(wx4 * mawf4, sy4 * mawf4, wz4 * mawf4) * mawa4;
-                        _cb.tunBuf! [baseIdxA + cy] = _caveNoise! .GetNoise((wx4 + awx4)  * maf4, sy4 * maf4, (wz4 + awz4)  * maf4);
-                        _cb.tunBuf2![baseIdxA + cy] = _caveNoise2!.GetNoise((wx4 + awx4b) * maf4, sy4 * maf4, (wz4 + awz4b) * maf4);
-                        _cb.tunWBuf![baseIdxA + cy] = _widthNoise!.GetNoise(wx4 * mawvf4, sy4 * mawvf4, wz4 * mawvf4);
-                    }
-                }
-                else if (bakeA)
-                {
-                    int baseIdxA = cx4 * cw4 * bh + cz4 * bh;
-                    for (int cy = 0; cy < bh; cy++) { _cb.tunBuf![baseIdxA + cy] = 0f; _cb.tunBuf2![baseIdxA + cy] = 0f; _cb.tunWBuf![baseIdxA + cy] = 0f; }
-                }
+                foreach (var mode in pipeline)
+                    mode.BakeCell(ref _cb, in args);
             }
 
+            // Mode B full-res warpedH pass
+            bool anyMbActive = pipeline.OfType<ModeBDef>().Any(m =>
+                _cb.bk2dModeAmps != null && m.PipelineIndex >= 0 &&
+                _cb.bk2dModeAmps[m.PipelineIndex].Any(v => v > 0f));
+            var firstMb = pipeline.OfType<ModeBDef>().FirstOrDefault();
 
-
-            if (anyMbActive && wg != null)
+            if (anyMbActive && wg != null && firstMb != null)
             {
                 int fullSz = bw * bw;
                 if (_cb.bkWarpedH == null || _cb.bkWarpedH.Length < fullSz) _cb.bkWarpedH = new float[fullSz];
@@ -1271,9 +1070,9 @@ namespace ProceduralTerrain
                     float bfx2 = (cx & 3) * 0.25f, bfz2 = (cz & 3) * 0.25f;
                     int b00 = cx4 * cw4 + cz4, b10 = cx4b * cw4 + cz4;
                     int b01 = cx4 * cw4 + cz4b, b11 = cx4b * cw4 + cz4b;
-                    float wf    = BL(_cb.bk2dMbwf!, b00, b10, b01, b11, bfx2, bfz2);
-                    float wa    = BL(_cb.bk2dMbwa!, b00, b10, b01, b11, bfx2, bfz2);
-                    float yo    = BL(_cb.bk2dMbyo!, b00, b10, b01, b11, bfx2, bfz2);
+                    float wf    = firstMb.WarpFrequency;
+                    float wa    = BL(_cb.bk2dModeAmps![firstMb.PipelineIndex], b00, b10, b01, b11, bfx2, bfz2) > 0f ? firstMb.WarpAmp : 0f;
+                    float yo    = firstMb.YOffset;
                     float locF2 = LocationFactor(wx, wz, nearbyLocs);
                     float dx    = _hmWarpX!.GetNoise(wx * wf, wz * wf) * (wa * locF2);
                     float dz2   = _hmWarpZ!.GetNoise(wx * wf, wz * wf) * (wa * locF2);
@@ -1344,17 +1143,10 @@ namespace ProceduralTerrain
         }
 
         static void FillPhase1(float[] buf, int bw, int bh, int extLo, float s,
-            int ox, int oz, int overlap, bool bakeC, bool bakeA, bool anyMbActive, WorldGenerator? wg, int cw4,
+            int ox, int oz, int overlap, WorldGenerator? wg, int cw4,
             List<(Vector2 pos, float extR)> nearbyLocs)
         {
-            int   ctrIdx      = (cw4 / 2) * cw4 + (cw4 / 2);
-            float mdFreqT     = _blendedProfs != null && _blendedProfs.Length > ctrIdx ? _blendedProfs[ctrIdx].modeD_freqT       : 0.02f;
-            float mdFreqN     = _blendedProfs != null && _blendedProfs.Length > ctrIdx ? _blendedProfs[ctrIdx].modeD_freqN       : 0.02f;
-            float mdAlignment = _blendedProfs != null && _blendedProfs.Length > ctrIdx ? _blendedProfs[ctrIdx].modeD_alignment    : 0f;
-            float mdVScale    = _blendedProfs != null && _blendedProfs.Length > ctrIdx ? _blendedProfs[ctrIdx].modeD_vScale       : 0.1f;
-            float mdGradFade   = _blendedProfs != null && _blendedProfs.Length > ctrIdx ? _blendedProfs[ctrIdx].modeD_gradFade     : 0f;
-            float mdSeaFade    = _blendedProfs != null && _blendedProfs.Length > ctrIdx ? _blendedProfs[ctrIdx].modeD_seaFade       : 0f;
-            float mdBlurRadius = _blendedProfs != null && _blendedProfs.Length > ctrIdx ? Mathf.Max(_blendedProfs[ctrIdx].modeD_blurRadius, 1f) : 128f;
+            var pipeline = _pipeline;
             for (int cx = 0; cx < bw; cx++)
             for (int cz = 0; cz < bw; cz++)
             {
@@ -1366,18 +1158,11 @@ namespace ProceduralTerrain
                 int cz4b = Math.Min(cz4 + 1, cw4 - 1);
                 float bfx = (cx & 3) * 0.25f;
                 float bfz = (cz & 3) * 0.25f;
-                int b200 =  cx4  * cw4 + cz4,  b210 =  cx4b * cw4 + cz4;
-                int b201 =  cx4  * cw4 + cz4b, b211 =  cx4b * cw4 + cz4b;
-                int bb00 = b200 * bh, bb10 = b210 * bh, bb01 = b201 * bh, bb11 = b211 * bh;
+                int b200 = cx4  * cw4 + cz4,  b210 = cx4b * cw4 + cz4;
+                int b201 = cx4  * cw4 + cz4b, b211 = cx4b * cw4 + cz4b;
 
-
-
-                float profMcT    = BL(_cb.bk2dMcT!,     b200, b210, b201, b211, bfx, bfz);
-                float profMcFlare= BL(_cb.bk2dMcFlare!, b200, b210, b201, b211, bfx, bfz);
                 float profFlD    = BL(_cb.bk2dFlD!,    b200, b210, b201, b211, bfx, bfz);
                 float profFlFade = BL(_cb.bk2dFlFade!, b200, b210, b201, b211, bfx, bfz);
-                float addH     = bakeC ? BL(_cb.bk2dAddH!, b200, b210, b201, b211, bfx, bfz) : 0f;
-                float localAmp = bakeC ? BL(_cb.bk2dLAmp!, b200, b210, b201, b211, bfx, bfz) : 0f;
                 float h;
                 if (wg == null) { h = 0f; }
                 else
@@ -1406,63 +1191,46 @@ namespace ProceduralTerrain
                     locFac     = minFac;
                     effectiveH = Mathf.Lerp(flatH, h, locFac);
                 }
-                float floorY   = effectiveH - profFlD;
 
-                float mbWarpedH = 0f, mbR = 0f, mbNA = 0f, mbVS = 0f, mbWF = 0f, mbTwist = 0f;
-                if (anyMbActive)
-                {
-                    mbR       = BL(_cb.bk2dMbr!,     b200, b210, b201, b211, bfx, bfz);
-                    mbWarpedH = mbR > 0f ? _cb.bkWarpedH![cx * bw + cz] : 0f;
-                    mbNA      = BL(_cb.bk2dMbna!,    b200, b210, b201, b211, bfx, bfz);
-                    mbVS      = BL(_cb.bk2dMbvs!,    b200, b210, b201, b211, bfx, bfz);
-                    mbWF      = BL(_cb.bk2dMbwf!,    b200, b210, b201, b211, bfx, bfz);
-                    mbTwist   = BL(_cb.bk2dMbtwist!, b200, b210, b201, b211, bfx, bfz);
-                }
-
-                float mAwf=0f, mAwa=0f, mAway=0f, mAf=0f, mAvs=0f, mAw=0f, mAwv=0f, mAwvf=0f;
-                if (bakeA)
-                {
-                    mAwf  = BL(_cb.bk2dMawf!,  b200, b210, b201, b211, bfx, bfz);
-                    mAwa  = BL(_cb.bk2dMawa!,  b200, b210, b201, b211, bfx, bfz);
-                    mAway = BL(_cb.bk2dMaway!, b200, b210, b201, b211, bfx, bfz);
-                    mAf   = BL(_cb.bk2dMaf!,   b200, b210, b201, b211, bfx, bfz);
-                    mAvs  = BL(_cb.bk2dMavs!,  b200, b210, b201, b211, bfx, bfz);
-                    mAw   = BL(_cb.bk2dMaw!,   b200, b210, b201, b211, bfx, bfz);
-                    mAwv  = BL(_cb.bk2dMawv!,  b200, b210, b201, b211, bfx, bfz);
-                    mAwvf = BL(_cb.bk2dMawvf!, b200, b210, b201, b211, bfx, bfz);
-                }
-
-                // mode D uses a (cw4+1)×(cw4+1) coarse grid — unclamped indices to avoid zone-edge seams
-                int mdCw   = cw4 + 1;
-                int mdCx4  = cx / 4, mdCz4 = cz / 4;
-                int md200  = mdCx4 * mdCw + mdCz4,       md210 = (mdCx4 + 1) * mdCw + mdCz4;
-                int md201  = mdCx4 * mdCw + (mdCz4 + 1), md211 = (mdCx4 + 1) * mdCw + (mdCz4 + 1);
+                // mode D uses a (cw4+1)×(cw4+1) coarse grid
+                int mdCw  = cw4 + 1;
+                int mdCx4 = cx / 4, mdCz4 = cz / 4;
+                int md200 = mdCx4 * mdCw + mdCz4,       md210 = (mdCx4 + 1) * mdCw + mdCz4;
+                int md201 = mdCx4 * mdCw + (mdCz4 + 1), md211 = (mdCx4 + 1) * mdCw + (mdCz4 + 1);
                 float nmX = BL(_cb.bk2dTgX!, md200, md210, md201, md211, bfx, bfz);
                 float nmZ = BL(_cb.bk2dTgZ!, md200, md210, md201, md211, bfx, bfz);
                 float nmLen = Mathf.Sqrt(nmX * nmX + nmZ * nmZ);
                 if (nmLen > 0.001f) { nmX /= nmLen; nmZ /= nmLen; } else { nmX = 1f; nmZ = 0f; }
                 float mdBlurH  = BL(_cb.bk2dBlurH!,   md200, md210, md201, md211, bfx, bfz);
                 float mdGradMg = BL(_cb.bk2dGradMag!, md200, md210, md201, md211, bfx, bfz);
-                // taper frequency to 0 near singularity
-                float mdAmp      = BL(_cb.bk2dMdAmp!, b200, b210, b201, b211, bfx, bfz);
-                float gradFactor = mdGradFade > 0f ? Mathf.SmoothStep(0f, mdGradFade, mdGradMg) : 1f;
-                // normalize blurH by blurRadius (stable, no amplification of height noise near singularity)
-                float mdRadial = mdBlurH / mdBlurRadius;
-                // alignment=0 → fast along T (radial ridges), 1 → fast along N (coast-parallel)
-                float freqT = Mathf.Lerp(mdFreqT, mdFreqN, mdAlignment);
-                float freqN = Mathf.Lerp(mdFreqN, mdFreqT, mdAlignment);
-                float mdTCoord = (worldX * (-nmZ) + worldZ * nmX) * freqT * gradFactor;
-                float mdNCoord = mdRadial * freqN * gradFactor;
-                float mdSeaFactor = mdSeaFade > 0f ? Mathf.SmoothStep(0f, mdSeaFade, effectiveH - 30f) : 1f;
-                float mdLocalAmp = mdAmp * mdSeaFactor;
-                FillYColumn(buf, bw, bh, extLo, s, cx, cz,
-                    effectiveH, addH, profMcT, profMcFlare, localAmp, localAmp > 0f && bakeC,
-                    locFac, floorY, profFlFade,
-                    mbWarpedH, mbR, mbNA, mbVS, mbWF, mbTwist,
-                    bb00, bb10, bb01, bb11, bfx, bfz,
-                    mAwf, mAwa, mAway, mAf, mAvs, mAw, mAwv, mAwvf,
-                    worldX, worldZ, bakeC, bakeA,
-                    mdLocalAmp, mdTCoord, mdNCoord, mdVScale);
+
+                var col = new ColumnCtx {
+                    worldX=worldX, worldZ=worldZ, effectiveH=effectiveH, locFac=locFac,
+                    blurH=mdBlurH, gradMag=mdGradMg, gradDirX=nmX, gradDirZ=nmZ,
+                    bfx=bfx, bfz=bfz,
+                    b200=b200, b210=b210, b201=b201, b211=b211,
+                    b3_00=b200*bh, b3_10=b210*bh, b3_01=b201*bh, b3_11=b211*bh,
+                    md200=md200, md210=md210, md201=md201, md211=md211,
+                    cw4=cw4, bh=bh,
+                    cx=cx, cz=cz, bw=bw
+                };
+                foreach (var mode in pipeline) mode.PrepareColumn(ref _cb, in col);
+
+                // Voxel loop
+                float floorY = effectiveH - profFlD;
+                for (int cy = 0; cy < bh; cy++)
+                {
+                    float worldY  = (extLo + cy) * s;
+                    float baseSDF = worldY - effectiveH;
+                    float combined = baseSDF;
+                    var vox = new VoxelCtx {
+                        worldX=worldX, worldY=worldY, worldZ=worldZ, effectiveH=effectiveH,
+                        cy=cy, locFac=locFac, floorY=floorY, floorFade=profFlFade
+                    };
+                    foreach (var mode in pipeline) mode.ComputeVoxel(ref combined, in vox);
+                    float _fade = profFlFade > 0f ? Mathf.Clamp01((worldY - floorY) / profFlFade) : 1f;
+                    buf[(cx * bh + cy) * bw + cz] = baseSDF + (combined - baseSDF) * locFac * _fade;
+                }
             }
         }
     }
