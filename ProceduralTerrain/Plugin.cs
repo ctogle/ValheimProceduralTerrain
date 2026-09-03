@@ -12,6 +12,117 @@ using UnityEngine;
 
 namespace ProceduralTerrain
 {
+    internal enum ModeType { A, B, C, D }
+
+    // A named, typed terrain-shaping primitive. Profiles reference these by name.
+    internal class ModeDefinition
+    {
+        public string   Name      = "";
+        public ModeType Type;
+        public float    Amplitude;  // distance-blended; determines mode on/off and relative strength
+
+        // ── Type A ────────────────────────────────────────────────────────────────
+        public float A_frequency = 0.015f, A_warpAmp = 10f, A_warpAmpY = 0f, A_warpFrequency = 0.04f;
+        public float A_vScale = 0.35f, A_widthVary = 0f, A_widthFrequency = 0.003f, A_yOffset = 0f;
+
+        // ── Type B ────────────────────────────────────────────────────────────────
+        public float B_warpAmp = 80f, B_warpFrequency = 0.005f, B_vScale = 0.5f;
+        public float B_noiseAmp = 0f, B_yOffset = 0f, B_twist = 0f;
+
+        // ── Type C ────────────────────────────────────────────────────────────────
+        public float C_threshold = 0f, C_frequency = 0.015f, C_warpAmp = 8f, C_warpFrequency = 0.005f;
+        public float C_vScale = 0.4f, C_twist = 0f, C_twistVary = 0f, C_twistFrequency = 0.003f;
+        public float C_ampVary = 0f, C_ampFrequency = 0.003f, C_flare = 0f, C_yOffset = 0f;
+
+        // ── Type D ────────────────────────────────────────────────────────────────
+        public float D_freqT = 0.02f, D_freqN = 0.02f, D_blurRadius = 128f;
+        public float D_alignment = 0f, D_vScale = 0.1f, D_gradFade = 0f, D_seaFade = 0f;
+
+        // Project this mode's params into a CaveProfile for the internal blending pipeline.
+        public void ApplyTo(ref CaveProfile p)
+        {
+            switch (Type)
+            {
+                case ModeType.A:
+                    p.modeA_width          = Amplitude;
+                    p.modeA_frequency      = A_frequency;
+                    p.modeA_warpAmp        = A_warpAmp;
+                    p.modeA_warpAmpY       = A_warpAmpY;
+                    p.modeA_warpFrequency  = A_warpFrequency;
+                    p.modeA_vScale         = A_vScale;
+                    p.modeA_widthVary      = A_widthVary;
+                    p.modeA_widthFrequency = A_widthFrequency;
+                    p.modeA_yOffset        = A_yOffset;
+                    break;
+                case ModeType.B:
+                    p.modeB_radius        = Amplitude;
+                    p.modeB_warpAmp       = B_warpAmp;
+                    p.modeB_warpFrequency = B_warpFrequency;
+                    p.modeB_vScale        = B_vScale;
+                    p.modeB_noiseAmp      = B_noiseAmp;
+                    p.modeB_yOffset       = B_yOffset;
+                    p.modeB_twist         = B_twist;
+                    break;
+                case ModeType.C:
+                    p.modeC_noiseAmp       = Amplitude;
+                    p.modeC_threshold      = C_threshold;
+                    p.modeC_frequency      = C_frequency;
+                    p.modeC_warpAmp        = C_warpAmp;
+                    p.modeC_warpFrequency  = C_warpFrequency;
+                    p.modeC_vScale         = C_vScale;
+                    p.modeC_twist          = C_twist;
+                    p.modeC_twistVary      = C_twistVary;
+                    p.modeC_twistFrequency = C_twistFrequency;
+                    p.modeC_ampVary        = C_ampVary;
+                    p.modeC_ampFrequency   = C_ampFrequency;
+                    p.modeC_flare          = C_flare;
+                    p.modeC_yOffset        = C_yOffset;
+                    break;
+                case ModeType.D:
+                    p.modeD_noiseAmp   = Amplitude;
+                    p.modeD_freqT      = D_freqT;
+                    p.modeD_freqN      = D_freqN;
+                    p.modeD_blurRadius = D_blurRadius;
+                    p.modeD_alignment  = D_alignment;
+                    p.modeD_vScale     = D_vScale;
+                    p.modeD_gradFade   = D_gradFade;
+                    p.modeD_seaFade    = D_seaFade;
+                    break;
+            }
+        }
+    }
+
+    // An ordered collection of named mode references, plus profile-level params.
+    internal class TerrainProfile
+    {
+        public string       Name         = "";
+        public List<string> ModeNames    = new();
+        public float        FloorDepth   = 8f;
+        public float        FloorFade    = 0f;
+        public float        BlurPasses   = 0f;
+        public float        PeronaK      = 0f;
+        public float        PeronaLambda = 0.1f;
+
+        // Build the internal CaveProfile by projecting referenced mode definitions.
+        public CaveProfile ToCaveProfile(Dictionary<string, ModeDefinition> modes)
+        {
+            var p = CaveProfile.Default;
+            // Reset all mode amplitudes to off; ApplyTo will set what's active.
+            p.modeA_width = 0f; p.modeB_radius = 0f; p.modeC_noiseAmp = 0f; p.modeD_noiseAmp = 0f;
+            p.floorDepth   = FloorDepth;
+            p.floorFade    = FloorFade;
+            p.blur_passes  = BlurPasses;
+            p.perona_k     = PeronaK;
+            p.perona_lambda = PeronaLambda;
+            foreach (var name in ModeNames)
+                if (modes.TryGetValue(name, out var md))
+                    md.ApplyTo(ref p);
+            return p;
+        }
+
+        public static TerrainProfile Default => new TerrainProfile();
+    }
+
     struct CaveProfile
     {
         // ── Mode B: warped-heightmap carve ────────────────────────────────────────
@@ -53,6 +164,7 @@ namespace ProceduralTerrain
         public float modeD_alignment;      // 0=radial ridges (freqT fast), 1=coast-parallel (freqN fast)
         public float modeD_vScale;         // Y scale for 3D noise (low=flat/surface, high=volumetric)
         public float modeD_gradFade;       // gradMag threshold below which amp fades to zero (0=off)
+        public float modeD_seaFade;        // wu above sea level over which amp fades from 0 to full (0=off)
 
         public float modeB_vScale;      // Y scale when sampling 3D wall-noise (low=flat, high=vertical)
         public float modeB_noiseAmp;   // amplitude of 3D SDF perturbation on Mode B walls (world units; 0=off)
@@ -78,7 +190,7 @@ namespace ProceduralTerrain
             modeC_warpAmp      = 8f,     modeC_warpFrequency = 0.005f, modeC_vScale       = 0.4f,
             modeC_twist        = 0f,     modeC_twistVary     = 0f,     modeC_twistFrequency = 0.003f,
             modeC_ampVary      = 0f,     modeC_ampFrequency  = 0.003f, modeC_flare          = 0f,
-            modeD_noiseAmp = 0f, modeD_freqT = 0.02f, modeD_freqN = 0.02f, modeD_blurRadius = 128f, modeD_alignment = 0f, modeD_vScale = 0.1f, modeD_gradFade = 0f,
+            modeD_noiseAmp = 0f, modeD_freqT = 0.02f, modeD_freqN = 0.02f, modeD_blurRadius = 128f, modeD_alignment = 0f, modeD_vScale = 0.1f, modeD_gradFade = 0f, modeD_seaFade = 0f,
             floorDepth      = 8f,
         };
     }
@@ -101,8 +213,10 @@ namespace ProceduralTerrain
         internal static bool _compressBake = false;
 
         // ── Biome profiles ────────────────────────────────────────────────────────
-        static volatile Dictionary<string, CaveProfile> _namedProfiles
-            = new Dictionary<string, CaveProfile>(StringComparer.OrdinalIgnoreCase);
+        static volatile Dictionary<string, ModeDefinition> _modeDefinitions
+            = new Dictionary<string, ModeDefinition>(StringComparer.OrdinalIgnoreCase);
+        static volatile Dictionary<string, TerrainProfile> _namedProfiles
+            = new Dictionary<string, TerrainProfile>(StringComparer.OrdinalIgnoreCase);
         static volatile Dictionary<Heightmap.Biome, CaveProfile> _biomeProfiles
             = BuildDefaultProfiles();
         static volatile bool _hotReloadPending;

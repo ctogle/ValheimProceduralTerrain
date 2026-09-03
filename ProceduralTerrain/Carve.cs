@@ -1353,6 +1353,7 @@ namespace ProceduralTerrain
             float mdAlignment = _blendedProfs != null && _blendedProfs.Length > ctrIdx ? _blendedProfs[ctrIdx].modeD_alignment    : 0f;
             float mdVScale    = _blendedProfs != null && _blendedProfs.Length > ctrIdx ? _blendedProfs[ctrIdx].modeD_vScale       : 0.1f;
             float mdGradFade   = _blendedProfs != null && _blendedProfs.Length > ctrIdx ? _blendedProfs[ctrIdx].modeD_gradFade     : 0f;
+            float mdSeaFade    = _blendedProfs != null && _blendedProfs.Length > ctrIdx ? _blendedProfs[ctrIdx].modeD_seaFade       : 0f;
             float mdBlurRadius = _blendedProfs != null && _blendedProfs.Length > ctrIdx ? Mathf.Max(_blendedProfs[ctrIdx].modeD_blurRadius, 1f) : 128f;
             for (int cx = 0; cx < bw; cx++)
             for (int cz = 0; cz < bw; cz++)
@@ -1452,7 +1453,8 @@ namespace ProceduralTerrain
                 float freqN = Mathf.Lerp(mdFreqN, mdFreqT, mdAlignment);
                 float mdTCoord = (worldX * (-nmZ) + worldZ * nmX) * freqT * gradFactor;
                 float mdNCoord = mdRadial * freqN * gradFactor;
-                float mdLocalAmp = mdAmp;
+                float mdSeaFactor = mdSeaFade > 0f ? Mathf.SmoothStep(0f, mdSeaFade, effectiveH - 30f) : 1f;
+                float mdLocalAmp = mdAmp * mdSeaFactor;
                 FillYColumn(buf, bw, bh, extLo, s, cx, cz,
                     effectiveH, addH, profMcT, profMcFlare, localAmp, localAmp > 0f && bakeC,
                     locFac, floorY, profFlFade,
