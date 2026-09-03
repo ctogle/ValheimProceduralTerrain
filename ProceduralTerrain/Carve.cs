@@ -28,8 +28,8 @@ namespace ProceduralTerrain
         // Island/pocket BFS (bool and int queues)
         public bool[]? visitedBuf, percolVisited;
         public int[]?  islandQueue;
-        // Pipeline mode amplitude grids [pipelineIdx][cellIdx]
-        public float[][]? bk2dModeAmps;
+        // Pipeline mode param grids [pipelineIdx][paramIdx][cellIdx]
+        public float[][][]? bkModeParams;
         // Pipeline mode auxiliary data [pipelineIdx][auxIdx][dataIdx]
         public float[][][]? bkModeAux;
     }
@@ -140,8 +140,8 @@ namespace ProceduralTerrain
 
             _t0 = _sw.ElapsedMilliseconds;
 
-            bool anyPipelineActive = _pipeline.Length > 0 && _cb.bk2dModeAmps != null &&
-                _pipeline.Any(m => _cb.bk2dModeAmps![m.PipelineIndex].Any(v => v > 0f));
+            bool anyPipelineActive = _pipeline.Length > 0 && _cb.bkModeParams != null &&
+                _pipeline.Any(m => _cb.bkModeParams![m.PipelineIndex][0].Any(v => v > 0f));
             FillPhase1(buf, bw, bh, extLo, s, ox, oz, overlap, wg, cw4, nearbyLocs);
             _t1 = _sw.ElapsedMilliseconds;
 
@@ -971,12 +971,18 @@ namespace ProceduralTerrain
             int pLen     = pipeline.Length;
             int nb2Size  = cw4 * cw4;
 
-            // Ensure bk2dModeAmps sized
-            if (_cb.bk2dModeAmps == null || _cb.bk2dModeAmps.Length < pLen)
-                _cb.bk2dModeAmps = new float[pLen][];
+            // Ensure bkModeParams sized [pipelineIdx][paramIdx][cellIdx]
+            if (_cb.bkModeParams == null || _cb.bkModeParams.Length < pLen)
+                _cb.bkModeParams = new float[pLen][][];
             for (int mi = 0; mi < pLen; mi++)
-                if (_cb.bk2dModeAmps[mi] == null || _cb.bk2dModeAmps[mi].Length < nb2Size)
-                    _cb.bk2dModeAmps[mi] = new float[nb2Size];
+            {
+                int nParams = pipeline[mi].ParamCount;
+                if (_cb.bkModeParams[mi] == null || _cb.bkModeParams[mi].Length < nParams)
+                    _cb.bkModeParams[mi] = new float[nParams][];
+                for (int pi2 = 0; pi2 < nParams; pi2++)
+                    if (_cb.bkModeParams[mi][pi2] == null || _cb.bkModeParams[mi][pi2].Length < nb2Size)
+                        _cb.bkModeParams[mi][pi2] = new float[nb2Size];
+            }
 
             // Ensure bkModeAux sized
             if (_cb.bkModeAux == null || _cb.bkModeAux.Length < pLen)
@@ -1009,9 +1015,10 @@ namespace ProceduralTerrain
 
             // Check if any Mode D (gradient) is active
             bool anyMdActive = pipeline.OfType<ModeDDef>().Any(m =>
-                _cb.bk2dModeAmps != null && m.PipelineIndex >= 0 &&
-                _cb.bk2dModeAmps[m.PipelineIndex].Any(v => v > 0f));
+                _cb.bkModeParams != null && m.PipelineIndex >= 0 &&
+                _cb.bkModeParams[m.PipelineIndex][0].Any(v => v > 0f));
 
+            // BlurRadius for Mode D comes from param 3 — use max default across active Mode Ds
             float mdBlurRadius = pipeline.OfType<ModeDDef>().Select(m => m.BlurRadius).DefaultIfEmpty(128f).Max();
             mdBlurRadius = Mathf.Clamp(mdBlurRadius, 16f, 2048f);
 
@@ -1053,8 +1060,8 @@ namespace ProceduralTerrain
 
             // Mode B full-res warpedH pass
             bool anyMbActive = pipeline.OfType<ModeBDef>().Any(m =>
-                _cb.bk2dModeAmps != null && m.PipelineIndex >= 0 &&
-                _cb.bk2dModeAmps[m.PipelineIndex].Any(v => v > 0f));
+                _cb.bkModeParams != null && m.PipelineIndex >= 0 &&
+                _cb.bkModeParams[m.PipelineIndex][0].Any(v => v > 0f));
             var firstMb = pipeline.OfType<ModeBDef>().FirstOrDefault();
 
             if (anyMbActive && wg != null && firstMb != null)
@@ -1071,7 +1078,7 @@ namespace ProceduralTerrain
                     int b00 = cx4 * cw4 + cz4, b10 = cx4b * cw4 + cz4;
                     int b01 = cx4 * cw4 + cz4b, b11 = cx4b * cw4 + cz4b;
                     float wf    = firstMb.WarpFrequency;
-                    float wa    = BL(_cb.bk2dModeAmps![firstMb.PipelineIndex], b00, b10, b01, b11, bfx2, bfz2) > 0f ? firstMb.WarpAmp : 0f;
+                    float wa    = BL(_cb.bkModeParams![firstMb.PipelineIndex][0], b00, b10, b01, b11, bfx2, bfz2) > 0f ? firstMb.WarpAmp : 0f;
                     float yo    = firstMb.YOffset;
                     float locF2 = LocationFactor(wx, wz, nearbyLocs);
                     float dx    = _hmWarpX!.GetNoise(wx * wf, wz * wf) * (wa * locF2);

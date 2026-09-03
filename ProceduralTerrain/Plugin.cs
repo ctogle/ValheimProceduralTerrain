@@ -48,6 +48,11 @@ namespace ProceduralTerrain
         public virtual bool NeedsGradField => false;
         public virtual float GradBlurRadius => 128f;
 
+        // Per-mode blended param metadata. Param index 0 is always amplitude.
+        public abstract int ParamCount { get; }
+        public abstract string[] ParamNames { get; }
+        public abstract float GetDefaultParam(int i);
+
         // Allocate this mode's aux arrays in CarveBuffers before the bake cell loop.
         public virtual void BakeBegin(ref CarveBuffers cb, int cellCount, int bh, int cw4) {}
 
@@ -67,6 +72,18 @@ namespace ProceduralTerrain
     {
         public float Frequency = 0.015f, WarpAmp = 10f, WarpAmpY = 0f, WarpFrequency = 0.04f;
         public float VScale = 0.35f, WidthVary = 0f, WidthFrequency = 0.003f, YOffset = 0f;
+
+        // Param indices: 0=amplitude 1=frequency 2=warpAmp 3=warpAmpY 4=warpFrequency 5=vScale 6=widthVary 7=widthFrequency 8=yOffset
+        static readonly string[] _paramNames = { "amplitude","frequency","warpamp","warpampy","warpfrequency","vscale","widthvary","widthfrequency","yoffset" };
+        public override int ParamCount => 9;
+        public override string[] ParamNames => _paramNames;
+        public override float GetDefaultParam(int i) => i switch {
+            0 => Amplitude, 1 => Frequency, 2 => WarpAmp, 3 => WarpAmpY, 4 => WarpFrequency,
+            5 => VScale, 6 => WidthVary, 7 => WidthFrequency, 8 => YOffset, _ => 0f };
+
+        // Blended param fields (set in PrepareColumn)
+        float _bAmplitude, _bFrequency, _bWarpAmp, _bWarpAmpY, _bWarpFrequency;
+        float _bVScale, _bWidthVary, _bWidthFrequency, _bYOffset;
 
         // Column instance fields
         float _colAmp, _colWidth;
@@ -90,16 +107,19 @@ namespace ProceduralTerrain
             float[]? tun  = cb.bkModeAux![pi][0];
             float[]? tun2 = cb.bkModeAux![pi][1];
             float[]? wBuf = cb.bkModeAux![pi][2];
-            float amp = cb.bk2dModeAmps![pi][args.cellIdx];
+            float amp = cb.bkModeParams![pi][0][args.cellIdx];
             int baseIdx = args.cellIdx * args.bh;
             if (amp <= 0f)
             {
                 for (int cy = 0; cy < args.bh; cy++) { tun![baseIdx+cy]=0f; tun2![baseIdx+cy]=0f; wBuf![baseIdx+cy]=0f; }
                 return;
             }
-            float mawf = WarpFrequency, mawa = WarpAmp, maway = WarpAmpY;
-            float maf = Frequency, mavs = VScale, mawvf = WidthFrequency;
-            float mayo = YOffset;
+            float mawf = cb.bkModeParams![pi][4][args.cellIdx]; // warpFrequency
+            float mawa = cb.bkModeParams![pi][2][args.cellIdx]; // warpAmp
+            float maf  = cb.bkModeParams![pi][1][args.cellIdx]; // frequency
+            float mavs = cb.bkModeParams![pi][5][args.cellIdx]; // vScale
+            float mawvf= cb.bkModeParams![pi][7][args.cellIdx]; // widthFrequency
+            float mayo = cb.bkModeParams![pi][8][args.cellIdx]; // yOffset
             float addHA = mayo > 0f ? args.wg.GetHeight(args.worldX, args.worldZ) : 0f;
             float s = args.s;
             for (int cy = 0; cy < args.bh; cy++)
@@ -118,16 +138,24 @@ namespace ProceduralTerrain
         public override void PrepareColumn(ref CarveBuffers cb, in ColumnCtx col)
         {
             int pi = PipelineIndex;
-            _colAmp = Plugin.BL(cb.bk2dModeAmps![pi], col.b200, col.b210, col.b201, col.b211, col.bfx, col.bfz);
+            _colAmp = Plugin.BL(cb.bkModeParams![pi][0], col.b200, col.b210, col.b201, col.b211, col.bfx, col.bfz);
             if (_colAmp <= 0f) return;
+            _bAmplitude      = _colAmp;
+            _bFrequency      = Plugin.BL(cb.bkModeParams![pi][1], col.b200, col.b210, col.b201, col.b211, col.bfx, col.bfz);
+            _bWarpAmp        = Plugin.BL(cb.bkModeParams![pi][2], col.b200, col.b210, col.b201, col.b211, col.bfx, col.bfz);
+            _bWarpAmpY       = Plugin.BL(cb.bkModeParams![pi][3], col.b200, col.b210, col.b201, col.b211, col.bfx, col.bfz);
+            _bWarpFrequency  = Plugin.BL(cb.bkModeParams![pi][4], col.b200, col.b210, col.b201, col.b211, col.bfx, col.bfz);
+            _bVScale         = Plugin.BL(cb.bkModeParams![pi][5], col.b200, col.b210, col.b201, col.b211, col.bfx, col.bfz);
+            _bWidthVary      = Plugin.BL(cb.bkModeParams![pi][6], col.b200, col.b210, col.b201, col.b211, col.bfx, col.bfz);
+            _bWidthFrequency = Plugin.BL(cb.bkModeParams![pi][7], col.b200, col.b210, col.b201, col.b211, col.bfx, col.bfz);
+            _bYOffset        = Plugin.BL(cb.bkModeParams![pi][8], col.b200, col.b210, col.b201, col.b211, col.bfx, col.bfz);
             _bfx = col.bfx; _bfz = col.bfz;
             _b3_00 = col.b3_00; _b3_10 = col.b3_10; _b3_01 = col.b3_01; _b3_11 = col.b3_11;
             _bh = col.bh;
             _tun  = cb.bkModeAux![pi][0];
             _tun2 = cb.bkModeAux![pi][1];
             _wBuf = cb.bkModeAux![pi][2];
-            // width vary noise computed in BakeCell using WidthVary * wn
-            _colWidth = Amplitude * Mathf.Max(0f, 1f + WidthVary * 0f); // wn is per-voxel
+            _colWidth = _bAmplitude;
         }
 
         public override void ComputeVoxel(ref float combined, in VoxelCtx ctx)
@@ -137,7 +165,7 @@ namespace ProceduralTerrain
             float na = Plugin.BL3Y(_tun!,  _b3_00, _b3_10, _b3_01, _b3_11, cy, _bfx, _bfz);
             float nb = Plugin.BL3Y(_tun2!, _b3_00, _b3_10, _b3_01, _b3_11, cy, _bfx, _bfz);
             float wn = Plugin.BL3Y(_wBuf!, _b3_00, _b3_10, _b3_01, _b3_11, cy, _bfx, _bfz);
-            float localWidth = Mathf.Max(_colAmp * (1f + WidthVary * wn), 0.001f);
+            float localWidth = Mathf.Max(_bAmplitude * (1f + _bWidthVary * wn), 0.001f);
             float dist       = Mathf.Sqrt(na * na + nb * nb) * 0.7071f;
             float s          = Plugin._scale ?? 1f;
             float tunnelSDF  = (localWidth - dist) / localWidth * 4f * s;
@@ -153,25 +181,33 @@ namespace ProceduralTerrain
         public float WarpAmp = 80f, WarpFrequency = 0.005f, VScale = 0.5f;
         public float NoiseAmp = 0f, YOffset = 0f, Twist = 0f;
 
+        // Param indices: 0=amplitude 1=warpAmp 2=warpFrequency 3=vScale 4=noiseAmp 5=yOffset 6=twist
+        static readonly string[] _paramNames = { "amplitude","warpamp","warpfrequency","vscale","noiseamp","yoffset","twist" };
+        public override int ParamCount => 7;
+        public override string[] ParamNames => _paramNames;
+        public override float GetDefaultParam(int i) => i switch {
+            0 => Amplitude, 1 => WarpAmp, 2 => WarpFrequency, 3 => VScale,
+            4 => NoiseAmp, 5 => YOffset, 6 => Twist, _ => 0f };
+
         // Column instance fields
         float _colAmp, _warpedH, _mbR, _noiseAmp, _vScale, _warpFreq, _twist;
 
         public override void BakeCell(ref CarveBuffers cb, in BakeCellArgs args)
         {
-            // Amplitude already set by BakeBlendedProfiles
+            // All params already set by BakeBlendedProfiles into bkModeParams
         }
 
         public override void PrepareColumn(ref CarveBuffers cb, in ColumnCtx col)
         {
             int pi = PipelineIndex;
-            _colAmp = Plugin.BL(cb.bk2dModeAmps![pi], col.b200, col.b210, col.b201, col.b211, col.bfx, col.bfz);
+            _colAmp = Plugin.BL(cb.bkModeParams![pi][0], col.b200, col.b210, col.b201, col.b211, col.bfx, col.bfz);
             _mbR = _colAmp;
             if (_colAmp <= 0f) return;
             _warpedH = cb.bkWarpedH![col.cx * col.bw + col.cz];
-            _noiseAmp = NoiseAmp;
-            _vScale   = VScale;
-            _warpFreq = WarpFrequency;
-            _twist    = Twist;
+            _noiseAmp = Plugin.BL(cb.bkModeParams![pi][4], col.b200, col.b210, col.b201, col.b211, col.bfx, col.bfz);
+            _vScale   = Plugin.BL(cb.bkModeParams![pi][3], col.b200, col.b210, col.b201, col.b211, col.bfx, col.bfz);
+            _warpFreq = Plugin.BL(cb.bkModeParams![pi][2], col.b200, col.b210, col.b201, col.b211, col.bfx, col.bfz);
+            _twist    = Plugin.BL(cb.bkModeParams![pi][6], col.b200, col.b210, col.b201, col.b211, col.bfx, col.bfz);
         }
 
         public override void ComputeVoxel(ref float combined, in VoxelCtx ctx)
@@ -208,6 +244,20 @@ namespace ProceduralTerrain
         public float VScale = 0.4f, Twist = 0f, TwistVary = 0f, TwistFrequency = 0.003f;
         public float AmpVary = 0f, AmpFrequency = 0.003f, Flare = 0f, YOffset = 0f;
 
+        // Param indices: 0=amplitude 1=threshold 2=frequency 3=warpAmp 4=warpFrequency 5=vScale
+        //                6=twist 7=twistVary 8=twistFrequency 9=ampVary 10=ampFrequency 11=flare 12=yOffset
+        static readonly string[] _paramNames = { "amplitude","threshold","frequency","warpamp","warpfrequency","vscale",
+            "twist","twistvary","twistfrequency","ampvary","ampfrequency","flare","yoffset" };
+        public override int ParamCount => 13;
+        public override string[] ParamNames => _paramNames;
+        public override float GetDefaultParam(int i) => i switch {
+            0 => Amplitude, 1 => Threshold, 2 => Frequency, 3 => WarpAmp, 4 => WarpFrequency,
+            5 => VScale, 6 => Twist, 7 => TwistVary, 8 => TwistFrequency,
+            9 => AmpVary, 10 => AmpFrequency, 11 => Flare, 12 => YOffset, _ => 0f };
+
+        // Column-level blended params set in PrepareColumn
+        float _bThreshold, _bFlare;
+
         // Column instance fields
         float _colAmp, _colAddH, _colLocalAmp;
         float _bfx, _bfz;
@@ -229,7 +279,7 @@ namespace ProceduralTerrain
             float[]? addHArr   = cb.bkModeAux![pi][0];
             float[]? lAmpArr   = cb.bkModeAux![pi][1];
             float[]? noiseBuf  = cb.bkModeAux![pi][2];
-            float amp = cb.bk2dModeAmps![pi][args.cellIdx];
+            float amp = cb.bkModeParams![pi][0][args.cellIdx];
             int baseIdx = args.cellIdx * args.bh;
             if (amp <= 0f)
             {
@@ -238,17 +288,23 @@ namespace ProceduralTerrain
                 for (int cy = 0; cy < args.bh; cy++) noiseBuf![baseIdx + cy] = 0f;
                 return;
             }
-            float awf4 = WarpFrequency;
-            float awx4 = Plugin._hmAddWarpX!.GetNoise(args.worldX * awf4, args.worldZ * awf4) * WarpAmp;
-            float awz4 = Plugin._hmAddWarpZ!.GetNoise(args.worldX * awf4, args.worldZ * awf4) * WarpAmp;
-            float addH4 = args.wg.GetHeight(args.worldX + awx4, args.worldZ + awz4) - YOffset;
-            float avf4 = AmpFrequency;
+            float awf4  = cb.bkModeParams![pi][4][args.cellIdx]; // warpFrequency
+            float bwarpA= cb.bkModeParams![pi][3][args.cellIdx]; // warpAmp
+            float awx4 = Plugin._hmAddWarpX!.GetNoise(args.worldX * awf4, args.worldZ * awf4) * bwarpA;
+            float awz4 = Plugin._hmAddWarpZ!.GetNoise(args.worldX * awf4, args.worldZ * awf4) * bwarpA;
+            float byo4  = cb.bkModeParams![pi][12][args.cellIdx]; // yOffset
+            float addH4 = args.wg.GetHeight(args.worldX + awx4, args.worldZ + awz4) - byo4;
+            float avf4  = cb.bkModeParams![pi][10][args.cellIdx]; // ampFrequency
+            float bav4  = cb.bkModeParams![pi][9][args.cellIdx];  // ampVary
             addHArr![args.cellIdx] = addH4;
-            lAmpArr![args.cellIdx] = Mathf.Max(amp * (1f + AmpVary
+            lAmpArr![args.cellIdx] = Mathf.Max(amp * (1f + bav4
                 * Plugin._addVaryNoise!.GetNoise(args.worldX * avf4, args.worldZ * avf4)), 0f);
-            float ts4 = 1f + TwistVary
-                * Plugin._twistVaryNoise!.GetNoise(args.worldX * TwistFrequency, args.worldZ * TwistFrequency);
-            float af4 = Frequency, vs4 = VScale, tw4 = Twist;
+            float btv4  = cb.bkModeParams![pi][7][args.cellIdx];  // twistVary
+            float btf4  = cb.bkModeParams![pi][8][args.cellIdx];  // twistFrequency
+            float ts4 = 1f + btv4 * Plugin._twistVaryNoise!.GetNoise(args.worldX * btf4, args.worldZ * btf4);
+            float af4 = cb.bkModeParams![pi][2][args.cellIdx];  // frequency
+            float vs4 = cb.bkModeParams![pi][5][args.cellIdx];  // vScale
+            float tw4 = cb.bkModeParams![pi][6][args.cellIdx];  // twist
             float s = args.s;
             for (int cy = 0; cy < args.bh; cy++)
             {
@@ -265,10 +321,12 @@ namespace ProceduralTerrain
         public override void PrepareColumn(ref CarveBuffers cb, in ColumnCtx col)
         {
             int pi = PipelineIndex;
-            _colAmp = Plugin.BL(cb.bk2dModeAmps![pi], col.b200, col.b210, col.b201, col.b211, col.bfx, col.bfz);
+            _colAmp = Plugin.BL(cb.bkModeParams![pi][0], col.b200, col.b210, col.b201, col.b211, col.bfx, col.bfz);
             if (_colAmp <= 0f) return;
-            _colAddH     = Plugin.BL(cb.bkModeAux![pi][0], col.b200, col.b210, col.b201, col.b211, col.bfx, col.bfz);
-            _colLocalAmp = Plugin.BL(cb.bkModeAux![pi][1], col.b200, col.b210, col.b201, col.b211, col.bfx, col.bfz);
+            _bThreshold     = Plugin.BL(cb.bkModeParams![pi][1],  col.b200, col.b210, col.b201, col.b211, col.bfx, col.bfz);
+            _bFlare         = Plugin.BL(cb.bkModeParams![pi][11], col.b200, col.b210, col.b201, col.b211, col.bfx, col.bfz);
+            _colAddH        = Plugin.BL(cb.bkModeAux![pi][0], col.b200, col.b210, col.b201, col.b211, col.bfx, col.bfz);
+            _colLocalAmp    = Plugin.BL(cb.bkModeAux![pi][1], col.b200, col.b210, col.b201, col.b211, col.bfx, col.bfz);
             _bfx = col.bfx; _bfz = col.bfz;
             _b3_00 = col.b3_00; _b3_10 = col.b3_10; _b3_01 = col.b3_01; _b3_11 = col.b3_11;
             _bh = col.bh;
@@ -281,7 +339,7 @@ namespace ProceduralTerrain
             float n = Plugin.BL3Y(_noiseBuf!, _b3_00, _b3_10, _b3_01, _b3_11, ctx.cy, _bfx, _bfz);
             float relY = ctx.worldY - _colAddH;
             float ft   = Mathf.Clamp01(relY / _colLocalAmp);
-            float effMcT = Threshold - Flare * (4f * ft * (1f - ft));
+            float effMcT = _bThreshold - _bFlare * (4f * ft * (1f - ft));
             float sdf = relY - (n - effMcT) * _colLocalAmp;
             if (sdf < combined) combined = sdf;
         }
@@ -297,34 +355,52 @@ namespace ProceduralTerrain
         public override bool NeedsGradField => true;
         public override float GradBlurRadius => BlurRadius;
 
+        // Param indices: 0=amplitude 1=freqT 2=freqN 3=blurRadius 4=alignment 5=vScale 6=gradFade 7=seaFade
+        static readonly string[] _paramNames = { "amplitude","freqt","freqn","blurradius","alignment","vscale","gradfade","seafade" };
+        public override int ParamCount => 8;
+        public override string[] ParamNames => _paramNames;
+        public override float GetDefaultParam(int i) => i switch {
+            0 => Amplitude, 1 => FreqT, 2 => FreqN, 3 => BlurRadius,
+            4 => Alignment, 5 => VScale, 6 => GradFade, 7 => SeaFade, _ => 0f };
+
+        // Blended param fields (set in PrepareColumn)
+        float _bFreqT, _bFreqN, _bBlurRadius, _bAlignment, _bVScale, _bGradFade, _bSeaFade;
+
         // Column instance fields
         float _mdTCoord, _mdNCoord, _colLocalAmp;
 
         public override void BakeCell(ref CarveBuffers cb, in BakeCellArgs args)
         {
-            // Amplitude already set by BakeBlendedProfiles
+            // All params already set by BakeBlendedProfiles into bkModeParams
         }
 
         public override void PrepareColumn(ref CarveBuffers cb, in ColumnCtx col)
         {
             int pi = PipelineIndex;
-            float mdAmp = Plugin.BL(cb.bk2dModeAmps![pi], col.b200, col.b210, col.b201, col.b211, col.bfx, col.bfz);
+            float mdAmp = Plugin.BL(cb.bkModeParams![pi][0], col.b200, col.b210, col.b201, col.b211, col.bfx, col.bfz);
             if (mdAmp <= 0f) { _colLocalAmp = 0f; return; }
+            _bFreqT      = Plugin.BL(cb.bkModeParams![pi][1], col.b200, col.b210, col.b201, col.b211, col.bfx, col.bfz);
+            _bFreqN      = Plugin.BL(cb.bkModeParams![pi][2], col.b200, col.b210, col.b201, col.b211, col.bfx, col.bfz);
+            _bBlurRadius = Plugin.BL(cb.bkModeParams![pi][3], col.b200, col.b210, col.b201, col.b211, col.bfx, col.bfz);
+            _bAlignment  = Plugin.BL(cb.bkModeParams![pi][4], col.b200, col.b210, col.b201, col.b211, col.bfx, col.bfz);
+            _bVScale     = Plugin.BL(cb.bkModeParams![pi][5], col.b200, col.b210, col.b201, col.b211, col.bfx, col.bfz);
+            _bGradFade   = Plugin.BL(cb.bkModeParams![pi][6], col.b200, col.b210, col.b201, col.b211, col.bfx, col.bfz);
+            _bSeaFade    = Plugin.BL(cb.bkModeParams![pi][7], col.b200, col.b210, col.b201, col.b211, col.bfx, col.bfz);
             float nmX = col.gradDirX, nmZ = col.gradDirZ;
-            float gradFactor = GradFade > 0f ? Mathf.SmoothStep(0f, GradFade, col.gradMag) : 1f;
-            float mdRadial   = col.blurH / Mathf.Max(BlurRadius, 1f);
-            float freqT = Mathf.Lerp(FreqT, FreqN, Alignment);
-            float freqN = Mathf.Lerp(FreqN, FreqT, Alignment);
+            float gradFactor = _bGradFade > 0f ? Mathf.SmoothStep(0f, _bGradFade, col.gradMag) : 1f;
+            float mdRadial   = col.blurH / Mathf.Max(_bBlurRadius, 1f);
+            float freqT = Mathf.Lerp(_bFreqT, _bFreqN, _bAlignment);
+            float freqN = Mathf.Lerp(_bFreqN, _bFreqT, _bAlignment);
             _mdTCoord    = (col.worldX * (-nmZ) + col.worldZ * nmX) * freqT * gradFactor;
             _mdNCoord    = mdRadial * freqN * gradFactor;
-            float seaFactor = SeaFade > 0f ? Mathf.SmoothStep(0f, SeaFade, col.effectiveH - 30f) : 1f;
+            float seaFactor = _bSeaFade > 0f ? Mathf.SmoothStep(0f, _bSeaFade, col.effectiveH - 30f) : 1f;
             _colLocalAmp = mdAmp * seaFactor;
         }
 
         public override void ComputeVoxel(ref float combined, in VoxelCtx ctx)
         {
             if (_colLocalAmp <= 0f) return;
-            float mdn   = Plugin._mdNoise!.GetNoise(_mdTCoord, ctx.worldY * VScale, _mdNCoord) * 0.5f + 0.5f;
+            float mdn   = Plugin._mdNoise!.GetNoise(_mdTCoord, ctx.worldY * _bVScale, _mdNCoord) * 0.5f + 0.5f;
             float mdSdf = (ctx.worldY - ctx.effectiveH) - mdn * _colLocalAmp;
             if (mdSdf < combined) combined = mdSdf;
         }
@@ -404,7 +480,8 @@ namespace ProceduralTerrain
 
         // ── Pipeline ──────────────────────────────────────────────────────────────
         static volatile ModeDefinition[] _pipeline = Array.Empty<ModeDefinition>();
-        static volatile Dictionary<Heightmap.Biome, float[]> _biomeAmps = new Dictionary<Heightmap.Biome, float[]>();
+        // _biomeParams[biome][pipelineIdx][paramIdx] — blendable params per biome per mode
+        static volatile Dictionary<Heightmap.Biome, float[][]> _biomeParams = new Dictionary<Heightmap.Biome, float[][]>();
 
         // ── Location protection ───────────────────────────────────────────────────
         internal static readonly List<(Vector2 pos, float extR)> _locationPositions = new();

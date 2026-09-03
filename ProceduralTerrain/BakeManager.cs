@@ -357,7 +357,7 @@ namespace ProceduralTerrain
                     _finishSkinNowMethod.Invoke(zoneObj, null);
                     Log.LogDebug($"[ProceduralTerrain] Hot-reload: re-activated zone {key}.");
                 }
-                catch (Exception e) { Log.LogWarning($"[ProceduralTerrain] Hot-reload zone {key}: {e.Message}"); }
+                catch (Exception e) { var inner = e.InnerException ?? e; Log.LogWarning($"[ProceduralTerrain] Hot-reload zone {key}: {inner.GetType().Name}: {inner.Message}\n{inner.StackTrace}"); }
             }
         }
     }

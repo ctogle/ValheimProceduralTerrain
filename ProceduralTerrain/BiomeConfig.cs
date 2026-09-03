@@ -119,13 +119,29 @@ namespace ProceduralTerrain
 
         // Parse a [Profile:name] section into a TerrainProfile.
         // include = otherProfile prepends the named profile's modes and inherits its params.
+        // profileParamOverrides receives modeName -> paramName -> value for "modename.paramname = value" entries.
         static TerrainProfile ParseTerrainProfile(string name, List<(string key, string val)> kvs,
-            Dictionary<string, TerrainProfile> namedProfiles)
+            Dictionary<string, TerrainProfile> namedProfiles,
+            Dictionary<string, Dictionary<string, float>> profileParamOverrides)
         {
             var inv = System.Globalization.CultureInfo.InvariantCulture;
             var tp = new TerrainProfile { Name = name };
             foreach (var (k, v) in kvs)
             {
+                // Detect modename.paramname overrides (key contains a dot)
+                int dotIdx = k.IndexOf('.');
+                if (dotIdx > 0)
+                {
+                    string modePart  = k.Substring(0, dotIdx);
+                    string paramPart = k.Substring(dotIdx + 1);
+                    if (float.TryParse(v, System.Globalization.NumberStyles.Float, inv, out float pv))
+                    {
+                        if (!profileParamOverrides.TryGetValue(modePart, out var modeOvr))
+                        { modeOvr = new Dictionary<string, float>(StringComparer.OrdinalIgnoreCase); profileParamOverrides[modePart] = modeOvr; }
+                        modeOvr[paramPart] = pv;
+                    }
+                    continue;
+                }
                 switch (k)
                 {
                     case "include":
@@ -213,11 +229,15 @@ namespace ProceduralTerrain
             // Pass 2: Profile definitions [Profile:name]
             // Profiles may only include profiles defined above them.
             var namedProfiles = new Dictionary<string, TerrainProfile>(StringComparer.OrdinalIgnoreCase);
+            // profileParamOverrides[profileName][modeName][paramName] = value
+            var allProfileParamOverrides = new Dictionary<string, Dictionary<string, Dictionary<string, float>>>(StringComparer.OrdinalIgnoreCase);
             foreach (var (secName, kvs) in sections)
             {
                 if (!secName.StartsWith("Profile:", StringComparison.OrdinalIgnoreCase)) continue;
                 string profName = secName.Substring(8).Trim();
-                namedProfiles[profName] = ParseTerrainProfile(profName, kvs, namedProfiles);
+                var profOvr = new Dictionary<string, Dictionary<string, float>>(StringComparer.OrdinalIgnoreCase);
+                namedProfiles[profName] = ParseTerrainProfile(profName, kvs, namedProfiles, profOvr);
+                if (profOvr.Count > 0) allProfileParamOverrides[profName] = profOvr;
             }
 
             // Pass 3: Debug, Bake, and biome assignments
@@ -296,17 +316,39 @@ namespace ProceduralTerrain
                 if (modeDefs.TryGetValue(mn, out var pmd)) { pmd.PipelineIndex = pipelineList.Count; pipelineList.Add(pmd); }
             _pipeline = pipelineList.ToArray();
 
-            // Build _biomeAmps
-            var newBiomeAmps = new Dictionary<Heightmap.Biome, float[]>();
+            // Build _biomeParams [biome][pipelineIdx][paramIdx]
+            var newBiomeParams = new Dictionary<Heightmap.Biome, float[][]>();
             foreach (var (biome2, tp) in biomeProfileMap)
             {
-                var amps = new float[_pipeline.Length];
+                var modeParams = new float[_pipeline.Length][];
+                // For each pipeline mode, look up overrides for this profile
+                allProfileParamOverrides.TryGetValue(tp.Name, out var profOvr);
                 foreach (var mn in tp.ModeNames)
-                    if (modeDefs.TryGetValue(mn, out var pmd) && pmd.PipelineIndex >= 0)
-                        amps[pmd.PipelineIndex] = pmd.Amplitude;
-                newBiomeAmps[biome2] = amps;
+                {
+                    if (!modeDefs.TryGetValue(mn, out var pmd) || pmd.PipelineIndex < 0) continue;
+                    int mi = pmd.PipelineIndex;
+                    int nP = pmd.ParamCount;
+                    var pArr = new float[nP];
+                    for (int pi = 0; pi < nP; pi++) pArr[pi] = pmd.GetDefaultParam(pi);
+                    // Apply profile-level overrides for this mode
+                    if (profOvr != null && profOvr.TryGetValue(mn, out var modeOvr))
+                    {
+                        string[] pNames = pmd.ParamNames;
+                        for (int pi = 0; pi < nP; pi++)
+                            if (modeOvr.TryGetValue(pNames[pi], out float ov)) pArr[pi] = ov;
+                    }
+                    modeParams[mi] = pArr;
+                }
+                // Fill any pipeline modes not referenced by this profile with zeros
+                for (int mi = 0; mi < _pipeline.Length; mi++)
+                    if (modeParams[mi] == null)
+                    {
+                        var pArr = new float[_pipeline[mi].ParamCount]; // all zeros (amplitude=0 = inactive)
+                        modeParams[mi] = pArr;
+                    }
+                newBiomeParams[biome2] = modeParams;
             }
-            _biomeAmps = newBiomeAmps;
+            _biomeParams = newBiomeParams;
 
             _modeDefinitions = modeDefs;
             _namedProfiles   = namedProfiles;
@@ -575,16 +617,17 @@ namespace ProceduralTerrain
             Log.LogInfo($"  → blended: blur={blendBlur:F1}  floorDepth={blendFloor:F1}  pipeline={_pipeline.Length} modes");
 
             // Per-mode blended amplitudes
-            var biomeAmps = _biomeAmps;
-            var pipeline  = _pipeline;
+            var bpMap    = _biomeParams;
+            var pipeline = _pipeline;
             for (int mi = 0; mi < pipeline.Length; mi++)
             {
                 float amp = 0f;
                 foreach (var (name, distCells, frac, w, _) in contributions)
                 {
                     var biome = System.Enum.Parse<Heightmap.Biome>(name);
-                    float[] ba = biomeAmps.TryGetValue(biome, out var a) ? a : Array.Empty<float>();
-                    amp += w * (mi < ba.Length ? ba[mi] : 0f);
+                    float[][] bmp = bpMap.TryGetValue(biome, out var a) ? a : Array.Empty<float[]>();
+                    float[] mArr = (mi < bmp.Length && bmp[mi] != null) ? bmp[mi] : Array.Empty<float>();
+                    amp += w * (mArr.Length > 0 ? mArr[0] : 0f); // param 0 = amplitude
                 }
                 amp *= rcp;
                 if (amp > 0f)
@@ -683,17 +726,28 @@ namespace ProceduralTerrain
 
             var pipeline = _pipeline;
             int pLen     = pipeline.Length;
-            var biomeAmps = _biomeAmps;
+            var biomeParams = _biomeParams;
 
-            // Ensure mode amplitude arrays
-            if (_cb.bk2dModeAmps == null || _cb.bk2dModeAmps.Length < pLen)
-                _cb.bk2dModeAmps = new float[pLen][];
+            // Compute maxParamCount for flat accumulator layout
+            int maxParamCount = 0;
             for (int mi = 0; mi < pLen; mi++)
-                if (_cb.bk2dModeAmps[mi] == null || _cb.bk2dModeAmps[mi].Length < cellCount)
-                    _cb.bk2dModeAmps[mi] = new float[cellCount];
+                if (pipeline[mi].ParamCount > maxParamCount) maxParamCount = pipeline[mi].ParamCount;
 
-            // Local accumulator for mode amps
-            var modeAmpAcc = new float[pLen * cellCount];
+            // Ensure bkModeParams sized [pipelineIdx][paramIdx][cellIdx]
+            if (_cb.bkModeParams == null || _cb.bkModeParams.Length < pLen)
+                _cb.bkModeParams = new float[pLen][][];
+            for (int mi = 0; mi < pLen; mi++)
+            {
+                int nP = pipeline[mi].ParamCount;
+                if (_cb.bkModeParams[mi] == null || _cb.bkModeParams[mi].Length < nP)
+                    _cb.bkModeParams[mi] = new float[nP][];
+                for (int pi = 0; pi < nP; pi++)
+                    if (_cb.bkModeParams[mi][pi] == null || _cb.bkModeParams[mi][pi].Length < cellCount)
+                        _cb.bkModeParams[mi][pi] = new float[cellCount];
+            }
+
+            // Local flat accumulator: [mi * maxParamCount + pi] * cellCount + idx
+            var modeParamAcc = new float[pLen * maxParamCount * cellCount];
 
             foreach (var (biomeInt, slot) in biomeSlot)
             {
@@ -702,7 +756,7 @@ namespace ProceduralTerrain
                 // Multi-source BFS: seed from every cell that has any fraction of this biome.
                 RunBiomeBFS(slot, pcw, pgSize, maxHops);
 
-                float[] bAmp = biomeAmps.TryGetValue((Heightmap.Biome)biomeInt, out var ba) ? ba : Array.Empty<float>();
+                float[][]? bParams = biomeParams.TryGetValue((Heightmap.Biome)biomeInt, out var bp) ? bp : null;
 
                 // Accumulate weighted profile into each inner coarse cell.
                 // At distance 0, scale by fractional membership so a cell that is 50% BF
@@ -724,11 +778,17 @@ namespace ProceduralTerrain
                     int idx = cx4 * cw4 + cz4;
                     ref var acc = ref _blendedProfs![idx];
                     AccumulateProfile(ref acc, ref _biomeTotW![idx], in prof, w);
-                    // Accumulate mode amps
+                    // Accumulate mode params
                     for (int mi = 0; mi < pLen; mi++)
                     {
-                        float ma = mi < bAmp.Length ? bAmp[mi] : 0f;
-                        modeAmpAcc[mi * cellCount + idx] += w * ma;
+                        float[]? mBiomeP = (bParams != null && mi < bParams.Length) ? bParams[mi] : null;
+                        int nP = pipeline[mi].ParamCount;
+                        int accBase = (mi * maxParamCount) * cellCount + idx;
+                        for (int pi = 0; pi < nP; pi++)
+                        {
+                            float pv = (mBiomeP != null && pi < mBiomeP.Length) ? mBiomeP[pi] : 0f;
+                            modeParamAcc[accBase + pi * cellCount] += w * pv;
+                        }
                     }
                 }
             }
@@ -741,7 +801,7 @@ namespace ProceduralTerrain
             {
                 const float SeaLevel = 30f;
                 var oceanProf = GetP(Heightmap.Biome.Ocean);
-                float[] oceanAmp = biomeAmps.TryGetValue(Heightmap.Biome.Ocean, out var oa) ? oa : Array.Empty<float>();
+                float[][]? oceanBP = biomeParams.TryGetValue(Heightmap.Biome.Ocean, out var obp) ? obp : null;
                 for (int cx4 = 0; cx4 < cw4; cx4++)
                 for (int cz4 = 0; cz4 < cw4; cz4++)
                 {
@@ -755,8 +815,14 @@ namespace ProceduralTerrain
                     AccumulateProfile(ref acc, ref _biomeTotW![idx], in oceanProf, coastW);
                     for (int mi = 0; mi < pLen; mi++)
                     {
-                        float ma = mi < oceanAmp.Length ? oceanAmp[mi] : 0f;
-                        modeAmpAcc[mi * cellCount + idx] += coastW * ma;
+                        float[]? mOceanP = (oceanBP != null && mi < oceanBP.Length) ? oceanBP[mi] : null;
+                        int nP = pipeline[mi].ParamCount;
+                        int accBase = (mi * maxParamCount) * cellCount + idx;
+                        for (int pi = 0; pi < nP; pi++)
+                        {
+                            float pv = (mOceanP != null && pi < mOceanP.Length) ? mOceanP[pi] : 0f;
+                            modeParamAcc[accBase + pi * cellCount] += coastW * pv;
+                        }
                     }
                 }
             }
@@ -767,8 +833,14 @@ namespace ProceduralTerrain
                 ref var p = ref _blendedProfs![idx];
                 float tw = _biomeTotW![idx];
                 NormalizeProfile(ref p, tw);
+                float rcp = tw > 0f ? 1f / tw : 0f;
                 for (int mi = 0; mi < pLen; mi++)
-                    _cb.bk2dModeAmps![mi][idx] = tw > 0f ? modeAmpAcc[mi * cellCount + idx] / tw : 0f;
+                {
+                    int nP = pipeline[mi].ParamCount;
+                    int accBase = (mi * maxParamCount) * cellCount + idx;
+                    for (int pi = 0; pi < nP; pi++)
+                        _cb.bkModeParams![mi][pi][idx] = modeParamAcc[accBase + pi * cellCount] * rcp;
+                }
             }
         }
     }
