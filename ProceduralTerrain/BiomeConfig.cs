@@ -573,6 +573,23 @@ namespace ProceduralTerrain
             float blendBlur  = contributions.Sum(c => c.w * c.prof.blur_passes)    * rcp;
             float blendFloor = contributions.Sum(c => c.w * c.prof.floorDepth)     * rcp;
             Log.LogInfo($"  → blended: blur={blendBlur:F1}  floorDepth={blendFloor:F1}  pipeline={_pipeline.Length} modes");
+
+            // Per-mode blended amplitudes
+            var biomeAmps = _biomeAmps;
+            var pipeline  = _pipeline;
+            for (int mi = 0; mi < pipeline.Length; mi++)
+            {
+                float amp = 0f;
+                foreach (var (name, distCells, frac, w, _) in contributions)
+                {
+                    var biome = System.Enum.Parse<Heightmap.Biome>(name);
+                    float[] ba = biomeAmps.TryGetValue(biome, out var a) ? a : Array.Empty<float>();
+                    amp += w * (mi < ba.Length ? ba[mi] : 0f);
+                }
+                amp *= rcp;
+                if (amp > 0f)
+                    Log.LogInfo($"    [{mi}] {pipeline[mi].Name}  amp={amp:F3}");
+            }
         }
 
         // ── Point-query biome blend — same supersampled fractional approach as BakeBlendedProfiles ──
