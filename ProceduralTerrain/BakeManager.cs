@@ -210,6 +210,12 @@ namespace ProceduralTerrain
             Log.LogInfo($"[ProceduralTerrain] bake: {toCarve.Count} zones to carve (radius={radius:F0}m, threads={threads})...");
             var bakeSw = System.Diagnostics.Stopwatch.StartNew();
             int doneCount = 0;
+            Plugin._bakeProgressTotal = toCarve.Count;
+            Plugin._bakeProgressDone  = 0;
+            // Pre-warm Script pool so bake threads don't all create Scripts simultaneously.
+            foreach (var mode in Plugin._pipeline.OfType<LuaModeDef>())
+                mode.WarmPool(threads);
+
             _parallelBakeActive = true;
             try
             {
@@ -221,6 +227,7 @@ namespace ProceduralTerrain
                         var (yLo, yHi) = ComputeYBounds(zox, zoz, zoneW, s, wg);
                         Carve(null, zox, zoz, zoneW, yLo, yHi);
                         int n = System.Threading.Interlocked.Increment(ref doneCount);
+                        Plugin._bakeProgressDone = n;
                         if (n % 50 == 0 || n == toCarve.Count)
                         {
                             float elapsed = bakeSw.ElapsedMilliseconds / 1000f;
@@ -300,8 +307,7 @@ namespace ProceduralTerrain
             _zoneFaceCache.Clear();
             _locationPositions.Clear();
             _locationsCached = false;
-            _caveNoise       = null;
-            _caveNoise2      = null;
+            _noisePool       = null;
             _warpX           = null;
             _warpY           = null;
             _warpZ           = null;
@@ -310,14 +316,6 @@ namespace ProceduralTerrain
             _warpZ2          = null;
             _hmWarpX         = null;
             _hmWarpZ         = null;
-            _hmAddWarpX      = null;
-            _hmAddWarpZ      = null;
-            _addNoise        = null;
-            _addVaryNoise    = null;
-            _widthNoise      = null;
-            _twistVaryNoise  = null;
-            _mbNoise         = null;
-            _mdNoise         = null;
         }
 
         static void RecarveAll()
@@ -450,8 +448,8 @@ public class BakeProgressUI : MonoBehaviour
             pct      = Plugin._bakeProgressTotal > 0 ? (float)Plugin._bakeProgressDone / Plugin._bakeProgressTotal : 0f;
             long elS = (Plugin._bakeProgressTimer?.ElapsedMilliseconds ?? 0) / 1000;
             float eta = pct > 0.01f ? elS / pct * (1f - pct) : 0f;
-            label    = $"Server baking terrain…  {pct * 100f:F0}%";
-            sublabel = eta > 0 ? $"ETA {eta:F0}s" : "Starting…";
+            label    = $"Baking terrain…  {pct * 100f:F0}%";
+            sublabel = eta > 0 ? $"ETA {eta:F0}s  ({Plugin._bakeProgressDone}/{Plugin._bakeProgressTotal} zones)" : "Starting…";
         }
 
         float w = 420f, h = 90f;

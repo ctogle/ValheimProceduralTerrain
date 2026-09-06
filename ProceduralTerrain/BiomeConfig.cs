@@ -31,7 +31,7 @@ namespace ProceduralTerrain
             };
 
         // ── Config file ───────────────────────────────────────────────────────────
-        static string ConfigPath =>
+        internal static string ConfigPath =>
             Path.Combine(BepInEx.Paths.ConfigPath, "procedural_terrain_biomes.cfg");
 
         // Parse a [Mode:name] section into a ModeDefinition subclass.
@@ -46,6 +46,37 @@ namespace ProceduralTerrain
                 break;
             }
             if (typeStr == null) { Log.LogWarning($"[ProceduralTerrain] Mode '{name}': missing or invalid type."); return null; }
+
+            // Handle Lua mode separately
+            if (typeStr == "LUA")
+            {
+                var luaDef = new LuaModeDef { Name = name };
+                var dynParams = new List<(string name, float def)>();
+                string? fileVal = null, blendVal = null, blendKStr = null;
+                foreach (var (k, v) in kvs)
+                {
+                    if (k == "type") continue;
+                    if (k == "file")    { fileVal  = v.Trim(); continue; }
+                    if (k == "blend")   { blendVal  = v.Trim().ToLowerInvariant(); continue; }
+                    if (k == "blend_k") { blendKStr = v.Trim(); continue; }
+                    if (float.TryParse(v, System.Globalization.NumberStyles.Float, inv, out float fv))
+                    {
+                        if (k == "amplitude") { luaDef.Amplitude = fv; }
+                        else dynParams.Add((k, fv));
+                    }
+                }
+                if (blendVal  != null) luaDef.Blend  = blendVal;
+                if (blendKStr != null && float.TryParse(blendKStr, System.Globalization.NumberStyles.Float, inv, out float bk)) luaDef.BlendK = bk;
+                // Ensure amplitude is index 0
+                var orderedParams = new List<(string name, float def)>();
+                orderedParams.Add(("amplitude", luaDef.Amplitude));
+                foreach (var p in dynParams) if (p.name != "amplitude") orderedParams.Add(p);
+                luaDef.SetDynParams(orderedParams);
+                if (fileVal != null)
+                    luaDef.FilePath = System.IO.Path.Combine(System.IO.Path.GetDirectoryName(ConfigPath)!, "ProceduralTerrain", "modes", fileVal);
+                luaDef.LoadScript();
+                return luaDef;
+            }
 
             ModeDefinition md = typeStr switch {
                 "A" => new ModeADef { Name = name },
@@ -280,6 +311,11 @@ namespace ProceduralTerrain
                             _bakeStep = Mathf.Clamp(bs, 1, 64);
                         if (k == "compressbake")
                             _compressBake = !(v == "0" || v == "false");
+                        if (k == "noise_count" && int.TryParse(v, out int nc))
+                        {
+                            nc = Mathf.Clamp(nc, 10, 256);
+                            if (nc != _noiseCount) RebuildNoisePool(nc);
+                        }
                     }
                     continue;
                 }
@@ -339,13 +375,9 @@ namespace ProceduralTerrain
                     }
                     modeParams[mi] = pArr;
                 }
-                // Fill any pipeline modes not referenced by this profile with zeros
-                for (int mi = 0; mi < _pipeline.Length; mi++)
-                    if (modeParams[mi] == null)
-                    {
-                        var pArr = new float[_pipeline[mi].ParamCount]; // all zeros (amplitude=0 = inactive)
-                        modeParams[mi] = pArr;
-                    }
+                // Leave absent pipeline modes as null — null = truly absent (vs explicit amplitude=0).
+                // The blend accumulator skips non-amplitude params for null entries so absent
+                // biomes only dilute amplitude, not frequency/vscale/etc.
                 newBiomeParams[biome2] = modeParams;
             }
             _biomeParams = newBiomeParams;
@@ -418,6 +450,20 @@ namespace ProceduralTerrain
         static void WatchBiomeConfig()
         {
             _configLastWrite = File.GetLastWriteTimeUtc(ConfigPath);
+            _luaLastWrite    = LatestLuaWrite();
+        }
+
+        static DateTime LatestLuaWrite()
+        {
+            var dir = Path.Combine(Path.GetDirectoryName(ConfigPath)!, "ProceduralTerrain", "modes");
+            if (!Directory.Exists(dir)) return DateTime.MinValue;
+            var t = DateTime.MinValue;
+            foreach (var f in Directory.GetFiles(dir, "*.lua"))
+            {
+                var ft = File.GetLastWriteTimeUtc(f);
+                if (ft > t) t = ft;
+            }
+            return t;
         }
 
         // ── Noise initialisation ──────────────────────────────────────────────────
@@ -425,7 +471,7 @@ namespace ProceduralTerrain
         // blended per-biome frequencies interpolate correctly across biome boundaries.
         static void InitNoise()
         {
-            if (_caveNoise != null) return;
+            if (_noisePool != null) return;
             long uid = ZNet.instance?.GetWorldUID() ?? 0L;
             int seed = uid != 0L ? (int)(uid * 2654435761L) : 12345;
             Log.LogInfo($"[ProceduralTerrain] noise seed={seed} (uid={uid})");
@@ -438,24 +484,18 @@ namespace ProceduralTerrain
                 return n;
             }
 
-            _caveNoise   = MakeNoise(0);  // Mode A tunnel field 1
-            _caveNoise2  = MakeNoise(1);  // Mode A tunnel field 2
+            // Warp noises (named fields, kept for backward compat in tight loops)
             _warpX       = MakeNoise(2);  // Mode A warp X (field 1)
             _warpZ       = MakeNoise(3);  // Mode A warp Z (field 1)
             _warpX2      = MakeNoise(13); // Mode A warp X (field 2)
             _warpZ2      = MakeNoise(14); // Mode A warp Z (field 2)
             _warpY       = MakeNoise(15); // Mode A warp Y/sy (field 1)
             _warpY2      = MakeNoise(16); // Mode A warp Y/sy (field 2)
-            _hmWarpX     = MakeNoise(4); // Mode B warp X
-            _hmWarpZ     = MakeNoise(5); // Mode B warp Z
-            _hmAddWarpX  = MakeNoise(6); // Mode C anchor warp X
-            _hmAddWarpZ  = MakeNoise(7); // Mode C anchor warp Z
-            _widthNoise  = MakeNoise(8);  // Mode A width modulation
-            _addNoise       = MakeNoise(9);  // Mode C 3D density field
-            _addVaryNoise   = MakeNoise(10); // Mode C amplitude modulation
-            _twistVaryNoise = MakeNoise(11); // Mode C twist scale modulation
-            _mbNoise        = MakeNoise(12); // Mode B 3D wall perturbation
-            _mdNoise        = MakeNoise(17); // Mode D anisotropic noise field
+            _hmWarpX     = MakeNoise(4);  // Mode B warp X
+            _hmWarpZ     = MakeNoise(5);  // Mode B warp Z
+
+            // Pool noises — use deterministic prime-spaced seeds independent of warp offsets
+            RebuildNoisePool(_noiseCount);
         }
 
         // ── Per-column analytic floor ─────────────────────────────────────────────
@@ -520,7 +560,7 @@ namespace ProceduralTerrain
             p.perona_k      *= rcp;
             p.perona_lambda *= rcp;
             p.floorDepth    *= rcp;
-            p.floorFade     *= rcp;
+            p.floorFade      = Mathf.Min(p.floorFade * rcp, p.floorDepth);
         }
 
         // ── voxcaves_probe: biome blend breakdown logged to console ──────────────────
@@ -565,13 +605,19 @@ namespace ProceduralTerrain
             return biomeSlot;
         }
 
-        static void ProbeBlend(float worldX, float worldZ, WorldGenerator wg, float s)
+        static void ProbeLog(string msg)
+        {
+            Log.LogInfo(msg);
+            Console.instance?.Print(msg);
+        }
+
+        static void ProbeBlend(float worldX, float worldZ, float worldY, WorldGenerator wg, float s)
         {
             var profs     = _biomeProfiles;
             var biomeSlot = SetupPointBlend(worldX, worldZ, wg, s,
                 out float coarseStep, out int pcw, out int pgSize, out int maxHops, out int center);
 
-            // Center cell fractions (what fraction of sub-samples at this exact cell are each biome)
+            // ── Biome blend ──────────────────────────────────────────────────────────
             var sb = new System.Text.StringBuilder();
             sb.Append($"  center cell fractions: ");
             foreach (var (biomeInt, slot) in biomeSlot)
@@ -579,7 +625,7 @@ namespace ProceduralTerrain
                 float f = _biomeFrac[center * MaxBiomeSlots + slot];
                 if (f > 0f) sb.Append($"{(Heightmap.Biome)biomeInt}={f:F2} ");
             }
-            Log.LogInfo(sb.ToString());
+            ProbeLog(sb.ToString());
 
             float totW = 0f;
             var contributions = new List<(string name, int distCells, float frac, float w, CaveProfile prof)>();
@@ -600,38 +646,118 @@ namespace ProceduralTerrain
                 contributions.Add(($"{(Heightmap.Biome)biomeInt}", distC, frac, w, prof));
             }
 
-            if (totW <= 0f) { Log.LogInfo("  no biome contribution (totW=0)"); return; }
+            // ── CoastFade injection (mirrors BakeBlendedProfiles step 2b) ────────────
+            float coastWProbe = 0f;
+            if (_coastFade > 0f)
+            {
+                const float SeaLevel = 30f;
+                float h = wg.GetHeight(worldX, worldZ);
+                coastWProbe = 1f - Mathf.Clamp01((h - SeaLevel) / _coastFade);
+                if (coastWProbe > 0f)
+                {
+                    var oceanProf = profs.TryGetValue(Heightmap.Biome.Ocean, out var op) ? op : CaveProfile.Default;
+                    totW += coastWProbe;
+                    contributions.Add(($"Ocean(coast)", 0, coastWProbe, coastWProbe, oceanProf));
+                }
+            }
 
-            Log.LogInfo($"  blendRadius={_biomeBlendRadius} coarseStep={coarseStep:F1} maxHops={maxHops}  totW={totW:F3}");
+            if (totW <= 0f) { ProbeLog("  no biome contribution (totW=0)"); return; }
+
+            ProbeLog($"  blendRadius={_biomeBlendRadius} coastFade={_coastFade:F0} coarseStep={coarseStep:F1} maxHops={maxHops}  totW={totW:F3}");
             foreach (var (name, distCells, frac, w, prof) in contributions)
             {
                 float normW = w / totW;
                 float worldDist = distCells * coarseStep;
-                Log.LogInfo($"  [{name}]  dist={worldDist:F0}wu ({distCells} hops)  seedFrac={frac:F2}  weight={w:F3}  normW={normW:P0}  blur={prof.blur_passes:F0}  floorDepth={prof.floorDepth:F1}");
+                ProbeLog($"  [{name}]  dist={worldDist:F0}wu ({distCells} hops)  seedFrac={frac:F2}  weight={w:F3}  normW={normW:P0}  blur={prof.blur_passes:F0}  floorDepth={prof.floorDepth:F1}");
             }
 
-            // Blended result
+            // ── Blended profile + full per-mode params ───────────────────────────────
             float rcp = 1f / totW;
-            float blendBlur  = contributions.Sum(c => c.w * c.prof.blur_passes)    * rcp;
-            float blendFloor = contributions.Sum(c => c.w * c.prof.floorDepth)     * rcp;
-            Log.LogInfo($"  → blended: blur={blendBlur:F1}  floorDepth={blendFloor:F1}  pipeline={_pipeline.Length} modes");
+            float blendBlur  = contributions.Sum(c => c.w * c.prof.blur_passes) * rcp;
+            float blendFloor = contributions.Sum(c => c.w * c.prof.floorDepth)  * rcp;
+            ProbeLog($"  → blended: blur={blendBlur:F1}  floorDepth={blendFloor:F1}  pipeline={_pipeline.Length} modes");
 
-            // Per-mode blended amplitudes
             var bpMap    = _biomeParams;
             var pipeline = _pipeline;
             for (int mi = 0; mi < pipeline.Length; mi++)
             {
-                float amp = 0f;
-                foreach (var (name, distCells, frac, w, _) in contributions)
+                var mode = pipeline[mi];
+                float[][] bmpActive = Array.Empty<float[]>();
+                foreach (var (name, _, _, w, _) in contributions)
                 {
-                    var biome = System.Enum.Parse<Heightmap.Biome>(name);
-                    float[][] bmp = bpMap.TryGetValue(biome, out var a) ? a : Array.Empty<float[]>();
-                    float[] mArr = (mi < bmp.Length && bmp[mi] != null) ? bmp[mi] : Array.Empty<float>();
-                    amp += w * (mArr.Length > 0 ? mArr[0] : 0f); // param 0 = amplitude
+                    if (!System.Enum.TryParse<Heightmap.Biome>(name, out var biome)) continue;
+                    if (bpMap.TryGetValue(biome, out var a) && mi < a.Length && a[mi] != null)
+                        bmpActive = a; // use first contributing biome that has params (blend below)
                 }
-                amp *= rcp;
-                if (amp > 0f)
-                    Log.LogInfo($"    [{mi}] {pipeline[mi].Name}  amp={amp:F3}");
+                // build blended param array for this mode
+                int pc = mode.ParamCount;
+                if (pc == 0) continue;
+                float[] acc = new float[pc];
+                float presentW = 0f;
+                foreach (var (name, _, _, w, _) in contributions)
+                {
+                    if (!System.Enum.TryParse<Heightmap.Biome>(name, out var biome)) biome = Heightmap.Biome.Ocean;
+                    float[][] bmp = bpMap.TryGetValue(biome, out var a) ? a : Array.Empty<float[]>();
+                    float[]? mArr = (mi < bmp.Length) ? bmp[mi] : null;
+                    bool present = mArr != null;
+                    if (present) presentW += w;
+                    for (int pi = 0; pi < pc; pi++)
+                    {
+                        if (pi > 0 && !present) continue;
+                        acc[pi] += w * (mArr != null && pi < mArr.Length ? mArr[pi] : 0f);
+                    }
+                }
+                float[] blendedP = new float[pc];
+                ModeDefinition.BlendParams(blendedP, acc, totW, presentW, pc);
+                if (blendedP[0] <= 0f) continue;
+
+                var psb = new System.Text.StringBuilder();
+                psb.Append($"    [{mi}] {mode.Name}  ");
+                string[] pnames = mode.ParamNames;
+                for (int pi = 0; pi < pc; pi++)
+                    psb.Append($"{(pi < pnames.Length ? pnames[pi] : pi.ToString())}={blendedP[pi]:G4}  ");
+                ProbeLog(psb.ToString());
+            }
+
+            // ── Input features at probe point ────────────────────────────────────────
+            ProbeLog($"  input features at ({worldX:F1}, {worldY:F1}, {worldZ:F1}):");
+
+            float th = wg.GetHeight(worldX, worldZ);
+            ProbeLog($"    terrain_h={th:F2}");
+
+            // Zone extent for the zone containing this world point
+            {
+                const int zoneW = 64;
+                int gridOffset = ((-(int)(32f / s)) % zoneW + zoneW) % zoneW;
+                int ox = (int)Math.Floor((worldX / s - gridOffset) / zoneW) * zoneW + gridOffset;
+                int oz = (int)Math.Floor((worldZ / s - gridOffset) / zoneW) * zoneW + gridOffset;
+                var (yLo, yHi) = Plugin.ComputeYBoundsPublic(ox, oz, zoneW, s, wg);
+                int loMarg = Mathf.Max(24, (int)Mathf.Ceil(48f / s) + 4); // approx loMargin
+                float extLo = (yLo - loMarg) * s;
+                float extHi = (yHi + 24) * s;
+                ProbeLog($"    zone ox={ox} oz={oz}  yLo={yLo} yHi={yHi}  extLo≈{extLo:F0}wu extHi≈{extHi:F0}wu");
+            }
+
+            // Gradient via finite difference (same 4wu step as coarse grid)
+            float hStep = 4f;
+            float dhx = wg.GetHeight(worldX + hStep, worldZ) - wg.GetHeight(worldX - hStep, worldZ);
+            float dhz = wg.GetHeight(worldX, worldZ + hStep) - wg.GetHeight(worldX, worldZ - hStep);
+            float gradMag = Mathf.Sqrt(dhx * dhx + dhz * dhz) / (2f * hStep);
+            float gradLen = Mathf.Max(gradMag * 2f * hStep, 1e-6f);
+            float gdx = dhx / gradLen, gdz = dhz / gradLen; // uphill direction
+            float tdx = -gdz, tdz = gdx;                    // tangent (90° CCW)
+            ProbeLog($"    grad_dirx={gdx:F3}  grad_dirz={gdz:F3}  grad_mag={gradMag:F4}");
+            ProbeLog($"    tangent_x={tdx:F3}  tangent_z={tdz:F3}");
+
+            if (Plugin._noisePool != null)
+            {
+                var np = Plugin._noisePool;
+                int nc = Mathf.Min(Plugin._noiseCount, np.Length);
+                var nsb = new System.Text.StringBuilder();
+                nsb.Append("    noise: ");
+                for (int ni = 0; ni < nc; ni++)
+                    nsb.Append($"n{ni + 1}={np[ni].GetNoise(worldX, worldY, worldZ):F3}  ");
+                ProbeLog(nsb.ToString());
             }
         }
 
@@ -747,7 +873,10 @@ namespace ProceduralTerrain
             }
 
             // Local flat accumulator: [mi * maxParamCount + pi] * cellCount + idx
-            var modeParamAcc = new float[pLen * maxParamCount * cellCount];
+            var modeParamAcc      = new float[pLen * maxParamCount * cellCount];
+            // Per-mode present weight: sum of biome weights where mode is non-null.
+            // Used to normalize non-amplitude params so absent biomes don't pull them toward zero.
+            var modePresentWAcc   = new float[pLen * cellCount];
 
             foreach (var (biomeInt, slot) in biomeSlot)
             {
@@ -782,10 +911,13 @@ namespace ProceduralTerrain
                     for (int mi = 0; mi < pLen; mi++)
                     {
                         float[]? mBiomeP = (bParams != null && mi < bParams.Length) ? bParams[mi] : null;
+                        bool present = mBiomeP != null;
+                        if (present) modePresentWAcc[mi * cellCount + idx] += w;
                         int nP = pipeline[mi].ParamCount;
                         int accBase = (mi * maxParamCount) * cellCount + idx;
                         for (int pi = 0; pi < nP; pi++)
                         {
+                            if (pi > 0 && !present) continue; // absent biomes only dilute amplitude
                             float pv = (mBiomeP != null && pi < mBiomeP.Length) ? mBiomeP[pi] : 0f;
                             modeParamAcc[accBase + pi * cellCount] += w * pv;
                         }
@@ -816,10 +948,13 @@ namespace ProceduralTerrain
                     for (int mi = 0; mi < pLen; mi++)
                     {
                         float[]? mOceanP = (oceanBP != null && mi < oceanBP.Length) ? oceanBP[mi] : null;
+                        bool present = mOceanP != null;
+                        if (present) modePresentWAcc[mi * cellCount + idx] += coastW;
                         int nP = pipeline[mi].ParamCount;
                         int accBase = (mi * maxParamCount) * cellCount + idx;
                         for (int pi = 0; pi < nP; pi++)
                         {
+                            if (pi > 0 && !present) continue;
                             float pv = (mOceanP != null && pi < mOceanP.Length) ? mOceanP[pi] : 0f;
                             modeParamAcc[accBase + pi * cellCount] += coastW * pv;
                         }
@@ -838,8 +973,13 @@ namespace ProceduralTerrain
                 {
                     int nP = pipeline[mi].ParamCount;
                     int accBase = (mi * maxParamCount) * cellCount + idx;
-                    for (int pi = 0; pi < nP; pi++)
-                        _cb.bkModeParams![mi][pi][idx] = modeParamAcc[accBase + pi * cellCount] * rcp;
+                    float presentW = modePresentWAcc[mi * cellCount + idx];
+                    // Gather per-param accumulated sums into a temp span, then normalize.
+                    Span<float> acc = stackalloc float[nP];
+                    for (int pi = 0; pi < nP; pi++) acc[pi] = modeParamAcc[accBase + pi * cellCount];
+                    Span<float> result = stackalloc float[nP];
+                    ModeDefinition.BlendParams(result, acc, tw, presentW, nP);
+                    for (int pi = 0; pi < nP; pi++) _cb.bkModeParams![mi][pi][idx] = result[pi];
                 }
             }
         }

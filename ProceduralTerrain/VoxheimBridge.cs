@@ -98,7 +98,7 @@ namespace ProceduralTerrain
             int ox = (int)Plugin._zoneOriginX.GetValue(__instance)!;
             int oz = (int)Plugin._zoneOriginZ.GetValue(__instance)!;
             string key = $"{ox},{oz}";
-            Plugin._sdfCache.Remove(key);
+            Plugin._sdfCache.TryRemove(key, out _);
             lock (Plugin._surfHCache) Plugin._surfHCache.Remove((ox, oz));
         }
     }

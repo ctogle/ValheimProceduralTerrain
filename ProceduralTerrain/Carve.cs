@@ -505,7 +505,10 @@ namespace ProceduralTerrain
                 }
             }
 
-            if (!_parallelBakeActive) _sdfCache[zoneKey] = (extLo, bh, width, cacheData);
+            // Bake threads skip sdfCache to avoid accumulating hundreds of MB during bake.
+            // Main-thread live carves (PTGenerator) always write so Voxheim fallback works.
+            if (!_parallelBakeActive || System.Threading.Thread.CurrentThread.ManagedThreadId == Plugin._mainThreadId)
+                _sdfCache[zoneKey] = (extLo, bh, width, cacheData);
 
             }
 
@@ -597,6 +600,9 @@ namespace ProceduralTerrain
         }
 
         // ── Cross-zone face cache helpers ─────────────────────────────────────────
+
+        internal static (int yLo, int yHi) ComputeYBoundsPublic(int ox, int oz, int w, float s, WorldGenerator wg)
+            => ComputeYBounds(ox, oz, w, s, wg);
 
         static (int yLo, int yHi) ComputeYBounds(int ox, int oz, int w, float s, WorldGenerator wg)
         {
@@ -1013,13 +1019,13 @@ namespace ProceduralTerrain
             foreach (var mode in pipeline)
                 mode.BakeBegin(ref _cb, nb2Size, bh, cw4);
 
-            // Check if any Mode D (gradient) is active
-            bool anyMdActive = pipeline.OfType<ModeDDef>().Any(m =>
+            // Check if any mode requiring grad field is active
+            bool anyMdActive = pipeline.Any(m => m.NeedsGradField &&
                 _cb.bkModeParams != null && m.PipelineIndex >= 0 &&
                 _cb.bkModeParams[m.PipelineIndex][0].Any(v => v > 0f));
 
-            // BlurRadius for Mode D comes from param 3 — use max default across active Mode Ds
-            float mdBlurRadius = pipeline.OfType<ModeDDef>().Select(m => m.BlurRadius).DefaultIfEmpty(128f).Max();
+            // BlurRadius: max across all grad-field modes
+            float mdBlurRadius = pipeline.Where(m => m.NeedsGradField).Select(m => m.GradBlurRadius).DefaultIfEmpty(128f).Max();
             mdBlurRadius = Mathf.Clamp(mdBlurRadius, 16f, 2048f);
 
             if (anyMdActive && wg != null)
@@ -1154,6 +1160,9 @@ namespace ProceduralTerrain
             List<(Vector2 pos, float extR)> nearbyLocs)
         {
             var pipeline = _pipeline;
+            int pLen2 = pipeline.Length;
+            if (Plugin._modeColCtx == null || Plugin._modeColCtx.Length < pLen2)
+                Plugin._modeColCtx = new ModeColCtx[pLen2];
             for (int cx = 0; cx < bw; cx++)
             for (int cz = 0; cz < bw; cz++)
             {
