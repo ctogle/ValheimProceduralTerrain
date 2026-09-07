@@ -634,7 +634,6 @@ namespace ProceduralTerrain
         internal static ManualLogSource Log = null!;
 
         // HeightGrid scale delegate. Built in BuildDelegates.
-        internal static Func<object, float>?                  _gridScale;
 
         // World units per voxel — read lazily, Voxheim initialises it after plugin load.
         static FieldInfo? _scaleField;
@@ -664,6 +663,7 @@ namespace ProceduralTerrain
         internal static readonly List<(Vector2 pos, float extR)> _locationPositions = new();
         internal static bool _locationsCached;
         internal static bool  _protectLocations    = true;
+        internal static bool  _flatPlaneLocations  = true;
         internal static bool  _islandRemoval       = true;
         internal static bool  _pocketRemoval       = true;
         internal static float _biomeBlendRadius    = 192f;

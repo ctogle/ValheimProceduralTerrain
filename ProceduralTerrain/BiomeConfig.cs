@@ -284,6 +284,8 @@ namespace ProceduralTerrain
                             _disableVegetation = v == "1" || v == "true";
                         if (k == "protectlocations")
                             _protectLocations = !(v == "0" || v == "false");
+                        if (k == "flatplanelocations")
+                            _flatPlaneLocations = !(v == "0" || v == "false");
                         if (k == "islandremoval")
                             _islandRemoval = !(v == "0" || v == "false");
                         if (k == "pocketremoval")

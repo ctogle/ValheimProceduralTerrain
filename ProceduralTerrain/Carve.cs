@@ -42,7 +42,7 @@ namespace ProceduralTerrain
             Mathf.Lerp(Mathf.Lerp(a[i00], a[i10], fx), Mathf.Lerp(a[i01], a[i11], fx), fz);
 
         // ── Carve pass ────────────────────────────────────────────────────────────
-        internal static void Carve(object? grid, int ox, int oz, int width, int yLo, int yHi, float gridScale = 0f)
+        internal static void Carve(object? grid, int ox, int oz, int width, int yLo, int yHi, float gridScale = 0f, Voxheim.Core.HeightGrid? heightGrid = null)
         {
             float s;
             if (gridScale > 0f)
@@ -142,7 +142,7 @@ namespace ProceduralTerrain
 
             bool anyPipelineActive = _pipeline.Length > 0 && _cb.bkModeParams != null &&
                 _pipeline.Any(m => _cb.bkModeParams![m.PipelineIndex][0].Any(v => v > 0f));
-            FillPhase1(buf, bw, bh, extLo, s, ox, oz, overlap, wg, cw4, nearbyLocs);
+            FillPhase1(buf, bw, bh, extLo, s, ox, oz, overlap, wg, cw4, nearbyLocs, heightGrid);
             _t1 = _sw.ElapsedMilliseconds;
 
             _t1b = _sw.ElapsedMilliseconds;
@@ -1157,7 +1157,7 @@ namespace ProceduralTerrain
 
         static void FillPhase1(float[] buf, int bw, int bh, int extLo, float s,
             int ox, int oz, int overlap, WorldGenerator? wg, int cw4,
-            List<(Vector2 pos, float extR)> nearbyLocs)
+            List<(Vector2 pos, float extR)> nearbyLocs, Voxheim.Core.HeightGrid? heightGrid = null)
         {
             var pipeline = _pipeline;
             int pLen2 = pipeline.Length;
@@ -1180,7 +1180,12 @@ namespace ProceduralTerrain
                 float profFlD    = BL(_cb.bk2dFlD!,    b200, b210, b201, b211, bfx, bfz);
                 float profFlFade = BL(_cb.bk2dFlFade!, b200, b210, b201, b211, bfx, bfz);
                 float h;
-                if (wg == null) { h = 0f; }
+                if (heightGrid != null)
+                {
+                    int hgx = cx - overlap, hgz = cz - overlap;
+                    h = heightGrid[hgx, hgz] * s;
+                }
+                else if (wg == null) { h = 0f; }
                 else
                 {
                     long hKey = (long)gx << 32 | (uint)gz;
@@ -1192,7 +1197,7 @@ namespace ProceduralTerrain
                 }
                 float locFac     = 1f;
                 float effectiveH = h;
-                if (_protectLocations && nearbyLocs.Count > 0)
+                if ((_protectLocations || _flatPlaneLocations) && nearbyLocs.Count > 0)
                 {
                     float minFac = 1f, flatH = h;
                     for (int li = 0; li < nearbyLocs.Count; li++)
@@ -1204,8 +1209,8 @@ namespace ProceduralTerrain
                             flatH  = wg != null ? wg.GetHeight(nearbyLocs[li].pos.x, nearbyLocs[li].pos.y) : h;
                         }
                     }
-                    locFac     = minFac;
-                    effectiveH = Mathf.Lerp(flatH, h, locFac);
+                    if (_protectLocations)   locFac     = minFac;
+                    if (_flatPlaneLocations) effectiveH = Mathf.Lerp(flatH, h, minFac);
                 }
 
                 // mode D uses a (cw4+1)×(cw4+1) coarse grid

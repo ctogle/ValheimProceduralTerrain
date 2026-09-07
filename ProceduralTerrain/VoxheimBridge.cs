@@ -7,7 +7,6 @@ using System.IO;
 using System.IO.Compression;
 using System.Linq;
 using System.Reflection;
-using System.Reflection.Emit;
 using UnityEngine;
 
 namespace ProceduralTerrain
@@ -61,22 +60,6 @@ namespace ProceduralTerrain
             if (_locationInstancesField == null)
                 Log.LogWarning("[ProceduralTerrain] m_locationInstances not found — location protection off.");
 
-            // HeightGrid Scale delegate
-            var gridT      = FindType("Voxheim.Core.HeightGrid", "Voxheim.Core");
-            var gridScaleP = gridT?.GetProperty("Scale", BindingFlags.Public | BindingFlags.Instance);
-            if (gridT != null && gridScaleP?.GetMethod != null)
-            {
-                var sdm = new DynamicMethod("HG_Scale", typeof(float),
-                    new[] { typeof(object) }, typeof(Plugin).Module, skipVisibility: true);
-                var sgi = sdm.GetILGenerator();
-                sgi.Emit(OpCodes.Ldarg_0); sgi.Emit(OpCodes.Castclass, gridT);
-                sgi.Emit(OpCodes.Callvirt, gridScaleP.GetMethod);
-                sgi.Emit(OpCodes.Ret);
-                _gridScale = (Func<object,float>)sdm.CreateDelegate(typeof(Func<object,float>));
-                Log.LogInfo("[ProceduralTerrain] HeightGrid.Scale delegate ready — scale read from grid, no s_scale dependency.");
-            }
-            else { Log.LogWarning("[ProceduralTerrain] HeightGrid.Scale not found — falling back to s_scale."); }
-
             return true;
         }
     }
@@ -118,8 +101,8 @@ namespace ProceduralTerrain
             string zoneKey = $"{ox},{oz}";
             if (!Plugin._sdfCache.TryGetValue(zoneKey, out var c))
             {
-                float gridS = Plugin._gridScale != null ? Plugin._gridScale(context.Heights) : 0f;
-                try { Plugin.Carve(context.Heights, ox, oz, width, context.InitialScanLo, context.InitialScanHi, gridS); }
+                float gridS = context.Heights.Scale;
+                try { Plugin.Carve(context.Heights, ox, oz, width, context.InitialScanLo, context.InitialScanHi, gridS, context.Heights); }
                 catch (Exception e) { Plugin.Log.LogError($"[PT] Carve ({ox},{oz}): {e.Message}"); return; }
                 if (!Plugin._sdfCache.TryGetValue(zoneKey, out c)) return;
             }
@@ -135,7 +118,7 @@ namespace ProceduralTerrain
                 {
                     sbyte d = c.data[(ci * c.bh + cy) * c.width + ri];
                     int   wy = c.extLo + cy;
-                    builder.Set(new Voxheim.Core.Int3(wx, wy, wz), d);
+                    builder.Field.Set(new Voxheim.Core.Int3(wx, wy, wz), d);
                 }
             }
         }
