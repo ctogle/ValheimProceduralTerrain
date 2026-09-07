@@ -1200,7 +1200,7 @@ namespace ProceduralTerrain
                 if (_seaLevelFade > 0f)
                 {
                     const float SeaLevel = 30f;
-                    seaFac = Mathf.Clamp01((h - (SeaLevel - _seaLevelFade)) / (2f * _seaLevelFade));
+                    seaFac = _seaLevelAtten + (1f - _seaLevelAtten) * Mathf.Clamp01((h - SeaLevel) / _seaLevelFade);
                 }
                 float effectiveH = h;
                 if ((_protectLocations || _flatPlaneLocations) && nearbyLocs.Count > 0)

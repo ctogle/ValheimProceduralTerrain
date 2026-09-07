@@ -448,6 +448,7 @@ namespace ProceduralTerrain
                 s.Globals[$"n{kk + 1}"] = (Func<float,float,float,float>)((x, y, z) =>
                     Plugin._noisePool != null ? Plugin._noisePool[kk].GetNoise(x, y, z) : 0f);
             }
+            s.Globals["log"]        = (Action<string>)(msg => Plugin.Log.LogInfo($"[lua] {msg}"));
             s.Globals["lerp"]       = (Func<float,float,float,float>)Mathf.Lerp;
             s.Globals["smoothstep"] = (Func<float,float,float,float>)Mathf.SmoothStep;
             s.Globals["terrain_h"]  = (Func<float,float,float>)((x, z) =>
@@ -671,7 +672,8 @@ namespace ProceduralTerrain
         internal static int   _transitionBlurPasses = 3;     // min blur passes for any active zone
         internal static int   _fixpointMaxZones     = 8;     // EnsureFixpoint hop cap
         internal static float _coastFade           = 0f;     // world units above sea level over which Ocean inflates into blend (0=off)
-        internal static float _seaLevelFade        = 0f;     // ramp half-width: amp=0 at SeaLevel-fade, 0.5 at SeaLevel, 1.0 at SeaLevel+fade (0=off)
+        internal static float _seaLevelFade        = 0f;     // distance above sea level where fade begins (factor=1 here, seaLevelAtten at sea level)
+        internal static float _seaLevelAtten       = 0f;     // factor at sea level (0=fully suppressed, 1=no suppression)
 
         // ── Bake download (client receiving from server) ──────────────────────────
         internal static bool   _bakeDownloadActive;

@@ -32,7 +32,7 @@ namespace ProceduralTerrain
 
         // ── Config file ───────────────────────────────────────────────────────────
         internal static string ConfigPath =>
-            Path.Combine(BepInEx.Paths.ConfigPath, "procedural_terrain_biomes.cfg");
+            Path.Combine(BepInEx.Paths.ConfigPath, "ProceduralTerrain", "procedural_terrain_biomes.cfg");
 
         // Parse a [Mode:name] section into a ModeDefinition subclass.
         static ModeDefinition? ParseModeDefinition(string name, List<(string key, string val)> kvs)
@@ -73,7 +73,7 @@ namespace ProceduralTerrain
                 foreach (var p in dynParams) if (p.name != "amplitude") orderedParams.Add(p);
                 luaDef.SetDynParams(orderedParams);
                 if (fileVal != null)
-                    luaDef.FilePath = System.IO.Path.Combine(System.IO.Path.GetDirectoryName(ConfigPath)!, "ProceduralTerrain", "modes", fileVal);
+                    luaDef.FilePath = System.IO.Path.Combine(System.IO.Path.GetDirectoryName(ConfigPath)!, "modes", fileVal);
                 luaDef.LoadScript();
                 return luaDef;
             }
@@ -302,6 +302,8 @@ namespace ProceduralTerrain
                             _coastFade = Mathf.Max(0f, cf);
                         if (k == "sealevelfade" && float.TryParse(v, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float slf))
                             _seaLevelFade = Mathf.Max(0f, slf);
+                        if (k == "sealevelatten" && float.TryParse(v, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float sla))
+                            _seaLevelAtten = Mathf.Clamp01(sla);
                     }
                     continue;
                 }
@@ -459,7 +461,7 @@ namespace ProceduralTerrain
 
         static DateTime LatestLuaWrite()
         {
-            var dir = Path.Combine(Path.GetDirectoryName(ConfigPath)!, "ProceduralTerrain", "modes");
+            var dir = Path.Combine(Path.GetDirectoryName(ConfigPath)!, "modes");
             if (!Directory.Exists(dir)) return DateTime.MinValue;
             var t = DateTime.MinValue;
             foreach (var f in Directory.GetFiles(dir, "*.lua"))
