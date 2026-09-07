@@ -671,6 +671,7 @@ namespace ProceduralTerrain
         internal static int   _transitionBlurPasses = 3;     // min blur passes for any active zone
         internal static int   _fixpointMaxZones     = 8;     // EnsureFixpoint hop cap
         internal static float _coastFade           = 0f;     // world units above sea level over which Ocean inflates into blend (0=off)
+        internal static float _seaLevelFade        = 0f;     // ramp half-width: amp=0 at SeaLevel-fade, 0.5 at SeaLevel, 1.0 at SeaLevel+fade (0=off)
 
         // ── Bake download (client receiving from server) ──────────────────────────
         internal static bool   _bakeDownloadActive;

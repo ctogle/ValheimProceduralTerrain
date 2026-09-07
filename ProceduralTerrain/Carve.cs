@@ -1196,6 +1196,12 @@ namespace ProceduralTerrain
                     }
                 }
                 float locFac     = 1f;
+                float seaFac     = 1f;
+                if (_seaLevelFade > 0f)
+                {
+                    const float SeaLevel = 30f;
+                    seaFac = Mathf.Clamp01((h - (SeaLevel - _seaLevelFade)) / (2f * _seaLevelFade));
+                }
                 float effectiveH = h;
                 if ((_protectLocations || _flatPlaneLocations) && nearbyLocs.Count > 0)
                 {
@@ -1250,7 +1256,7 @@ namespace ProceduralTerrain
                     };
                     foreach (var mode in pipeline) mode.ComputeVoxel(ref combined, in vox);
                     float _fade = profFlFade > 0f ? Mathf.Clamp01((worldY - floorY) / profFlFade) : 1f;
-                    buf[(cx * bh + cy) * bw + cz] = baseSDF + (combined - baseSDF) * locFac * _fade;
+                    buf[(cx * bh + cy) * bw + cz] = baseSDF + (combined - baseSDF) * locFac * seaFac * _fade;
                 }
             }
         }
