@@ -357,6 +357,7 @@ namespace ProceduralTerrain
             foreach (var mn in pipelineNames)
                 if (modeDefs.TryGetValue(mn, out var pmd)) { pmd.PipelineIndex = pipelineList.Count; pipelineList.Add(pmd); }
             _pipeline = pipelineList.ToArray();
+            Plugin.ZoneGradCache.Clear();
 
             // Build _biomeParams [biome][pipelineIdx][paramIdx]
             var newBiomeParams = new Dictionary<Heightmap.Biome, float[][]>();

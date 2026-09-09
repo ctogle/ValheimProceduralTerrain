@@ -112,6 +112,8 @@ namespace ProceduralTerrain
                         float e = Mathf.Max(0f, 1f - mc.Threshold) * a + mc.WarpAmp;
                         if (e > maxExtM) maxExtM = e;
                     }
+                    else if (mode is LuaModeDef lm && lm.ExtendUp > maxExtM)
+                        maxExtM = lm.ExtendUp;
                 }
                 if (maxExtM  > 0f) hiMargin = Mathf.Max(24, (int)Mathf.Ceil(maxExtM  / s) + 8);
                 if (maxFloor > 0f) loMargin = Mathf.Max(24, (int)Mathf.Ceil(maxFloor / s) + 4);
@@ -709,6 +711,8 @@ namespace ProceduralTerrain
                         float e = Mathf.Max(0f, 1f - mc.Threshold) * a + mc.WarpAmp;
                         if (e > maxExtM) maxExtM = e;
                     }
+                    else if (mode is LuaModeDef lm && lm.ExtendUp > maxExtM)
+                        maxExtM = lm.ExtendUp;
                 }
                 if (maxExtM  > 0f) hiMargin = Mathf.Max(24, (int)Mathf.Ceil(maxExtM  / s) + 8);
                 if (maxFloor > 0f) loMargin = Mathf.Max(24, (int)Mathf.Ceil(maxFloor / s) + 4);
@@ -1152,6 +1156,68 @@ namespace ProceduralTerrain
                 tgX[cidx]   = gdx;
                 tgZ[cidx]   = gdz;
                 blurH[cidx] = blurGrid[gi * gw2 + gj];
+            }
+        }
+
+        // Per-zone-center gradient cache for continuous cross-boundary grad field.
+        // Keyed by zone coordinate (zone = floor(world / ZoneSize)). Cleared on config reload.
+        internal static class ZoneGradCache
+        {
+            const float ZoneSize = 64f;
+            static readonly Dictionary<(int, int), (float tgX, float tgZ, float mag)> _cache = new();
+            static readonly object _lock = new();
+
+            public static void Clear() { lock (_lock) _cache.Clear(); }
+
+            static (float tgX, float tgZ, float mag) Compute(WorldGenerator wg, int zx, int zz, float blurRadius)
+            {
+                float cx = (zx + 0.5f) * ZoneSize;
+                float cz = (zz + 0.5f) * ZoneSize;
+                float r  = Mathf.Max(blurRadius, ZoneSize * 0.5f);
+                // 8-direction ring: cardinal + diagonal. Diagonal weight 0.5 (projected onto axes).
+                float hpx = wg.GetHeight(cx + r, cz),     hnx = wg.GetHeight(cx - r, cz);
+                float hpz = wg.GetHeight(cx, cz + r),     hnz = wg.GetHeight(cx, cz - r);
+                float hpp = wg.GetHeight(cx + r, cz + r), hnn = wg.GetHeight(cx - r, cz - r);
+                float hpn = wg.GetHeight(cx + r, cz - r), hnp = wg.GetHeight(cx - r, cz + r);
+                float gx = ((hpx - hnx) + 0.5f * ((hpp - hnp) + (hpn - hnn))) / (4f * r);
+                float gz = ((hpz - hnz) + 0.5f * ((hpp - hpn) + (hnp - hnn))) / (4f * r);
+                float mag = Mathf.Sqrt(gx * gx + gz * gz);
+                float inv = 1f / (mag + 0.001f);
+                return (gx * inv, gz * inv, mag);
+            }
+
+            static (float tgX, float tgZ, float mag) Get(WorldGenerator wg, int zx, int zz, float blurRadius)
+            {
+                lock (_lock)
+                    if (_cache.TryGetValue((zx, zz), out var v)) return v;
+                var r = Compute(wg, zx, zz, blurRadius);
+                lock (_lock) { _cache[(zx, zz)] = r; return r; }
+            }
+
+            public static (float tgX, float tgZ, float mag) Sample(WorldGenerator wg, float wx, float wz, float blurRadius)
+            {
+                // Bicubic (smoothstep) interpolation between surrounding zone-center gradients — C1 continuous.
+                float fx = wx / ZoneSize - 0.5f;
+                float fz = wz / ZoneSize - 0.5f;
+                int zx0 = Mathf.FloorToInt(fx), zz0 = Mathf.FloorToInt(fz);
+                float bfx = Mathf.SmoothStep(0f, 1f, fx - zx0);
+                float bfz = Mathf.SmoothStep(0f, 1f, fz - zz0);
+
+                var (tx00, tz00, m00) = Get(wg, zx0,     zz0,     blurRadius);
+                var (tx10, tz10, m10) = Get(wg, zx0 + 1, zz0,     blurRadius);
+                var (tx01, tz01, m01) = Get(wg, zx0,     zz0 + 1, blurRadius);
+                var (tx11, tz11, m11) = Get(wg, zx0 + 1, zz0 + 1, blurRadius);
+
+                float w00 = (1-bfx)*(1-bfz), w10 = bfx*(1-bfz);
+                float w01 = (1-bfx)*bfz,      w11 = bfx*bfz;
+
+                float tgX = tx00*w00 + tx10*w10 + tx01*w01 + tx11*w11;
+                float tgZ = tz00*w00 + tz10*w10 + tz01*w01 + tz11*w11;
+                float mag  = m00*w00  + m10*w10  + m01*w01  + m11*w11;
+
+                float len = Mathf.Sqrt(tgX*tgX + tgZ*tgZ);
+                if (len > 0.001f) { tgX /= len; tgZ /= len; }
+                return (tgX, tgZ, mag);
             }
         }
 

@@ -415,7 +415,7 @@ namespace ProceduralTerrain
         public override string[] ParamNames => _dynParamNames;
         public override float GetDefaultParam(int i) => i < _dynDefaults.Length ? _dynDefaults[i] : 0f;
 
-        public override bool NeedsGradField => true;
+        public override bool NeedsGradField => false;
         public override float GradBlurRadius
         {
             get
@@ -423,6 +423,19 @@ namespace ProceduralTerrain
                 for (int i = 0; i < _dynParamNames.Length; i++)
                     if (_dynParamNames[i] == "blurradius") return _dynDefaults[i];
                 return 128f;
+            }
+        }
+
+        // Optional cfg param: how many world units above vanilla terrain this mode may raise
+        // the surface. Feeds the bake's vertical window (hiMargin) so tall raised features
+        // aren't clipped at the default ceiling. 0 = no extra extent.
+        public float ExtendUp
+        {
+            get
+            {
+                for (int i = 0; i < _dynParamNames.Length; i++)
+                    if (_dynParamNames[i] == "extendup") return _dynDefaults[i];
+                return 0f;
             }
         }
 
@@ -522,10 +535,10 @@ namespace ProceduralTerrain
             }
 
             int idx = args.cellIdx;
-            float dirx  = cb.bk2dTgX    != null && idx < cb.bk2dTgX.Length    ? cb.bk2dTgX[idx]    : 0f;
-            float dirz  = cb.bk2dTgZ    != null && idx < cb.bk2dTgZ.Length    ? cb.bk2dTgZ[idx]    : 0f;
-            float mag   = cb.bk2dGradMag != null && idx < cb.bk2dGradMag.Length ? cb.bk2dGradMag[idx] : 0f;
-            float blurh = cb.bk2dBlurH  != null && idx < cb.bk2dBlurH.Length  ? cb.bk2dBlurH[idx]  : 0f;
+            var wg2 = args.wg ?? WorldGenerator.instance;
+            (float dirx, float dirz, float mag) = wg2 != null
+                ? Plugin.ZoneGradCache.Sample(wg2, args.worldX, args.worldZ, GradBlurRadius)
+                : (0f, 0f, 0f);
 
             var (s, p) = RentEntry();
             try
@@ -533,10 +546,9 @@ namespace ProceduralTerrain
                 // Mutate pre-allocated params table in place — avoids per-cell Table allocation.
                 for (int i = 0; i < _dynParamNames.Length; i++)
                     p[_dynParamNames[i]] = (double)cb.bkModeParams![pi][i][idx];
-                p["grad_dirx"]  = (double)dirx;
-                p["grad_dirz"]  = (double)dirz;
-                p["grad_mag"]   = (double)mag;
-                p["grad_blurh"] = (double)blurh;
+                p["grad_dirx"] = (double)dirx;
+                p["grad_dirz"] = (double)dirz;
+                p["grad_mag"]  = (double)mag;
 
                 var res = s.Call(s.Globals["bake"], args.worldX, args.worldZ, p, args.extLoS, (double)args.s, args.bh);
                 var tbl = res.Table;
