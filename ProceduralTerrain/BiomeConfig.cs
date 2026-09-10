@@ -184,6 +184,7 @@ namespace ProceduralTerrain
                             tp.BlurPasses    = incl.BlurPasses;
                             tp.PeronaK       = incl.PeronaK;
                             tp.PeronaLambda  = incl.PeronaLambda;
+                            tp.ExtendUp      = incl.ExtendUp;
                         }
                         else Log.LogWarning($"[ProceduralTerrain] Profile '{name}': include '{v.Trim()}' not found.");
                         break;
@@ -199,6 +200,7 @@ namespace ProceduralTerrain
                             case "blur_passes":   tp.BlurPasses   = fv; break;
                             case "perona_k":      tp.PeronaK      = fv; break;
                             case "perona_lambda": tp.PeronaLambda = fv; break;
+                            case "extendup":      tp.ExtendUp     = fv; break;
                         }
                         break;
                 }
@@ -557,6 +559,7 @@ namespace ProceduralTerrain
             acc.perona_lambda += w * prof.perona_lambda;
             acc.floorDepth    += w * prof.floorDepth;
             acc.floorFade     += w * prof.floorFade;
+            acc.extendUp      += w * prof.extendUp;
         }
 
         static void NormalizeProfile(ref CaveProfile p, float totW)
@@ -568,6 +571,7 @@ namespace ProceduralTerrain
             p.perona_lambda *= rcp;
             p.floorDepth    *= rcp;
             p.floorFade      = Mathf.Min(p.floorFade * rcp, p.floorDepth);
+            p.extendUp      *= rcp;
         }
 
         // ── voxcaves_probe: biome blend breakdown logged to console ──────────────────

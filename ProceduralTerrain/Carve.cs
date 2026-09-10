@@ -100,9 +100,12 @@ namespace ProceduralTerrain
             int hiMargin = 24, loMargin = 24;
             {
                 float maxExtM = 0f, maxFloor = 0f;
-                // Floor margin from blended profile-level params
+                // Floor + extendUp margins from blended profile-level params (per-zone, per-biome)
                 for (int i = 0; i < cw4Early * cw4Early && _blendedProfs != null && i < _blendedProfs.Length; i++)
+                {
                     if (_blendedProfs[i].floorDepth > maxFloor) maxFloor = _blendedProfs[i].floorDepth;
+                    if (_blendedProfs[i].extendUp  > maxExtM)  maxExtM  = _blendedProfs[i].extendUp;
+                }
                 // Height extension from pipeline Mode C params (worst case)
                 foreach (var mode in _pipeline)
                 {
@@ -112,8 +115,6 @@ namespace ProceduralTerrain
                         float e = Mathf.Max(0f, 1f - mc.Threshold) * a + mc.WarpAmp;
                         if (e > maxExtM) maxExtM = e;
                     }
-                    else if (mode is LuaModeDef lm && lm.ExtendUp > maxExtM)
-                        maxExtM = lm.ExtendUp;
                 }
                 if (maxExtM  > 0f) hiMargin = Mathf.Max(24, (int)Mathf.Ceil(maxExtM  / s) + 8);
                 if (maxFloor > 0f) loMargin = Mathf.Max(24, (int)Mathf.Ceil(maxFloor / s) + 4);
@@ -702,7 +703,10 @@ namespace ProceduralTerrain
                 float maxExtM = 0f, maxFloor = 0f;
                 int nb2 = cw4 * cw4;
                 for (int i = 0; i < nb2 && _blendedProfs != null && i < _blendedProfs.Length; i++)
+                {
                     if (_blendedProfs[i].floorDepth > maxFloor) maxFloor = _blendedProfs[i].floorDepth;
+                    if (_blendedProfs[i].extendUp  > maxExtM)  maxExtM  = _blendedProfs[i].extendUp;
+                }
                 foreach (var mode in _pipeline)
                 {
                     if (mode is ModeCDef mc)
@@ -711,8 +715,6 @@ namespace ProceduralTerrain
                         float e = Mathf.Max(0f, 1f - mc.Threshold) * a + mc.WarpAmp;
                         if (e > maxExtM) maxExtM = e;
                     }
-                    else if (mode is LuaModeDef lm && lm.ExtendUp > maxExtM)
-                        maxExtM = lm.ExtendUp;
                 }
                 if (maxExtM  > 0f) hiMargin = Mathf.Max(24, (int)Mathf.Ceil(maxExtM  / s) + 8);
                 if (maxFloor > 0f) loMargin = Mathf.Max(24, (int)Mathf.Ceil(maxFloor / s) + 4);

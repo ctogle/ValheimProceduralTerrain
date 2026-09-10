@@ -426,19 +426,6 @@ namespace ProceduralTerrain
             }
         }
 
-        // Optional cfg param: how many world units above vanilla terrain this mode may raise
-        // the surface. Feeds the bake's vertical window (hiMargin) so tall raised features
-        // aren't clipped at the default ceiling. 0 = no extra extent.
-        public float ExtendUp
-        {
-            get
-            {
-                for (int i = 0; i < _dynParamNames.Length; i++)
-                    if (_dynParamNames[i] == "extendup") return _dynDefaults[i];
-                return 0f;
-            }
-        }
-
         // Called from ParseModeDefinition after all fields are set.
         public void SetDynParams(List<(string name, float def)> plist)
         {
@@ -605,6 +592,7 @@ namespace ProceduralTerrain
         public float        BlurPasses   = 0f;
         public float        PeronaK      = 0f;
         public float        PeronaLambda = 0.1f;
+        public float        ExtendUp     = 0f;
 
         // Build the internal CaveProfile from profile-level params only.
         public CaveProfile ToCaveProfile(Dictionary<string, ModeDefinition> modes)
@@ -614,7 +602,8 @@ namespace ProceduralTerrain
                 floorFade    = FloorFade,
                 blur_passes  = BlurPasses,
                 perona_k     = PeronaK,
-                perona_lambda = PeronaLambda
+                perona_lambda = PeronaLambda,
+                extendUp     = ExtendUp
             };
         }
 
@@ -629,6 +618,7 @@ namespace ProceduralTerrain
         public float perona_lambda;    // PM diffusion rate per iteration (must be < 1/6; default 0.1)
         public float floorDepth;       // metres below terrain surface where carving stops
         public float floorFade;        // metres above floorY over which carving tapers to zero (0=hard stop)
+        public float extendUp;         // metres above terrain the profile may raise features (bake vertical window)
 
         public static readonly CaveProfile Default = new CaveProfile
         {
@@ -637,6 +627,7 @@ namespace ProceduralTerrain
             perona_lambda = 0.1f,
             floorDepth    = 8f,
             floorFade     = 0f,
+            extendUp      = 0f,
         };
     }
 
