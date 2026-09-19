@@ -217,6 +217,7 @@ namespace ProceduralTerrain
                 mode.WarmPool(threads);
 
             _parallelBakeActive = true;
+            Plugin._phaseLogRemaining = 12;
             try
             {
                 System.Threading.Tasks.Parallel.ForEach(toCarve,
@@ -224,9 +225,14 @@ namespace ProceduralTerrain
                     zone =>
                     {
                         var (zox, zoz) = zone;
+                        var swZ = System.Diagnostics.Stopwatch.StartNew();
                         var (yLo, yHi) = ComputeYBounds(zox, zoz, zoneW, s, wg);
+                        long tYB = swZ.ElapsedMilliseconds;
                         Carve(null, zox, zoz, zoneW, yLo, yHi);
+                        long tCarve = swZ.ElapsedMilliseconds - tYB;
                         int n = System.Threading.Interlocked.Increment(ref doneCount);
+                        if (n <= 12)
+                            Log.LogInfo($"[PT-baketime] zone ({zox},{zoz}) bh={yHi - yLo} yBounds={tYB}ms carve={tCarve}ms");
                         Plugin._bakeProgressDone = n;
                         if (n % 50 == 0 || n == toCarve.Count)
                         {

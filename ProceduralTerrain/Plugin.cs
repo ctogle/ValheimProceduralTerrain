@@ -405,8 +405,25 @@ namespace ProceduralTerrain
         public string Blend    = "min";
         public float  BlendK   = 2f;
 
-        // Pool stores (Script, pre-allocated params Table) pairs to avoid per-cell allocation.
-        System.Collections.Concurrent.ConcurrentBag<(MoonSharp.Interpreter.Script s, MoonSharp.Interpreter.Table p)>? _scriptPool;
+        // Pool entry: a Script plus its reusable params table and output buffer. Reused per BakeCell so
+        // the hot path allocates nothing — the output column is written into a CLR float[] (wrapped as
+        // MoonSharp userdata) instead of a fresh per-call table, which was the bake's dominant GC source.
+        internal sealed class LuaEntry
+        {
+            public MoonSharp.Interpreter.Script s = null!;
+            public MoonSharp.Interpreter.Table  p = null!;
+            public float[]  outBuf = System.Array.Empty<float>();
+            public MoonSharp.Interpreter.DynValue outUD = MoonSharp.Interpreter.DynValue.Nil;
+        }
+
+        static LuaModeDef()
+        {
+            // float[] element get/set from Lua (0-based) — lets bake() write its column into a shared buffer.
+            if (!MoonSharp.Interpreter.UserData.IsTypeRegistered(typeof(float[])))
+                MoonSharp.Interpreter.UserData.RegisterType<float[]>();
+        }
+
+        System.Collections.Concurrent.ConcurrentBag<LuaEntry>? _scriptPool;
         string? _luaSrc;
         string[] _dynParamNames  = Array.Empty<string>();
         float[]  _dynDefaults    = Array.Empty<float>();
@@ -438,7 +455,7 @@ namespace ProceduralTerrain
             }
         }
 
-        (MoonSharp.Interpreter.Script s, MoonSharp.Interpreter.Table p) CreateEntry()
+        LuaEntry CreateEntry()
         {
             var s = new MoonSharp.Interpreter.Script(MoonSharp.Interpreter.CoreModules.Preset_HardSandbox);
             int nc = Plugin._noiseCount;
@@ -454,18 +471,20 @@ namespace ProceduralTerrain
             s.Globals["terrain_h"]  = (Func<float,float,float>)((x, z) =>
                 WorldGenerator.instance?.GetHeight(x, z) ?? 0f);
             s.DoString(_luaSrc!);
+            // Diagnostic: override the CLR noise callbacks with pure-Lua zero stubs (no marshalling).
+            if (Plugin._probeLuaNoiseZero)
+                s.DoString("for i=1,16 do _G['n'..i]=function(a,b,c) return 0 end end");
             // Pre-allocate params table — reused each BakeCell, values updated in place.
-            var p = new MoonSharp.Interpreter.Table(s);
-            return (s, p);
+            return new LuaEntry { s = s, p = new MoonSharp.Interpreter.Table(s) };
         }
 
-        (MoonSharp.Interpreter.Script s, MoonSharp.Interpreter.Table p) RentEntry()
+        LuaEntry RentEntry()
         {
             if (_scriptPool != null && _scriptPool.TryTake(out var e)) return e;
             return CreateEntry();
         }
 
-        void ReturnEntry((MoonSharp.Interpreter.Script s, MoonSharp.Interpreter.Table p) e) => _scriptPool?.Add(e);
+        void ReturnEntry(LuaEntry e) => _scriptPool?.Add(e);
 
         public void WarmPool(int count)
         {
@@ -488,7 +507,7 @@ namespace ProceduralTerrain
                 _luaSrc = System.IO.File.ReadAllText(FilePath);
                 // Create one entry eagerly to validate the source; pool is pre-seeded with it.
                 var first = CreateEntry();
-                _scriptPool = new System.Collections.Concurrent.ConcurrentBag<(MoonSharp.Interpreter.Script, MoonSharp.Interpreter.Table)>();
+                _scriptPool = new System.Collections.Concurrent.ConcurrentBag<LuaEntry>();
                 _scriptPool.Add(first);
                 Plugin.Log.LogInfo($"[ProceduralTerrain] LuaMode '{Name}': loaded {FilePath}");
             }
@@ -515,7 +534,7 @@ namespace ProceduralTerrain
             float amp = cb.bkModeParams![pi][0][args.cellIdx];
             int baseIdx = args.cellIdx * args.bh;
             float[]? auxBuf = cb.bkModeAux![pi][0];
-            if (amp <= 0f)
+            if (amp <= 0f || Plugin._probeLuaSkip)
             {
                 for (int cy = 0; cy < args.bh; cy++) auxBuf![baseIdx + cy] = 0f;
                 return;
@@ -526,27 +545,43 @@ namespace ProceduralTerrain
             (float dirx, float dirz, float mag) = wg2 != null
                 ? Plugin.ZoneGradCache.Sample(wg2, args.worldX, args.worldZ, GradBlurRadius)
                 : (0f, 0f, 0f);
+            // Standardized per-column inputs computed once in C# and injected, so lua modes never
+            // recompute them via per-call interop (terrain_h) — grad already here; add base height.
+            float th0 = wg2 != null ? wg2.GetHeight(args.worldX, args.worldZ) : 0f;
 
-            var (s, p) = RentEntry();
+            Plugin._luaCallsThisCarve++;
+            var e = RentEntry();
+            var s = e.s; var p = e.p;
             try
             {
                 // Mutate pre-allocated params table in place — avoids per-cell Table allocation.
                 for (int i = 0; i < _dynParamNames.Length; i++)
                     p[_dynParamNames[i]] = (double)cb.bkModeParams![pi][i][idx];
-                p["grad_dirx"] = (double)dirx;
-                p["grad_dirz"] = (double)dirz;
-                p["grad_mag"]  = (double)mag;
+                p["grad_dirx"]   = (double)dirx;
+                p["grad_dirz"]   = (double)dirz;
+                p["grad_mag"]    = (double)mag;
+                p["terrain_h0"]  = (double)th0;
 
-                var res = s.Call(s.Globals["bake"], args.worldX, args.worldZ, p, args.extLoS, (double)args.s, args.bh);
+                // Reusable CLR output buffer (wrapped as userdata) — bake() writes its column into this
+                // (0-based) instead of returning a fresh table, so the hot path allocates nothing.
+                if (e.outBuf.Length < args.bh)
+                {
+                    e.outBuf = new float[args.bh];
+                    e.outUD  = MoonSharp.Interpreter.UserData.Create(e.outBuf);
+                }
+
+                var res = s.Call(s.Globals["bake"], args.worldX, args.worldZ, p, args.extLoS, (double)args.s, args.bh, e.outUD);
+
+                // Buffer-write modes return nil; legacy modes still return a table (read that instead).
                 var tbl = res.Table;
                 if (tbl != null)
                     for (int cy = 0; cy < args.bh; cy++)
                         auxBuf![baseIdx + cy] = (float)(tbl.Get(cy + 1).CastToNumber() ?? 0.0);
                 else
-                    for (int cy = 0; cy < args.bh; cy++) auxBuf![baseIdx + cy] = 0f;
+                    for (int cy = 0; cy < args.bh; cy++) auxBuf![baseIdx + cy] = e.outBuf[cy];
             }
             catch { for (int cy = 0; cy < args.bh; cy++) auxBuf![baseIdx + cy] = 0f; }
-            finally { ReturnEntry((s, p)); }
+            finally { ReturnEntry(e); }
         }
 
         public override void PrepareColumn(ref CarveBuffers cb, in ColumnCtx col)
@@ -802,6 +837,20 @@ namespace ProceduralTerrain
 
         // Set true during parallel bake to suppress main-thread-only side effects.
         static volatile bool _parallelBakeActive;
+
+        // Phase-timing log budget: >=0 => log a [PT-phase] breakdown for this carve. Reset at bake start.
+        internal static int _phaseLogRemaining = 0;
+
+        // Per-carve MoonSharp bake() invocation count (past the amp<=0 early-out) — allocation probe.
+        [ThreadStatic] internal static long _luaCallsThisCarve;
+
+        // Diagnostic: skip the MoonSharp s.Call + result-table read in BakeCell (fill zeros), to isolate
+        // whether the per-cell Lua marshalling is the bake's garbage source. Terrain is wrong while set.
+        internal static volatile bool _probeLuaSkip;
+
+        // Diagnostic: bind n1..n8 to pure-Lua zero stubs (no CLR boundary) to isolate whether the
+        // per-voxel noise callback interop is the garbage source vs MoonSharp's inherent per-op cost.
+        internal static volatile bool _probeLuaNoiseZero;
 
         // CR reconstruction temp buffers — main thread only, not [ThreadStatic].
         static float[] _crTemp1 = new float[72 * 150 * 36]; // [bw * nsy * nsz]
@@ -1175,13 +1224,14 @@ namespace ProceduralTerrain
                 RecarveAll();
             }
 
-            // Fast-poll while waiting for location data (zone modifications are deferred
-            // until locations are known), then settle to a slow poll for config changes.
+            // Fast-poll while waiting for locations to finish generating (the time-sliced coroutine
+            // fills them over several frames); BuildLocationCache no-ops until ZoneSystem reports
+            // LocationsGenerated, then caches once. Settle to a slow poll for config changes after.
             int pollEvery = _locationsCached ? 300 : 10;
             if (++_pollFrame % pollEvery != 0) return;
 
             if (!_locationsCached)
-                BuildLocationCache(); // sets _hotReloadPending → RecarveAll once locations arrive
+                BuildLocationCache(); // caches once LocationsGenerated; sets _hotReloadPending → RecarveAll
 
             var t    = File.GetLastWriteTimeUtc(ConfigPath);
             var tLua = LatestLuaWrite();

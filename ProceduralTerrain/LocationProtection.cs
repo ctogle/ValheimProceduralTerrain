@@ -38,9 +38,19 @@ namespace ProceduralTerrain
             return result;
         }
 
+        // Build the full location set once, gated on ZoneSystem's own completion flag. Location
+        // generation runs as a time-sliced coroutine (GenerateLocationsTimeSliced), so m_locationInstances
+        // fills incrementally over several frames — reading it early caught a partial set (the "8") and
+        // stranded every later location, nearby villages/houses included, outside protection while spawn
+        // (generated first) looked fine. LocationsGenerated flips true only when that coroutine finishes,
+        // which is exactly what the game itself gates on, so it's the authoritative "all locations in"
+        // signal — no fixed delay, no count-stability guessing.
         static void BuildLocationCache()
         {
             if (_locationsCached) return;
+            var zs = ZoneSystem.instance;
+            if (zs == null || !zs.LocationsGenerated) return;
+
             var entries = ReadLocationInstances();
             if (entries.Count == 0) return;
             _locationPositions.Clear();
