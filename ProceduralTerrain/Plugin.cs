@@ -774,6 +774,10 @@ namespace ProceduralTerrain
         // Layout: data[(ci * bh + cy) * width + ri]  (ci=zoneX, ri=zoneZ, cy=Y-extLo)
         internal static readonly System.Collections.Concurrent.ConcurrentDictionary<string, (int extLo, int bh, int width, sbyte[] data)> _sdfCache = new();
 
+        // Zones whose SDF has already been carved with location groundwork baked in. Used to drop a
+        // stale (mod-less/early) cache entry once, so the zone re-carves with the edits applied.
+        internal static readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> _groundworkedZones = new();
+
         // Per-zone surface height cache: filled after Phase 2, queried by GetWorldHeight patch.
         // Layout: surfH[cx * bw + cz] = world-Y of topmost solid voxel (NaN = no solid in column).
         // Includes overlap region so border columns near zone edges are correct.
