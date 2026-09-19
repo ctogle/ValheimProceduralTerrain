@@ -51,6 +51,32 @@ namespace ProceduralTerrain
             Log.LogInfo($"[ProceduralTerrain] Location cache built: {_locationPositions.Count} location(s) loaded.");
         }
 
+        // Protection radius for a location = max(exteriorRadius, LocProtectR, reach of its own
+        // terrain modifiers). Ties the fully-damped inner radius to what the location actually edits
+        // (level/smooth/paint footprints can extend past m_exteriorRadius), so PT stays out of the
+        // whole edited area, not just the nominal exterior circle.
+        static float LocProtectRadius(Vector2 pos, float extR)
+        {
+            float r = Mathf.Max(extR, LocProtectR);
+            var mods = TerrainModifier.GetAllInstances();
+            for (int i = 0; i < mods.Count; i++)
+            {
+                var tm = mods[i];
+                if (tm == null) continue;
+                var p = tm.transform.position;
+                float dx = p.x - pos.x, dz = p.z - pos.y;
+                float d = Mathf.Sqrt(dx * dx + dz * dz);
+                float mr = tm.GetRadius();
+                // only count modifiers belonging to (overlapping) this location's footprint
+                if (d <= r + mr + 4f)
+                {
+                    float reach = d + mr;
+                    if (reach > r) r = reach;
+                }
+            }
+            return r;
+        }
+
         static float LocFactor((Vector2 pos, float extR) loc, float worldX, float worldZ)
         {
             float dx = worldX - loc.pos.x, dz = worldZ - loc.pos.y;

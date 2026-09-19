@@ -94,7 +94,7 @@ namespace ProceduralTerrain
                 float dx = loc.pos.x - zoneX, dz = loc.pos.y - zoneZ;
                 float locSearchR = Mathf.Max(loc.extR, LocProtectR) + LocFadeR;
                 if (dx * dx + dz * dz < (searchR + locSearchR) * (searchR + locSearchR))
-                    nearbyLocs.Add(loc);
+                    nearbyLocs.Add((loc.pos, LocProtectRadius(loc.pos, loc.extR)));
             }
 
             int hiMargin = 24, loMargin = 24;
@@ -738,7 +738,7 @@ namespace ProceduralTerrain
             {
                 float dx = loc.pos.x - zoneX, dz = loc.pos.y - zoneZ;
                 float locSearchR = Mathf.Max(loc.extR, LocProtectR) + LocFadeR;
-                if (dx * dx + dz * dz < (searchR + locSearchR) * (searchR + locSearchR)) nearby.Add(loc);
+                if (dx * dx + dz * dz < (searchR + locSearchR) * (searchR + locSearchR)) nearby.Add((loc.pos, LocProtectRadius(loc.pos, loc.extR)));
             }
 
             BakeSdfSetup(ox, oz, overlap, s, extLo, bhZ, bwZ, cw4, wg, nearby);
