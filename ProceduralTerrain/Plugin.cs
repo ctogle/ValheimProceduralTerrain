@@ -40,19 +40,27 @@ namespace ProceduralTerrain
 
     // Per-column state for each pipeline mode — [ThreadStatic] field lives in Plugin class below.
     internal struct ModeColCtx {
-        public float colAmp;              // used by all modes (guard check)
-        public float bfx, bfz;           // BL fractions (A, C, Lua)
-        public int b00, b10, b01, b11, bh; // BL3Y corner indices (A, C, Lua)
-        public float[]? arr0, arr1, arr2; // aux array refs (A: tun/tun2/wBuf, C: noiseBuf, Lua: auxBuf)
-        public float f0, f1, f2, f3, f4, f5; // mode-specific floats
+        public float colAmp;                 // interpolated amplitude gate (0 => mode inactive this column)
+        public float bfx, bfz;               // BL fractions
+        public int   b00, b10, b01, b11, bh; // BL3Y corner indices
+        public float[]? arr0;                // finished SDF column aux buffer
     }
 
     // ── Abstract ModeDefinition ───────────────────────────────────────────────
 
+    // ── Single-method mode contract ───────────────────────────────────────────
+    // A mode (Lua or native C#) implements exactly ONE thing: BakeColumn — given a coarse
+    // cell (worldX,worldZ), its blended params, and the vertical window (extLoS,s,bh), write bh
+    // finished SDF values into its aux buffer [pi][0]. The framework owns everything else
+    // identically for every mode: coarse-grid evaluation, param blending, trilinear interpolation
+    // to full resolution, the floor clamp, and the blend op. This is what makes Lua↔C# a 1:1 port
+    // and makes duplication/drift structurally impossible — the shared machinery lives here once.
     internal abstract class ModeDefinition {
         public string Name = "";
-        public float Amplitude;
-        public int PipelineIndex = -1;
+        public float  Amplitude;
+        public int    PipelineIndex = -1;
+        public string Blend  = "min";   // min | max | smoothmax
+        public float  BlendK = 2f;      // smoothmax join width
 
         public virtual bool NeedsGradField => false;
         public virtual float GradBlurRadius => 128f;
@@ -74,326 +82,44 @@ namespace ProceduralTerrain
                 result[pi] = acc[pi] * (pi == 0 ? rcpTotal : rcpPresent);
         }
 
-        // Allocate this mode's aux arrays in CarveBuffers before the bake cell loop.
-        public virtual void BakeBegin(ref CarveBuffers cb, int cellCount, int bh, int cw4) {}
-
-        // Fill this mode's baked data for one coarse cell.
-        public abstract void BakeCell(ref CarveBuffers cb, in BakeCellArgs args);
-
-        // Compute column-level intermediates; store them as instance fields.
-        public virtual void PrepareColumn(ref CarveBuffers cb, in ColumnCtx col) {}
-
-        // Apply this mode's SDF contribution to `combined`.
-        public abstract void ComputeVoxel(ref float combined, in VoxelCtx ctx);
-    }
-
-    // ── Mode A: noise tunnel network ──────────────────────────────────────────
-
-    internal sealed class ModeADef : ModeDefinition
-    {
-        public float Frequency = 0.015f, WarpAmp = 10f, WarpAmpY = 0f, WarpFrequency = 0.04f;
-        public float VScale = 0.35f, WidthVary = 0f, WidthFrequency = 0.003f, YOffset = 0f;
-
-        // Param indices: 0=amplitude 1=frequency 2=warpAmp 3=warpAmpY 4=warpFrequency 5=vScale 6=widthVary 7=widthFrequency 8=yOffset
-        static readonly string[] _paramNames = { "amplitude","frequency","warpamp","warpampy","warpfrequency","vscale","widthvary","widthfrequency","yoffset" };
-        public override int ParamCount => 9;
-        public override string[] ParamNames => _paramNames;
-        public override float GetDefaultParam(int i) => i switch {
-            0 => Amplitude, 1 => Frequency, 2 => WarpAmp, 3 => WarpAmpY, 4 => WarpFrequency,
-            5 => VScale, 6 => WidthVary, 7 => WidthFrequency, 8 => YOffset, _ => 0f };
-
-
-        public override void BakeBegin(ref CarveBuffers cb, int cellCount, int bh, int cw4)
+        // Allocate this mode's aux buffer: one column-array of cellCount*bh finished SDF values.
+        // Modes that need scratch may override to allocate more slots, but slot 0 is the output.
+        public virtual void BakeBegin(ref CarveBuffers cb, int cellCount, int bh, int cw4)
         {
-            int pi = PipelineIndex;
-            Plugin.EnsureAuxSlots(ref cb, pi, 3);
-            int n4 = cellCount * bh;
-            Plugin.EnsureArr(ref cb.bkModeAux![pi][0], n4);
-            Plugin.EnsureArr(ref cb.bkModeAux![pi][1], n4);
-            Plugin.EnsureArr(ref cb.bkModeAux![pi][2], n4);
+            Plugin.EnsureAuxSlots(ref cb, PipelineIndex, 1);
+            Plugin.EnsureArr(ref cb.bkModeAux![PipelineIndex][0], cellCount * bh);
         }
 
-        public override void BakeCell(ref CarveBuffers cb, in BakeCellArgs args)
-        {
-            int pi = PipelineIndex;
-            float[]? tun  = cb.bkModeAux![pi][0];
-            float[]? tun2 = cb.bkModeAux![pi][1];
-            float[]? wBuf = cb.bkModeAux![pi][2];
-            float amp = cb.bkModeParams![pi][0][args.cellIdx];
-            int baseIdx = args.cellIdx * args.bh;
-            if (amp <= 0f)
-            {
-                for (int cy = 0; cy < args.bh; cy++) { tun![baseIdx+cy]=0f; tun2![baseIdx+cy]=0f; wBuf![baseIdx+cy]=0f; }
-                return;
-            }
-            float mawf = cb.bkModeParams![pi][4][args.cellIdx]; // warpFrequency
-            float mawa = cb.bkModeParams![pi][2][args.cellIdx]; // warpAmp
-            float maf  = cb.bkModeParams![pi][1][args.cellIdx]; // frequency
-            float mavs = cb.bkModeParams![pi][5][args.cellIdx]; // vScale
-            float mawvf= cb.bkModeParams![pi][7][args.cellIdx]; // widthFrequency
-            float mayo = cb.bkModeParams![pi][8][args.cellIdx]; // yOffset
-            float addHA = mayo > 0f ? args.wg.GetHeight(args.worldX, args.worldZ) : 0f;
-            float s = args.s;
-            for (int cy = 0; cy < args.bh; cy++)
-            {
-                float sy4 = (args.extLoS + cy * s - addHA + mayo) * mavs;
-                float awx4  = Plugin._warpX! .GetNoise(args.worldX * mawf, sy4 * mawf, args.worldZ * mawf) * mawa;
-                float awz4  = Plugin._warpZ! .GetNoise(args.worldX * mawf, sy4 * mawf, args.worldZ * mawf) * mawa;
-                float awx4b = Plugin._warpX2!.GetNoise(args.worldX * mawf, sy4 * mawf, args.worldZ * mawf) * mawa;
-                float awz4b = Plugin._warpZ2!.GetNoise(args.worldX * mawf, sy4 * mawf, args.worldZ * mawf) * mawa;
-                tun! [baseIdx + cy] = Plugin._noisePool![0].GetNoise((args.worldX + awx4)  * maf, sy4 * maf, (args.worldZ + awz4)  * maf);
-                tun2![baseIdx + cy] = Plugin._noisePool![1].GetNoise((args.worldX + awx4b) * maf, sy4 * maf, (args.worldZ + awz4b) * maf);
-                wBuf![baseIdx + cy] = Plugin._noisePool![2].GetNoise(args.worldX * mawvf, sy4 * mawvf, args.worldZ * mawvf);
-            }
-        }
+        // THE per-mode method: fill this cell's finished SDF column into aux[pi][0] at
+        // [cellIdx*bh .. +bh). worldX/worldZ = coarse cell centre; blended params in cb.bkModeParams.
+        public abstract void BakeColumn(ref CarveBuffers cb, in BakeCellArgs args);
 
-        public override void PrepareColumn(ref CarveBuffers cb, in ColumnCtx col)
+        // ── Generic framework interpolation + floor + blend (shared by every mode) ────────────
+        // Set up the column: interpolated amplitude gate + BL3Y corner indices + the aux ref.
+        public void PrepareColumn(ref CarveBuffers cb, in ColumnCtx col)
         {
-            int pi = PipelineIndex;
-            ref var c = ref Plugin._modeColCtx![pi];
-            c.colAmp = Plugin.BL(cb.bkModeParams![pi][0], col.b200, col.b210, col.b201, col.b211, col.bfx, col.bfz);
+            ref var c = ref Plugin._modeColCtx![PipelineIndex];
+            c.colAmp = Plugin.BL(cb.bkModeParams![PipelineIndex][0], col.b200, col.b210, col.b201, col.b211, col.bfx, col.bfz);
             if (c.colAmp <= 0f) return;
-            c.f0 = Plugin.BL(cb.bkModeParams![pi][6], col.b200, col.b210, col.b201, col.b211, col.bfx, col.bfz); // widthVary
             c.bfx = col.bfx; c.bfz = col.bfz;
             c.b00 = col.b3_00; c.b10 = col.b3_10; c.b01 = col.b3_01; c.b11 = col.b3_11; c.bh = col.bh;
-            c.arr0 = cb.bkModeAux![pi][0];
-            c.arr1 = cb.bkModeAux![pi][1];
-            c.arr2 = cb.bkModeAux![pi][2];
+            c.arr0 = cb.bkModeAux![PipelineIndex][0];
         }
 
-        public override void ComputeVoxel(ref float combined, in VoxelCtx ctx)
+        // Interpolate the finished SDF column to this voxel, clamp to the floor, and blend in.
+        public void ComputeVoxel(ref float combined, in VoxelCtx ctx)
         {
             ref var c = ref Plugin._modeColCtx![PipelineIndex];
-            if (c.colAmp <= 0f) return;
-            int cy = ctx.cy;
-            float na = Plugin.BL3Y(c.arr0!, c.b00, c.b10, c.b01, c.b11, cy, c.bfx, c.bfz);
-            float nb = Plugin.BL3Y(c.arr1!, c.b00, c.b10, c.b01, c.b11, cy, c.bfx, c.bfz);
-            float wn = Plugin.BL3Y(c.arr2!, c.b00, c.b10, c.b01, c.b11, cy, c.bfx, c.bfz);
-            float localWidth = Mathf.Max(c.colAmp * (1f + c.f0 * wn), 0.001f);
-            float dist       = Mathf.Sqrt(na * na + nb * nb) * 0.7071f;
-            float s          = Plugin._scale ?? 1f;
-            float tunnelSDF  = (localWidth - dist) / localWidth * 4f * s;
-            float sdf        = Mathf.Min(tunnelSDF, ctx.worldY - ctx.floorY);
-            combined = Plugin.SmoothMax(combined, sdf, 2f * s);
-        }
-    }
-
-    // ── Mode B: warped-heightmap carved band ──────────────────────────────────
-
-    internal sealed class ModeBDef : ModeDefinition
-    {
-        public float WarpAmp = 80f, WarpFrequency = 0.005f, VScale = 0.5f;
-        public float NoiseAmp = 0f, YOffset = 0f, Twist = 0f;
-
-        // Param indices: 0=amplitude 1=warpAmp 2=warpFrequency 3=vScale 4=noiseAmp 5=yOffset 6=twist
-        static readonly string[] _paramNames = { "amplitude","warpamp","warpfrequency","vscale","noiseamp","yoffset","twist" };
-        public override int ParamCount => 7;
-        public override string[] ParamNames => _paramNames;
-        public override float GetDefaultParam(int i) => i switch {
-            0 => Amplitude, 1 => WarpAmp, 2 => WarpFrequency, 3 => VScale,
-            4 => NoiseAmp, 5 => YOffset, 6 => Twist, _ => 0f };
-
-
-        public override void BakeCell(ref CarveBuffers cb, in BakeCellArgs args)
-        {
-            // All params already set by BakeBlendedProfiles into bkModeParams
-        }
-
-        public override void PrepareColumn(ref CarveBuffers cb, in ColumnCtx col)
-        {
-            int pi = PipelineIndex;
-            ref var c = ref Plugin._modeColCtx![pi];
-            c.colAmp = Plugin.BL(cb.bkModeParams![pi][0], col.b200, col.b210, col.b201, col.b211, col.bfx, col.bfz);
-            if (c.colAmp <= 0f) return;
-            c.f0 = cb.bkWarpedH![col.cx * col.bw + col.cz];                                                                    // warpedH
-            c.f1 = Plugin.BL(cb.bkModeParams![pi][4], col.b200, col.b210, col.b201, col.b211, col.bfx, col.bfz);              // noiseAmp
-            c.f2 = Plugin.BL(cb.bkModeParams![pi][3], col.b200, col.b210, col.b201, col.b211, col.bfx, col.bfz);              // vScale
-            c.f3 = Plugin.BL(cb.bkModeParams![pi][2], col.b200, col.b210, col.b201, col.b211, col.bfx, col.bfz);              // warpFreq
-            c.f4 = Plugin.BL(cb.bkModeParams![pi][6], col.b200, col.b210, col.b201, col.b211, col.bfx, col.bfz);              // twist
-        }
-
-        public override void ComputeVoxel(ref float combined, in VoxelCtx ctx)
-        {
-            ref var c = ref Plugin._modeColCtx![PipelineIndex];
-            if (c.colAmp <= 0f) return;
-            float worldY = ctx.worldY;
-            float bandSDF = c.colAmp - Mathf.Abs(worldY - c.f0);
-            if (c.f1 > 0f)
+            if (c.colAmp <= 0f || c.arr0 == null) return;
+            float scale = Plugin._scale ?? 1f;
+            float raw   = Plugin.BL3Y(c.arr0, c.b00, c.b10, c.b01, c.b11, ctx.cy, c.bfx, c.bfz) * scale;
+            float sdf   = Mathf.Min(raw, ctx.worldY - ctx.floorY);
+            switch (Blend)
             {
-                float sy = worldY * c.f2;
-                float nx = ctx.worldX, nz = ctx.worldZ;
-                if (c.f4 != 0f)
-                {
-                    float ang = worldY * c.f4;
-                    float cs = Mathf.Cos(ang), ss = Mathf.Sin(ang);
-                    nx = ctx.worldX * cs - ctx.worldZ * ss;
-                    nz = ctx.worldX * ss + ctx.worldZ * cs;
-                }
-                bandSDF += Plugin._noisePool![8].GetNoise(nx * c.f3, sy * c.f3, nz * c.f3) * c.f1;
+                case "smoothmax": combined = Plugin.SmoothMax(combined, sdf, BlendK * scale); break;
+                case "max":       if (sdf > combined) combined = sdf; break;
+                default:          if (sdf < combined) combined = sdf; break; // "min"
             }
-            float fd  = worldY - ctx.floorY;
-            float sdf = bandSDF < fd ? bandSDF : fd;
-            if (sdf > combined) combined = sdf;
-        }
-    }
-
-    // ── Mode C: 3D density field above heightmap ──────────────────────────────
-
-    internal sealed class ModeCDef : ModeDefinition
-    {
-        public float Threshold = 0f, Frequency = 0.015f, WarpAmp = 8f, WarpFrequency = 0.005f;
-        public float VScale = 0.4f, Twist = 0f, TwistVary = 0f, TwistFrequency = 0.003f;
-        public float AmpVary = 0f, AmpFrequency = 0.003f, Flare = 0f, YOffset = 0f;
-
-        // Param indices: 0=amplitude 1=threshold 2=frequency 3=warpAmp 4=warpFrequency 5=vScale
-        //                6=twist 7=twistVary 8=twistFrequency 9=ampVary 10=ampFrequency 11=flare 12=yOffset
-        static readonly string[] _paramNames = { "amplitude","threshold","frequency","warpamp","warpfrequency","vscale",
-            "twist","twistvary","twistfrequency","ampvary","ampfrequency","flare","yoffset" };
-        public override int ParamCount => 13;
-        public override string[] ParamNames => _paramNames;
-        public override float GetDefaultParam(int i) => i switch {
-            0 => Amplitude, 1 => Threshold, 2 => Frequency, 3 => WarpAmp, 4 => WarpFrequency,
-            5 => VScale, 6 => Twist, 7 => TwistVary, 8 => TwistFrequency,
-            9 => AmpVary, 10 => AmpFrequency, 11 => Flare, 12 => YOffset, _ => 0f };
-
-
-        public override void BakeBegin(ref CarveBuffers cb, int cellCount, int bh, int cw4)
-        {
-            int pi = PipelineIndex;
-            Plugin.EnsureAuxSlots(ref cb, pi, 3);
-            Plugin.EnsureArr(ref cb.bkModeAux![pi][0], cellCount);      // addH
-            Plugin.EnsureArr(ref cb.bkModeAux![pi][1], cellCount);      // lAmp
-            Plugin.EnsureArr(ref cb.bkModeAux![pi][2], cellCount * bh); // noiseBuf
-        }
-
-        public override void BakeCell(ref CarveBuffers cb, in BakeCellArgs args)
-        {
-            int pi = PipelineIndex;
-            float[]? addHArr   = cb.bkModeAux![pi][0];
-            float[]? lAmpArr   = cb.bkModeAux![pi][1];
-            float[]? noiseBuf  = cb.bkModeAux![pi][2];
-            float amp = cb.bkModeParams![pi][0][args.cellIdx];
-            int baseIdx = args.cellIdx * args.bh;
-            if (amp <= 0f)
-            {
-                addHArr! [args.cellIdx] = args.wg.GetHeight(args.worldX, args.worldZ);
-                lAmpArr! [args.cellIdx] = 0f;
-                for (int cy = 0; cy < args.bh; cy++) noiseBuf![baseIdx + cy] = 0f;
-                return;
-            }
-            float awf4  = cb.bkModeParams![pi][4][args.cellIdx]; // warpFrequency
-            float bwarpA= cb.bkModeParams![pi][3][args.cellIdx]; // warpAmp
-            float awx4 = Plugin._noisePool![3].GetNoise(args.worldX * awf4, args.worldZ * awf4) * bwarpA;
-            float awz4 = Plugin._noisePool![4].GetNoise(args.worldX * awf4, args.worldZ * awf4) * bwarpA;
-            float byo4  = cb.bkModeParams![pi][12][args.cellIdx]; // yOffset
-            float addH4 = args.wg.GetHeight(args.worldX + awx4, args.worldZ + awz4) - byo4;
-            float avf4  = cb.bkModeParams![pi][10][args.cellIdx]; // ampFrequency
-            float bav4  = cb.bkModeParams![pi][9][args.cellIdx];  // ampVary
-            addHArr![args.cellIdx] = addH4;
-            lAmpArr![args.cellIdx] = Mathf.Max(amp * (1f + bav4
-                * Plugin._noisePool![5].GetNoise(args.worldX * avf4, args.worldZ * avf4)), 0f);
-            float btv4  = cb.bkModeParams![pi][7][args.cellIdx];  // twistVary
-            float btf4  = cb.bkModeParams![pi][8][args.cellIdx];  // twistFrequency
-            float ts4 = 1f + btv4 * Plugin._noisePool![6].GetNoise(args.worldX * btf4, args.worldZ * btf4);
-            float af4 = cb.bkModeParams![pi][2][args.cellIdx];  // frequency
-            float vs4 = cb.bkModeParams![pi][5][args.cellIdx];  // vScale
-            float tw4 = cb.bkModeParams![pi][6][args.cellIdx];  // twist
-            float s = args.s;
-            for (int cy = 0; cy < args.bh; cy++)
-            {
-                float wy4  = args.extLoS + cy * s;
-                float sy4  = (wy4 - addH4) * vs4;
-                float ang4 = wy4 * tw4 * ts4;
-                float cos4 = Mathf.Cos(ang4), sin4 = Mathf.Sin(ang4);
-                float tx4  = args.worldX * cos4 - args.worldZ * sin4;
-                float tz4  = args.worldX * sin4 + args.worldZ * cos4;
-                noiseBuf![baseIdx + cy] = Plugin._noisePool![7].GetNoise(tx4 * af4, sy4 * af4, tz4 * af4);
-            }
-        }
-
-        public override void PrepareColumn(ref CarveBuffers cb, in ColumnCtx col)
-        {
-            int pi = PipelineIndex;
-            ref var c = ref Plugin._modeColCtx![pi];
-            c.colAmp = Plugin.BL(cb.bkModeParams![pi][0], col.b200, col.b210, col.b201, col.b211, col.bfx, col.bfz);
-            if (c.colAmp <= 0f) return;
-            c.f0 = Plugin.BL(cb.bkModeParams![pi][1],  col.b200, col.b210, col.b201, col.b211, col.bfx, col.bfz); // threshold
-            c.f1 = Plugin.BL(cb.bkModeParams![pi][11], col.b200, col.b210, col.b201, col.b211, col.bfx, col.bfz); // flare
-            c.f2 = Plugin.BL(cb.bkModeAux![pi][0], col.b200, col.b210, col.b201, col.b211, col.bfx, col.bfz);     // colAddH
-            c.f3 = Plugin.BL(cb.bkModeAux![pi][1], col.b200, col.b210, col.b201, col.b211, col.bfx, col.bfz);     // colLocalAmp
-            c.bfx = col.bfx; c.bfz = col.bfz;
-            c.b00 = col.b3_00; c.b10 = col.b3_10; c.b01 = col.b3_01; c.b11 = col.b3_11; c.bh = col.bh;
-            c.arr0 = cb.bkModeAux![pi][2];
-        }
-
-        public override void ComputeVoxel(ref float combined, in VoxelCtx ctx)
-        {
-            ref var c = ref Plugin._modeColCtx![PipelineIndex];
-            if (c.colAmp <= 0f || c.f3 <= 0f) return;
-            float n    = Plugin.BL3Y(c.arr0!, c.b00, c.b10, c.b01, c.b11, ctx.cy, c.bfx, c.bfz);
-            float relY = ctx.worldY - c.f2;
-            float ft   = Mathf.Clamp01(relY / c.f3);
-            float effT = c.f0 - c.f1 * (4f * ft * (1f - ft));
-            float sdf  = relY - (n - effT) * c.f3;
-            if (sdf < combined) combined = sdf;
-        }
-    }
-
-    // ── Mode D: coast-aligned anisotropic noise ridges ────────────────────────
-
-    internal sealed class ModeDDef : ModeDefinition
-    {
-        public float FreqT = 0.02f, FreqN = 0.02f, BlurRadius = 128f;
-        public float Alignment = 0f, VScale = 0.1f, GradFade = 0f, SeaFade = 0f;
-
-        public override bool NeedsGradField => true;
-        public override float GradBlurRadius => BlurRadius;
-
-        // Param indices: 0=amplitude 1=freqT 2=freqN 3=blurRadius 4=alignment 5=vScale 6=gradFade 7=seaFade
-        static readonly string[] _paramNames = { "amplitude","freqt","freqn","blurradius","alignment","vscale","gradfade","seafade" };
-        public override int ParamCount => 8;
-        public override string[] ParamNames => _paramNames;
-        public override float GetDefaultParam(int i) => i switch {
-            0 => Amplitude, 1 => FreqT, 2 => FreqN, 3 => BlurRadius,
-            4 => Alignment, 5 => VScale, 6 => GradFade, 7 => SeaFade, _ => 0f };
-
-
-        public override void BakeCell(ref CarveBuffers cb, in BakeCellArgs args)
-        {
-            // All params already set by BakeBlendedProfiles into bkModeParams
-        }
-
-        public override void PrepareColumn(ref CarveBuffers cb, in ColumnCtx col)
-        {
-            int pi = PipelineIndex;
-            ref var c = ref Plugin._modeColCtx![pi];
-            float mdAmp = Plugin.BL(cb.bkModeParams![pi][0], col.b200, col.b210, col.b201, col.b211, col.bfx, col.bfz);
-            if (mdAmp <= 0f) { c.colAmp = 0f; return; }
-            float freqT      = Plugin.BL(cb.bkModeParams![pi][1], col.b200, col.b210, col.b201, col.b211, col.bfx, col.bfz);
-            float freqN      = Plugin.BL(cb.bkModeParams![pi][2], col.b200, col.b210, col.b201, col.b211, col.bfx, col.bfz);
-            float blurRadius = Plugin.BL(cb.bkModeParams![pi][3], col.b200, col.b210, col.b201, col.b211, col.bfx, col.bfz);
-            float alignment  = Plugin.BL(cb.bkModeParams![pi][4], col.b200, col.b210, col.b201, col.b211, col.bfx, col.bfz);
-            c.f2             = Plugin.BL(cb.bkModeParams![pi][5], col.b200, col.b210, col.b201, col.b211, col.bfx, col.bfz); // vScale
-            float gradFade   = Plugin.BL(cb.bkModeParams![pi][6], col.b200, col.b210, col.b201, col.b211, col.bfx, col.bfz);
-            float seaFade    = Plugin.BL(cb.bkModeParams![pi][7], col.b200, col.b210, col.b201, col.b211, col.bfx, col.bfz);
-            float nmX = col.gradDirX, nmZ = col.gradDirZ;
-            float gradFactor = gradFade > 0f ? Mathf.SmoothStep(0f, gradFade, col.gradMag) : 1f;
-            float mdRadial   = col.blurH / Mathf.Max(blurRadius, 1f);
-            float fT = Mathf.Lerp(freqT, freqN, alignment);
-            float fN = Mathf.Lerp(freqN, freqT, alignment);
-            c.f0 = (col.worldX * (-nmZ) + col.worldZ * nmX) * fT * gradFactor;  // mdTCoord
-            c.f1 = mdRadial * fN * gradFactor;                                    // mdNCoord
-            float seaFactor = seaFade > 0f ? Mathf.SmoothStep(0f, seaFade, col.effectiveH - 30f) : 1f;
-            c.colAmp = mdAmp * seaFactor;
-        }
-
-        public override void ComputeVoxel(ref float combined, in VoxelCtx ctx)
-        {
-            ref var c = ref Plugin._modeColCtx![PipelineIndex];
-            if (c.colAmp <= 0f) return;
-            float mdn   = Plugin._noisePool![9].GetNoise(c.f0, ctx.worldY * c.f2, c.f1) * 0.5f + 0.5f;
-            float mdSdf = (ctx.worldY - ctx.effectiveH) - mdn * c.colAmp;
-            if (mdSdf < combined) combined = mdSdf;
         }
     }
 
@@ -402,10 +128,9 @@ namespace ProceduralTerrain
     internal sealed class LuaModeDef : ModeDefinition
     {
         public string FilePath = "";
-        public string Blend    = "min";
-        public float  BlendK   = 2f;
+        // Blend/BlendK inherited from ModeDefinition.
 
-        // Pool entry: a Script plus its reusable params table and output buffer. Reused per BakeCell so
+        // Pool entry: a Script plus its reusable params table and output buffer. Reused per BakeColumn so
         // the hot path allocates nothing — the output column is written into a CLR float[] (wrapped as
         // MoonSharp userdata) instead of a fresh per-call table, which was the bake's dominant GC source.
         internal sealed class LuaEntry
@@ -520,14 +245,9 @@ namespace ProceduralTerrain
         }
 
 
-        public override void BakeBegin(ref CarveBuffers cb, int cellCount, int bh, int cw4)
-        {
-            int pi  = PipelineIndex;
-            Plugin.EnsureAuxSlots(ref cb, pi, 1);
-            Plugin.EnsureArr(ref cb.bkModeAux![pi][0], cellCount * bh);
-        }
+        // BakeBegin (aux slot alloc) inherited from ModeDefinition.
 
-        public override void BakeCell(ref CarveBuffers cb, in BakeCellArgs args)
+        public override void BakeColumn(ref CarveBuffers cb, in BakeCellArgs args)
         {
             if (_scriptPool == null) return;
             int pi = PipelineIndex;
@@ -583,36 +303,163 @@ namespace ProceduralTerrain
             catch { for (int cy = 0; cy < args.bh; cy++) auxBuf![baseIdx + cy] = 0f; }
             finally { ReturnEntry(e); }
         }
+        // PrepareColumn / ComputeVoxel (interpolate + floor + blend) inherited from ModeDefinition.
+    }
 
-        public override void PrepareColumn(ref CarveBuffers cb, in ColumnCtx col)
+    // ── Native (C#) mode base ─────────────────────────────────────────────────
+    // Same contract as a Lua mode — implement BakeColumn — but the column formula is native C#, so
+    // it allocates nothing and bakes at full speed. Param names/defaults are declared once via
+    // ParamSpec (index 0 is amplitude); the config parser sets defaults generically by name, and the
+    // framework's blending/interpolation/floor/blend apply identically to Lua and native modes.
+    internal abstract class NativeModeDef : ModeDefinition
+    {
+        protected abstract (string name, float def)[] ParamSpec { get; }
+        string[]? _names;
+        float[]?  _defs;
+        void Ensure()
+        {
+            if (_names != null) return;
+            var spec = ParamSpec;
+            _names = new string[spec.Length];
+            _defs  = new float[spec.Length];
+            for (int i = 0; i < spec.Length; i++) { _names[i] = spec[i].name; _defs[i] = spec[i].def; }
+            Amplitude = _defs.Length > 0 ? _defs[0] : 0f;
+        }
+        public override int      ParamCount        { get { Ensure(); return _names!.Length; } }
+        public override string[] ParamNames        { get { Ensure(); return _names!; } }
+        public override float    GetDefaultParam(int i) { Ensure(); return i < _defs!.Length ? _defs[i] : 0f; }
+
+        // Set a default param by config key (index 0 = amplitude mirrors the Amplitude field).
+        public void SetParam(string key, float v)
+        {
+            Ensure();
+            int idx = Array.IndexOf(_names!, key);
+            if (idx < 0) return;
+            _defs![idx] = v;
+            if (idx == 0) Amplitude = v;
+        }
+    }
+
+    // ── IsotropicFormation: native C# port of formation_dev.lua ───────────────
+    // Isotropic (direction-independent) domain-warped 3D-noise surface formation. Line-for-line
+    // equivalent to formation_dev.lua, reading the same shared noise pool so output is identical.
+    internal sealed class IsotropicFormation : NativeModeDef
+    {
+        // Index order IS the param contract — must match names used in the [Mode:*] cfg / profile overrides.
+        static readonly (string, float)[] _spec = {
+            ("amplitude", 14f), ("frequency", 0.035f), ("warpamp", 26f), ("warpfrequency", 0.01f),
+            ("vscale", 0.4f), ("threshold", 0f), ("twist", 0.001f), ("twistvary", 0.3f),
+            ("twistfrequency", 0.008f), ("ampvary", 0.2f), ("ampfrequency", 0.005f), ("flare", 0.6f),
+            ("yoffset", 0f), ("smoothradius", 0f), ("gradfade", 0f), ("yanchor", 0f),
+        };
+        protected override (string name, float def)[] ParamSpec => _spec;
+
+        public override void BakeColumn(ref CarveBuffers cb, in BakeCellArgs args)
         {
             int pi = PipelineIndex;
-            ref var c = ref Plugin._modeColCtx![pi];
-            c.colAmp = Plugin.BL(cb.bkModeParams![pi][0], col.b200, col.b210, col.b201, col.b211, col.bfx, col.bfz);
-            if (c.colAmp <= 0f) return;
-            c.bfx = col.bfx; c.bfz = col.bfz;
-            c.b00 = col.b3_00; c.b10 = col.b3_10; c.b01 = col.b3_01; c.b11 = col.b3_11; c.bh = col.bh;
-            c.arr0 = cb.bkModeAux![pi][0];
-        }
+            var P = cb.bkModeParams![pi];
+            int idx = args.cellIdx, baseIdx = idx * args.bh;
+            float[] outCol = cb.bkModeAux![pi][0];
 
-        public override void ComputeVoxel(ref float combined, in VoxelCtx ctx)
-        {
-            ref var c = ref Plugin._modeColCtx![PipelineIndex];
-            if (c.colAmp <= 0f || c.arr0 == null) return;
-            float scale = Plugin._scale ?? 1f;
-            float raw   = Plugin.BL3Y(c.arr0, c.b00, c.b10, c.b01, c.b11, ctx.cy, c.bfx, c.bfz) * scale;
-            float sdf   = Mathf.Min(raw, ctx.worldY - ctx.floorY);
-            switch (Blend)
+            float amp = P[0][idx];
+            if (amp <= 0f) { for (int cy = 0; cy < args.bh; cy++) outCol[baseIdx + cy] = 0f; return; }
+
+            float freq      = P[1][idx],  warpAmp  = P[2][idx],  warpFreq = P[3][idx], vscale  = P[4][idx];
+            float threshold = P[5][idx],  twist    = P[6][idx],  twistVary= P[7][idx], twistFq = P[8][idx];
+            float ampVary   = P[9][idx],  ampFreq  = P[10][idx], flare    = P[11][idx], yoffset = P[12][idx];
+            float smoothR   = P[13][idx], gradFade = P[14][idx], yanchor  = P[15][idx];
+
+            var pool = Plugin._noisePool!;
+            var wg   = args.wg ?? WorldGenerator.instance;
+
+            float wx = args.worldX, wz = args.worldZ;
+            float warpx = pool[3].GetNoise(wx * warpFreq, wz * warpFreq, 0f) * warpAmp;
+            float warpz = pool[4].GetNoise(wx * warpFreq, wz * warpFreq, 0f) * warpAmp;
+
+            float addh;
+            if (yanchor != 0f) addh = yanchor;
+            else if (smoothR > 0f)
             {
-                case "smoothmax":
-                    combined = Plugin.SmoothMax(combined, sdf, BlendK * scale);
-                    break;
-                case "max":
-                    if (sdf > combined) combined = sdf;
-                    break;
-                default: // "min"
-                    if (sdf < combined) combined = sdf;
-                    break;
+                float sum = 0f;
+                for (int dx = -1; dx <= 1; dx++)
+                for (int dz = -1; dz <= 1; dz++)
+                    sum += wg != null ? wg.GetHeight(wx + dx * smoothR + warpx, wz + dz * smoothR + warpz) : 0f;
+                addh = sum / 9f;
+            }
+            else addh = wg != null ? wg.GetHeight(wx + warpx, wz + warpz) : 0f;
+            addh -= yoffset;
+
+            float lamp = Mathf.Max(amp * (1f + ampVary * pool[5].GetNoise(wx * ampFreq, wz * ampFreq, 0f)), 0f);
+            if (gradFade > 0f && wg != null)
+            {
+                var (_, _, gmag) = Plugin.ZoneGradCache.Sample(wg, wx, wz, GradBlurRadius);
+                lamp *= 1f - Mathf.Min(1f, gmag / gradFade);
+            }
+
+            float ts = 1f + twistVary * pool[6].GetNoise(wx * twistFq, wz * twistFq, 0f);
+            for (int cy = 0; cy < args.bh; cy++)
+            {
+                float wy   = args.extLoS + cy * args.s;
+                float rely = wy - addh;
+                float sy   = rely * vscale;
+                float ang  = wy * twist * ts;
+                float c    = Mathf.Cos(ang), ss = Mathf.Sin(ang);
+                float n    = pool[7].GetNoise((wx * c - wz * ss) * freq, sy * freq, (wx * ss + wz * c) * freq);
+                float ft   = Mathf.Clamp01(rely / Mathf.Max(lamp, 0.001f));
+                float efft = threshold - flare * (4f * ft * (1f - ft));
+                outCol[baseIdx + cy] = rely - (n - efft) * lamp;
+            }
+        }
+    }
+
+    // ── IsotropicTunnel: native C# port of tunnel_carve.lua ───────────────────
+    // Isotropic 3D-noise tunnel network: two warped noise fields form a distance field carved into
+    // a smoothmax blend. Line-for-line equivalent to tunnel_carve.lua, same shared noise pool
+    // (slots n9..n15 = pool[8..14]). Writes SDF pre-scaled by s, matching the Lua mode; the shared
+    // ComputeVoxel applies the further ×scale identically for every mode, preserving exact parity.
+    internal sealed class IsotropicTunnel : NativeModeDef
+    {
+        static readonly (string, float)[] _spec = {
+            ("amplitude", 0.6f), ("frequency", 0.018f), ("warpamp", 6f), ("warpfrequency", 0.012f),
+            ("vscale", 1.5f), ("widthvary", 0.5f), ("widthfrequency", 0.008f), ("yoffset", 0f),
+        };
+        protected override (string name, float def)[] ParamSpec => _spec;
+
+        public override void BakeColumn(ref CarveBuffers cb, in BakeCellArgs args)
+        {
+            int pi = PipelineIndex;
+            var P = cb.bkModeParams![pi];
+            int idx = args.cellIdx, baseIdx = idx * args.bh;
+            float[] outCol = cb.bkModeAux![pi][0];
+
+            float amp = P[0][idx];
+            if (amp <= 0f) { for (int cy = 0; cy < args.bh; cy++) outCol[baseIdx + cy] = 0f; return; }
+
+            float freq  = P[1][idx], warpA = P[2][idx], warpF = P[3][idx], vsc = P[4][idx];
+            float wv    = P[5][idx], wvf   = P[6][idx], yoff  = P[7][idx];
+
+            var pool = Plugin._noisePool!;
+            var wg   = args.wg ?? WorldGenerator.instance;
+            float wx = args.worldX, wz = args.worldZ, s = args.s;
+            float addh = yoff != 0f ? (wg != null ? wg.GetHeight(wx, wz) : 0f) : 0f;
+
+            for (int cy = 0; cy < args.bh; cy++)
+            {
+                float wy = args.extLoS + cy * s;
+                float sy = (wy - addh + yoff) * vsc;
+
+                float awx1 = pool[11].GetNoise(wx * warpF, sy * warpF, wz * warpF) * warpA;
+                float awz1 = pool[12].GetNoise(wx * warpF, sy * warpF, wz * warpF) * warpA;
+                float awx2 = pool[13].GetNoise(wx * warpF, sy * warpF, wz * warpF) * warpA;
+                float awz2 = pool[14].GetNoise(wx * warpF, sy * warpF, wz * warpF) * warpA;
+
+                float na = pool[8].GetNoise((wx + awx1) * freq, sy * freq, (wz + awz1) * freq);
+                float nb = pool[9].GetNoise((wx + awx2) * freq, sy * freq, (wz + awz2) * freq);
+                float wn = pool[10].GetNoise(wx * wvf, sy * wvf, wz * wvf);
+
+                float localWidth = Mathf.Max(amp * (1f + wv * wn), 0.001f);
+                float dist       = Mathf.Sqrt(na * na + nb * nb) * 0.7071f;
+                outCol[baseIdx + cy] = (localWidth - dist) / localWidth * 4f * s;
             }
         }
     }

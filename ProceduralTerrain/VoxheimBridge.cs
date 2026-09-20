@@ -99,21 +99,30 @@ namespace ProceduralTerrain
             int width = context.Width;
 
             string zoneKey = $"{ox},{oz}";
+            Plugin.EnsureBakeLoaded();
             bool haveCache = Plugin._sdfCache.TryGetValue(zoneKey, out var c);
 
-            // World-edit conform: the authority path never hands PT the location modifiers
-            // (context.HeadlessBaseline is null during play), so we gather the placed terrain
-            // modifiers ourselves (TerrainModifier.GetAllInstances — locations + player edits) and
-            // bake them into our baseline heights via Voxheim's own ApplyGroundworkInPlace. Only do
-            // this expensive step when we'll actually carve: a fresh zone, or the first time we can
-            // fold modifiers into a zone that was cached before they were placed.
+            // Location groundwork (villages/spawn) is the deterministic initial condition, so it's baked
+            // into the baseline. On a bake HIT the baked baseline already conforms — we must not run the
+            // live groundwork gather (no live work during gameplay). Only bake MISSES (unbaked zones)
+            // self-gather location modifiers and carve live. Player edits are never handled here —
+            // Voxheim replays them as an overlay on top of whatever baseline we serve.
             if (!haveCache || !Plugin._groundworkedZones.ContainsKey(zoneKey))
             {
-                var heights = BuildGroundworkedHeights(context, out int nmods) ?? context.Heights;
-                if (nmods > 0 && Plugin._groundworkedZones.TryAdd(zoneKey, 0))
+                Voxheim.Core.HeightGrid heights;
+                if (Plugin.IsZoneBaked(ox, oz))
                 {
-                    if (haveCache) { Plugin._sdfCache.TryRemove(zoneKey, out _); haveCache = false; }
-                    Plugin.Log.LogInfo($"[PT-conform] zone ({ox},{oz}) groundwork: {nmods} modifier(s) baked into baseline");
+                    heights = context.Heights; // baked baseline already has location groundwork
+                    Plugin._groundworkedZones.TryAdd(zoneKey, 0);
+                }
+                else
+                {
+                    heights = BuildGroundworkedHeights(context, out int nmods) ?? context.Heights;
+                    if (nmods > 0 && Plugin._groundworkedZones.TryAdd(zoneKey, 0))
+                    {
+                        if (haveCache) { Plugin._sdfCache.TryRemove(zoneKey, out _); haveCache = false; }
+                        Plugin.Log.LogInfo($"[PT-conform] zone ({ox},{oz}) groundwork: {nmods} location modifier(s) baked into baseline");
+                    }
                 }
 
                 if (!haveCache)
@@ -140,27 +149,32 @@ namespace ProceduralTerrain
             }
         }
 
-        // Build a per-zone height grid with all overlapping location/player terrain ops baked in,
-        // using vanilla HMBuildData (base heights + corner biomes) + Voxheim's ApplyGroundworkInPlace.
-        // Returns null (and nmods=0) when there are no modifiers or worldgen isn't ready.
-        static Voxheim.Core.HeightGrid BuildGroundworkedHeights(Voxheim.Core.VoxelBaselineContext context, out int nmods)
+        // Build a per-zone height grid with overlapping LOCATION terrain ops baked in, using vanilla
+        // HMBuildData (base heights + corner biomes) + Voxheim's ApplyGroundworkInPlace. Returns null
+        // (nmods=0) when there are no location modifiers or worldgen isn't ready. Callable by zone
+        // coords so both the live generator and the bake pre-gather share this exact path.
+        internal static Voxheim.Core.HeightGrid BuildGroundworkedHeights(Voxheim.Core.VoxelBaselineContext context, out int nmods)
+            => BuildGroundworkedHeights(context.CenterX, context.CenterY, context.CenterZ, context.Width, context.Scale, out nmods);
+
+        internal static Voxheim.Core.HeightGrid BuildGroundworkedHeights(
+            float centerX, float centerY, float centerZ, int width, float scale, out int nmods)
         {
             nmods = 0;
             var wg = WorldGenerator.instance;
             if (wg == null) return null;
 
-            int width   = context.Width;
-            float scale = context.Scale;
-            var center  = new Vector3(context.CenterX, context.CenterY, context.CenterZ);
+            var center  = new Vector3(centerX, centerY, centerZ);
             float half  = width * scale * 0.5f;
 
-            // Gather placed terrain modifiers (locations + player edits) overlapping this zone.
+            // Gather LOCATION terrain modifiers overlapping this zone. Player edits (m_playerModifiction)
+            // are deliberately excluded: Voxheim replays them as an overlay on top of our baseline, so
+            // baking them here would double-apply them and make the baseline non-deterministic.
             var mods = new List<Voxheim.Core.ModifierDescriptor>();
             var all  = TerrainModifier.GetAllInstances();
             for (int i = 0; i < all.Count; i++)
             {
                 var tm = all[i];
-                if (tm == null) continue;
+                if (tm == null || tm.m_playerModifiction) continue;
                 var p = tm.transform.position;
                 float r = tm.GetRadius();
                 if (Math.Abs(p.x - center.x) > half + r + 4f) continue;

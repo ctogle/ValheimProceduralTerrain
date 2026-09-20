@@ -71,6 +71,17 @@ namespace ProceduralTerrain
             catch (Exception ex) { Log.LogWarning($"[ProceduralTerrain] bake: load failed: {ex.GetType().Name}: {ex.Message}\n{ex.StackTrace}"); _bakeData = null; }
         }
 
+        // Load the bake file once (idempotent) — lets the live generator test IsZoneBaked before carving.
+        internal static void EnsureBakeLoaded()
+        {
+            if (_bakeLoadAttempted) return;
+            _bakeLoadAttempted = true;
+            LoadBakeFile();
+        }
+
+        // True when this zone is present in the loaded bake file (its baseline is fully baked).
+        internal static bool IsZoneBaked(int ox, int oz) => _bakeData != null && _bakeData.ContainsKey((ox, oz));
+
         static float CatmullRom(float p0, float p1, float p2, float p3, float t)
         {
             float t2 = t * t, t3 = t2 * t;
@@ -206,6 +217,23 @@ namespace ProceduralTerrain
                 if (_bakeData != null && _bakeFileStep == _bakeStep && _bakeData.ContainsKey((ox, oz))) continue;
                 toCarve.Add((ox, oz));
             }
+            // Pre-gather LOCATION groundwork on the MAIN thread — TerrainModifier.GetAllInstances and
+            // HeightmapBuilder.RequestTerrainSync are main-thread-only, so worker threads can't do it.
+            // Zones with no overlapping location modifiers get nothing (cheap: the gather returns null
+            // before any RequestTerrainSync). Worker threads then carve from these conformed heights,
+            // baking the deterministic location edits into the file. Player edits are never baked —
+            // Voxheim overlays them on top at runtime.
+            var bakeGroundwork = new Dictionary<(int ox, int oz), Voxheim.Core.HeightGrid>();
+            foreach (var (zox, zoz) in toCarve)
+            {
+                float cx = (zox + zoneW * 0.5f) * s;
+                float cz = (zoz + zoneW * 0.5f) * s;
+                var gw = PTGenerator.BuildGroundworkedHeights(cx, 0f, cz, zoneW, s, out int nm);
+                if (gw != null && nm > 0) bakeGroundwork[(zox, zoz)] = gw;
+            }
+            if (bakeGroundwork.Count > 0)
+                Log.LogInfo($"[ProceduralTerrain] bake: {bakeGroundwork.Count} zone(s) with location groundwork baked in");
+
             int threads = Math.Max(1, Environment.ProcessorCount - 1);
             Log.LogInfo($"[ProceduralTerrain] bake: {toCarve.Count} zones to carve (radius={radius:F0}m, threads={threads})...");
             var bakeSw = System.Diagnostics.Stopwatch.StartNew();
@@ -228,7 +256,11 @@ namespace ProceduralTerrain
                         var swZ = System.Diagnostics.Stopwatch.StartNew();
                         var (yLo, yHi) = ComputeYBounds(zox, zoz, zoneW, s, wg);
                         long tYB = swZ.ElapsedMilliseconds;
-                        Carve(null, zox, zoz, zoneW, yLo, yHi);
+                        // Location-conformed heights (if any) bake the edits in; else raw procedural carve.
+                        if (bakeGroundwork.TryGetValue(zone, out var gw))
+                            Carve(gw, zox, zoz, zoneW, yLo, yHi, s, gw);
+                        else
+                            Carve(null, zox, zoz, zoneW, yLo, yHi);
                         long tCarve = swZ.ElapsedMilliseconds - tYB;
                         int n = System.Threading.Interlocked.Increment(ref doneCount);
                         if (n <= 12)

@@ -78,75 +78,35 @@ namespace ProceduralTerrain
                 return luaDef;
             }
 
-            ModeDefinition md = typeStr switch {
-                "A" => new ModeADef { Name = name },
-                "B" => new ModeBDef { Name = name },
-                "C" => new ModeCDef { Name = name },
-                "D" => new ModeDDef { Name = name },
-                _ => (ModeDefinition?)null!
-            };
-            if (md == null) { Log.LogWarning($"[ProceduralTerrain] Mode '{name}': unknown type '{typeStr}'."); return null; }
-
-            foreach (var (k, v) in kvs)
+            // Native (C#) modes: same [Mode:*] contract as Lua, selected by type name. This is what lets
+            // a mode be swapped between its Lua prototype and its C# port by editing `type=` and saving
+            // (config hot-reload rebuilds the pipeline). Params are set generically by name via SetParam.
+            if (_nativeModes.TryGetValue(typeStr, out var factory))
             {
-                if (k == "type") continue;
-                if (!float.TryParse(v, System.Globalization.NumberStyles.Float, inv, out float fv)) continue;
-                if (k == "amplitude") { md.Amplitude = fv; continue; }
-                switch (md)
+                var nd = factory(); nd.Name = name;
+                foreach (var (k, v) in kvs)
                 {
-                    case ModeADef a:
-                        switch (k) {
-                            case "frequency":      a.Frequency      = fv; break;
-                            case "warpamp":        a.WarpAmp        = fv; break;
-                            case "warpampy":       a.WarpAmpY       = fv; break;
-                            case "warpfrequency":  a.WarpFrequency  = fv; break;
-                            case "vscale":         a.VScale         = fv; break;
-                            case "widthvary":      a.WidthVary      = fv; break;
-                            case "widthfrequency": a.WidthFrequency = fv; break;
-                            case "yoffset":        a.YOffset        = fv; break;
-                        }
-                        break;
-                    case ModeBDef b:
-                        switch (k) {
-                            case "warpamp":       b.WarpAmp       = fv; break;
-                            case "warpfrequency": b.WarpFrequency = fv; break;
-                            case "vscale":        b.VScale        = fv; break;
-                            case "noiseamp":      b.NoiseAmp      = fv; break;
-                            case "yoffset":       b.YOffset       = fv; break;
-                            case "twist":         b.Twist         = fv; break;
-                        }
-                        break;
-                    case ModeCDef c:
-                        switch (k) {
-                            case "threshold":      c.Threshold      = fv; break;
-                            case "frequency":      c.Frequency      = fv; break;
-                            case "warpamp":        c.WarpAmp        = fv; break;
-                            case "warpfrequency":  c.WarpFrequency  = fv; break;
-                            case "vscale":         c.VScale         = fv; break;
-                            case "twist":          c.Twist          = fv; break;
-                            case "twistvary":      c.TwistVary      = fv; break;
-                            case "twistfrequency": c.TwistFrequency = fv; break;
-                            case "ampvary":        c.AmpVary        = fv; break;
-                            case "ampfrequency":   c.AmpFrequency   = fv; break;
-                            case "flare":          c.Flare          = fv; break;
-                            case "yoffset":        c.YOffset        = fv; break;
-                        }
-                        break;
-                    case ModeDDef d:
-                        switch (k) {
-                            case "freqt":      d.FreqT      = fv; break;
-                            case "freqn":      d.FreqN      = fv; break;
-                            case "blurradius": d.BlurRadius = fv; break;
-                            case "alignment":  d.Alignment  = fv; break;
-                            case "vscale":     d.VScale     = fv; break;
-                            case "gradfade":   d.GradFade   = fv; break;
-                            case "seafade":    d.SeaFade    = fv; break;
-                        }
-                        break;
+                    if (k == "type") continue;
+                    if (k == "blend")   { nd.Blend = v.Trim().ToLowerInvariant(); continue; }
+                    if (k == "blend_k") { if (float.TryParse(v, System.Globalization.NumberStyles.Float, inv, out float bk)) nd.BlendK = bk; continue; }
+                    if (float.TryParse(v, System.Globalization.NumberStyles.Float, inv, out float fv))
+                        nd.SetParam(k, fv);
                 }
+                return nd;
             }
-            return md;
+
+            Log.LogWarning($"[ProceduralTerrain] Mode '{name}': unknown type '{typeStr}' (expected 'lua' or a native mode name).");
+            return null;
         }
+
+        // Native C# mode registry: type name (as written in [Mode:*] type=, case-insensitive) -> factory.
+        // Add a line here to expose a new C# mode to the config.
+        static readonly Dictionary<string, Func<NativeModeDef>> _nativeModes =
+            new(StringComparer.OrdinalIgnoreCase)
+            {
+                { "isotropic_formation", () => new IsotropicFormation() },
+                { "isotropic_tunnel",    () => new IsotropicTunnel()    },
+            };
 
         // Parse a [Profile:name] section into a TerrainProfile.
         // include = otherProfile prepends the named profile's modes and inherits its params.

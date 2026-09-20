@@ -106,16 +106,6 @@ namespace ProceduralTerrain
                     if (_blendedProfs[i].floorDepth > maxFloor) maxFloor = _blendedProfs[i].floorDepth;
                     if (_blendedProfs[i].extendUp  > maxExtM)  maxExtM  = _blendedProfs[i].extendUp;
                 }
-                // Height extension from pipeline Mode C params (worst case)
-                foreach (var mode in _pipeline)
-                {
-                    if (mode is ModeCDef mc)
-                    {
-                        float a = mc.Amplitude * Mathf.Max(1f, 1f + mc.AmpVary);
-                        float e = Mathf.Max(0f, 1f - mc.Threshold) * a + mc.WarpAmp;
-                        if (e > maxExtM) maxExtM = e;
-                    }
-                }
                 if (maxExtM  > 0f) hiMargin = Mathf.Max(24, (int)Mathf.Ceil(maxExtM  / s) + 8);
                 if (maxFloor > 0f) loMargin = Mathf.Max(24, (int)Mathf.Ceil(maxFloor / s) + 4);
             }
@@ -711,15 +701,6 @@ namespace ProceduralTerrain
                     if (_blendedProfs[i].floorDepth > maxFloor) maxFloor = _blendedProfs[i].floorDepth;
                     if (_blendedProfs[i].extendUp  > maxExtM)  maxExtM  = _blendedProfs[i].extendUp;
                 }
-                foreach (var mode in _pipeline)
-                {
-                    if (mode is ModeCDef mc)
-                    {
-                        float a = mc.Amplitude * Mathf.Max(1f, 1f + mc.AmpVary);
-                        float e = Mathf.Max(0f, 1f - mc.Threshold) * a + mc.WarpAmp;
-                        if (e > maxExtM) maxExtM = e;
-                    }
-                }
                 if (maxExtM  > 0f) hiMargin = Mathf.Max(24, (int)Mathf.Ceil(maxExtM  / s) + 8);
                 if (maxFloor > 0f) loMargin = Mathf.Max(24, (int)Mathf.Ceil(maxFloor / s) + 4);
             }
@@ -1082,7 +1063,7 @@ namespace ProceduralTerrain
                 };
 
                 foreach (var mode in pipeline)
-                    mode.BakeCell(ref _cb, in args);
+                    mode.BakeColumn(ref _cb, in args);
             }
 
             if (_sdfSw != null)
@@ -1090,35 +1071,6 @@ namespace ProceduralTerrain
                 _sCells = _sdfSw.ElapsedMilliseconds;
                 int gcd = GC.CollectionCount(2) - _gc0;
                 Log.LogInfo($"[PT-sdf] zone ({ox},{oz}) alloc={_sAlloc}ms begin={_sBegin - _sAlloc}ms grad={_sGrad - _sBegin}ms cells={_sCells - _sGrad}ms luaCalls={_luaCallsThisCarve} anyMd={anyMdActive} gen2gc={gcd}");
-            }
-
-            // Mode B full-res warpedH pass
-            bool anyMbActive = pipeline.OfType<ModeBDef>().Any(m =>
-                _cb.bkModeParams != null && m.PipelineIndex >= 0 &&
-                _cb.bkModeParams[m.PipelineIndex][0].Any(v => v > 0f));
-            var firstMb = pipeline.OfType<ModeBDef>().FirstOrDefault();
-
-            if (anyMbActive && wg != null && firstMb != null)
-            {
-                int fullSz = bw * bw;
-                if (_cb.bkWarpedH == null || _cb.bkWarpedH.Length < fullSz) _cb.bkWarpedH = new float[fullSz];
-                for (int cx = 0; cx < bw; cx++)
-                for (int cz = 0; cz < bw; cz++)
-                {
-                    float wx = (ox - overlap + cx) * s, wz = (oz - overlap + cz) * s;
-                    int cx4  = cx / 4, cz4  = cz / 4;
-                    int cx4b = Math.Min(cx4 + 1, cw4 - 1), cz4b = Math.Min(cz4 + 1, cw4 - 1);
-                    float bfx2 = (cx & 3) * 0.25f, bfz2 = (cz & 3) * 0.25f;
-                    int b00 = cx4 * cw4 + cz4, b10 = cx4b * cw4 + cz4;
-                    int b01 = cx4 * cw4 + cz4b, b11 = cx4b * cw4 + cz4b;
-                    float wf    = firstMb.WarpFrequency;
-                    float wa    = BL(_cb.bkModeParams![firstMb.PipelineIndex][0], b00, b10, b01, b11, bfx2, bfz2) > 0f ? firstMb.WarpAmp : 0f;
-                    float yo    = firstMb.YOffset;
-                    float locF2 = LocationFactor(wx, wz, nearbyLocs);
-                    float dx    = _hmWarpX!.GetNoise(wx * wf, wz * wf) * (wa * locF2);
-                    float dz2   = _hmWarpZ!.GetNoise(wx * wf, wz * wf) * (wa * locF2);
-                    _cb.bkWarpedH![cx * bw + cz] = wg.GetHeight(wx + dx, wz + dz2) - yo;
-                }
             }
         }
 
