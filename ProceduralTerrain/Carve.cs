@@ -121,9 +121,6 @@ namespace ProceduralTerrain
             float[] buf = _cb.bufA, tmp = _cb.bufB, orig = _cb.bufC;
 
             bool fromBake = _bakeData != null && TryPopulateFromBake(ox, oz, bw, bh, extLo, s, buf);
-            long _t0 = 0, _t1 = 0, _t1b = 0, _t2 = 0, _tFix = 0;
-            _luaCallsThisCarve = 0;
-            var _sw = System.Diagnostics.Stopwatch.StartNew();
 
             if (!fromBake)
             {
@@ -132,14 +129,9 @@ namespace ProceduralTerrain
             int   cw4     = cw4Early;
             BakeSdfSetup(ox, oz, overlap, s, extLo, bh, bw, cw4, wg, nearbyLocs);
 
-            _t0 = _sw.ElapsedMilliseconds;
-
             bool anyPipelineActive = _pipeline.Length > 0 && _cb.bkModeParams != null &&
                 _pipeline.Any(m => _cb.bkModeParams![m.PipelineIndex][0].Any(v => v > 0f));
             FillPhase1(buf, bw, bh, extLo, s, ox, oz, overlap, wg, cw4, nearbyLocs, heightGrid);
-            _t1 = _sw.ElapsedMilliseconds;
-
-            _t1b = _sw.ElapsedMilliseconds;
 
             CaveProfile blurProf = centerProf;
             if (_blendedProfs != null)
@@ -227,8 +219,6 @@ namespace ProceduralTerrain
                 TaubinStep(taubinMu);
             }
 
-            _t2 = _sw.ElapsedMilliseconds;
-
             if (_islandRemoval) {
                 int islandBufSize = bw * bh * bw;
                 int stride_x      = bh * bw;
@@ -286,9 +276,7 @@ namespace ProceduralTerrain
                 bool needsFullPass = ungNX || ungPX || ungNZ || ungPZ;
                 if (needsFullPass)
                 {
-                    long _fixStart = _sw.ElapsedMilliseconds;
                     EnsureFixpoint(ox, oz, width, ungNX, ungPX, ungNZ, ungPZ);
-                    _tFix = _sw.ElapsedMilliseconds - _fixStart;
 
                     Array.Clear(_cb.visitedBuf, 0, islandBufSize);
                     qHead = 0; qTail = 0;
@@ -506,19 +494,11 @@ namespace ProceduralTerrain
 
             }
 
-            long _t3 = _sw.ElapsedMilliseconds;
-
             if (_dumpZonesRemaining > 0)
             {
                 _dumpZonesRemaining--;
                 DumpZoneData(ox, oz, overlap, s, wg, cw4Early, bw, bh, extLo, buf);
             }
-
-            var _centerBiome = WorldGenerator.instance?.GetBiome((ox + width / 2) * (float)(_scale ?? 1f), (oz + width / 2) * (float)(_scale ?? 1f)) ?? Heightmap.Biome.None;
-            if (System.Threading.Interlocked.Decrement(ref _phaseLogRemaining) >= 0)
-                Log.LogInfo($"[PT-phase] zone ({ox},{oz}) biome={_centerBiome} pipeline={_pipeline.Length} voxels={bw}x{bh}x{bw} fixHops={_lastFixpointHops} luaCalls={_luaCallsThisCarve} Ph0={_t0}ms Ph1={_t1-_t0}ms blur={_t1b-_t1}ms Ph2={_t2-_t1b}ms fix={_tFix}ms Ph3={_t3-_t2}ms total={_t3}ms");
-            else
-                Log.LogDebug($"[ProceduralTerrain] zone ({ox},{oz}) biome={_centerBiome} pipeline={_pipeline.Length} voxels={bw}x{bh}x{bw} fixHops={_lastFixpointHops} Ph0={_t0}ms Ph1={_t1-_t0}ms blur={_t1b-_t1}ms Ph2={_t2-_t1b}ms fix={_tFix}ms Ph3={_t3-_t2}ms total={_t3}ms");
         }
 
         // ── Zone data dump ───────────────────────────────────────────────────────
@@ -968,11 +948,6 @@ namespace ProceduralTerrain
             int pLen     = pipeline.Length;
             int nb2Size  = cw4 * cw4;
 
-            bool _sdfLog = _phaseLogRemaining > 0;
-            var  _sdfSw  = _sdfLog ? System.Diagnostics.Stopwatch.StartNew() : null;
-            int  _gc0 = _sdfLog ? GC.CollectionCount(2) : 0;
-            long _sAlloc = 0, _sBegin = 0, _sGrad = 0, _sCells = 0;
-
             // Ensure bkModeParams sized [pipelineIdx][paramIdx][cellIdx]
             if (_cb.bkModeParams == null || _cb.bkModeParams.Length < pLen)
                 _cb.bkModeParams = new float[pLen][][];
@@ -1011,13 +986,9 @@ namespace ProceduralTerrain
                 _cb.bk2dFlFade![i] = _blendedProfs[i].floorFade;
             }
 
-            if (_sdfSw != null) _sAlloc = _sdfSw.ElapsedMilliseconds;
-
             // BakeBegin for each mode
             foreach (var mode in pipeline)
                 mode.BakeBegin(ref _cb, nb2Size, bh, cw4);
-
-            if (_sdfSw != null) _sBegin = _sdfSw.ElapsedMilliseconds;
 
             // Check if any mode requiring grad field is active
             bool anyMdActive = pipeline.Any(m => m.NeedsGradField &&
@@ -1043,8 +1014,6 @@ namespace ProceduralTerrain
                 }
             }
 
-            if (_sdfSw != null) _sGrad = _sdfSw.ElapsedMilliseconds;
-
             // Main coarse cell loop
             for (int cx4 = 0; cx4 < cw4; cx4++)
             for (int cz4 = 0; cz4 < cw4; cz4++)
@@ -1064,13 +1033,6 @@ namespace ProceduralTerrain
 
                 foreach (var mode in pipeline)
                     mode.BakeColumn(ref _cb, in args);
-            }
-
-            if (_sdfSw != null)
-            {
-                _sCells = _sdfSw.ElapsedMilliseconds;
-                int gcd = GC.CollectionCount(2) - _gc0;
-                Log.LogInfo($"[PT-sdf] zone ({ox},{oz}) alloc={_sAlloc}ms begin={_sBegin - _sAlloc}ms grad={_sGrad - _sBegin}ms cells={_sCells - _sGrad}ms luaCalls={_luaCallsThisCarve} anyMd={anyMdActive} gen2gc={gcd}");
             }
         }
 

@@ -252,10 +252,6 @@ namespace ProceduralTerrain
                             _islandRemoval = !(v == "0" || v == "false");
                         if (k == "pocketremoval")
                             _pocketRemoval = !(v == "0" || v == "false");
-                        if (k == "probeluaskip")
-                            _probeLuaSkip = v == "1" || v == "true";
-                        if (k == "probeluanoisezero")
-                            _probeLuaNoiseZero = v == "1" || v == "true";
                         if (k == "biomeblendradius" && float.TryParse(v, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float bbr))
                             _biomeBlendRadius = Mathf.Max(1f, bbr);
                         if (k == "biomeblendsmooth")

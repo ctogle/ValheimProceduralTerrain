@@ -196,10 +196,7 @@ namespace ProceduralTerrain
             s.Globals["terrain_h"]  = (Func<float,float,float>)((x, z) =>
                 WorldGenerator.instance?.GetHeight(x, z) ?? 0f);
             s.DoString(_luaSrc!);
-            // Diagnostic: override the CLR noise callbacks with pure-Lua zero stubs (no marshalling).
-            if (Plugin._probeLuaNoiseZero)
-                s.DoString("for i=1,16 do _G['n'..i]=function(a,b,c) return 0 end end");
-            // Pre-allocate params table — reused each BakeCell, values updated in place.
+            // Pre-allocate params table — reused each BakeColumn, values updated in place.
             return new LuaEntry { s = s, p = new MoonSharp.Interpreter.Table(s) };
         }
 
@@ -254,7 +251,7 @@ namespace ProceduralTerrain
             float amp = cb.bkModeParams![pi][0][args.cellIdx];
             int baseIdx = args.cellIdx * args.bh;
             float[]? auxBuf = cb.bkModeAux![pi][0];
-            if (amp <= 0f || Plugin._probeLuaSkip)
+            if (amp <= 0f)
             {
                 for (int cy = 0; cy < args.bh; cy++) auxBuf![baseIdx + cy] = 0f;
                 return;
@@ -269,7 +266,6 @@ namespace ProceduralTerrain
             // recompute them via per-call interop (terrain_h) — grad already here; add base height.
             float th0 = wg2 != null ? wg2.GetHeight(args.worldX, args.worldZ) : 0f;
 
-            Plugin._luaCallsThisCarve++;
             var e = RentEntry();
             var s = e.s; var p = e.p;
             try
@@ -684,20 +680,6 @@ namespace ProceduralTerrain
 
         // Set true during parallel bake to suppress main-thread-only side effects.
         static volatile bool _parallelBakeActive;
-
-        // Phase-timing log budget: >=0 => log a [PT-phase] breakdown for this carve. Reset at bake start.
-        internal static int _phaseLogRemaining = 0;
-
-        // Per-carve MoonSharp bake() invocation count (past the amp<=0 early-out) — allocation probe.
-        [ThreadStatic] internal static long _luaCallsThisCarve;
-
-        // Diagnostic: skip the MoonSharp s.Call + result-table read in BakeCell (fill zeros), to isolate
-        // whether the per-cell Lua marshalling is the bake's garbage source. Terrain is wrong while set.
-        internal static volatile bool _probeLuaSkip;
-
-        // Diagnostic: bind n1..n8 to pure-Lua zero stubs (no CLR boundary) to isolate whether the
-        // per-voxel noise callback interop is the garbage source vs MoonSharp's inherent per-op cost.
-        internal static volatile bool _probeLuaNoiseZero;
 
         // CR reconstruction temp buffers — main thread only, not [ThreadStatic].
         static float[] _crTemp1 = new float[72 * 150 * 36]; // [bw * nsy * nsz]
