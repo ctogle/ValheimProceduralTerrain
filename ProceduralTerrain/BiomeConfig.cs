@@ -262,10 +262,6 @@ namespace ProceduralTerrain
                             _fixpointMaxZones = Mathf.Max(1, fmz);
                         if (k == "coastfade" && float.TryParse(v, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float cf))
                             _coastFade = Mathf.Max(0f, cf);
-                        if (k == "sealevelfade" && float.TryParse(v, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float slf))
-                            _seaLevelFade = Mathf.Max(0f, slf);
-                        if (k == "sealevelatten" && float.TryParse(v, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float sla))
-                            _seaLevelAtten = Mathf.Clamp01(sla);
                     }
                     continue;
                 }

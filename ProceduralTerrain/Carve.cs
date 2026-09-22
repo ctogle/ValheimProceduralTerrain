@@ -976,14 +976,14 @@ namespace ProceduralTerrain
             if (_cb.bk2dGradMag == null || _cb.bk2dGradMag.Length < mdSize) _cb.bk2dGradMag = new float[mdSize];
 
             // Floor depth/fade grids
-            if (_cb.bk2dFlD    == null || _cb.bk2dFlD.Length    < nb2Size) _cb.bk2dFlD    = new float[nb2Size];
-            if (_cb.bk2dFlFade == null || _cb.bk2dFlFade.Length < nb2Size) _cb.bk2dFlFade = new float[nb2Size];
+            if (_cb.bk2dFlD     == null || _cb.bk2dFlD.Length     < nb2Size) _cb.bk2dFlD     = new float[nb2Size];
+            if (_cb.bk2dFlFade  == null || _cb.bk2dFlFade.Length  < nb2Size) _cb.bk2dFlFade  = new float[nb2Size];
 
             // Populate floor arrays from blended profiles
             for (int i = 0; i < nb2Size && _blendedProfs != null && i < _blendedProfs.Length; i++)
             {
-                _cb.bk2dFlD!  [i] = _blendedProfs[i].floorDepth;
-                _cb.bk2dFlFade![i] = _blendedProfs[i].floorFade;
+                _cb.bk2dFlD!    [i] = _blendedProfs[i].floorDepth;
+                _cb.bk2dFlFade! [i] = _blendedProfs[i].floorFade;
             }
 
             // BakeBegin for each mode
@@ -1200,12 +1200,6 @@ namespace ProceduralTerrain
                     }
                 }
                 float locFac     = 1f;
-                float seaFac     = 1f;
-                if (_seaLevelFade > 0f)
-                {
-                    const float SeaLevel = 30f;
-                    seaFac = _seaLevelAtten + (1f - _seaLevelAtten) * Mathf.Clamp01((h - SeaLevel) / _seaLevelFade);
-                }
                 float effectiveH = h;
                 if ((_protectLocations || _flatPlaneLocations) && nearbyLocs.Count > 0)
                 {
@@ -1260,7 +1254,7 @@ namespace ProceduralTerrain
                     };
                     foreach (var mode in pipeline) mode.ComputeVoxel(ref combined, in vox);
                     float _fade = profFlFade > 0f ? Mathf.Clamp01((worldY - floorY) / profFlFade) : 1f;
-                    buf[(cx * bh + cy) * bw + cz] = baseSDF + (combined - baseSDF) * locFac * seaFac * _fade;
+                    buf[(cx * bh + cy) * bw + cz] = baseSDF + (combined - baseSDF) * locFac * _fade;
                 }
             }
         }

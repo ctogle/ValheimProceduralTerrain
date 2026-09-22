@@ -347,6 +347,7 @@ namespace ProceduralTerrain
             ("vscale", 0.4f), ("threshold", 0f), ("twist", 0.001f), ("twistvary", 0.3f),
             ("twistfrequency", 0.008f), ("ampvary", 0.2f), ("ampfrequency", 0.005f), ("flare", 0.6f),
             ("yoffset", 0f), ("smoothradius", 0f), ("gradfade", 0f), ("yanchor", 0f),
+            ("seaatten", 1f), ("seafade", 0f), ("sealevel", 30f),
         };
         protected override (string name, float def)[] ParamSpec => _spec;
 
@@ -364,6 +365,7 @@ namespace ProceduralTerrain
             float threshold = P[5][idx],  twist    = P[6][idx],  twistVary= P[7][idx], twistFq = P[8][idx];
             float ampVary   = P[9][idx],  ampFreq  = P[10][idx], flare    = P[11][idx], yoffset = P[12][idx];
             float smoothR   = P[13][idx], gradFade = P[14][idx], yanchor  = P[15][idx];
+            float seaAtten  = P[16][idx], seaFade  = P[17][idx], seaLevel = P[18][idx];
 
             var pool = Plugin._noisePool!;
             var wg   = args.wg ?? WorldGenerator.instance;
@@ -392,6 +394,13 @@ namespace ProceduralTerrain
                 lamp *= 1f - Mathf.Min(1f, gmag / gradFade);
             }
 
+            // Per-mode sea-level attenuation: scale amplitude toward 0 as the surface approaches sea level.
+            if (seaFade > 0f)
+            {
+                float baseSurfaceH = addh + yoffset;   // GetHeight-derived surface (before yoffset shift)
+                lamp *= seaAtten + (1f - seaAtten) * Mathf.Clamp01((baseSurfaceH - seaLevel) / seaFade);
+            }
+
             float ts = 1f + twistVary * pool[6].GetNoise(wx * twistFq, wz * twistFq, 0f);
             for (int cy = 0; cy < args.bh; cy++)
             {
@@ -417,7 +426,8 @@ namespace ProceduralTerrain
     {
         static readonly (string, float)[] _spec = {
             ("amplitude", 0.6f), ("frequency", 0.018f), ("warpamp", 6f), ("warpfrequency", 0.012f),
-            ("vscale", 1.5f), ("widthvary", 0.5f), ("widthfrequency", 0.008f), ("yoffset", 0f),
+            ("vscale", 1.5f), ("widthvary", 0.5f), ("widthfrequency", 0.008f),
+            ("seaatten", 1f), ("seafade", 0f), ("sealevel", 30f),
         };
         protected override (string name, float def)[] ParamSpec => _spec;
 
@@ -432,17 +442,28 @@ namespace ProceduralTerrain
             if (amp <= 0f) { for (int cy = 0; cy < args.bh; cy++) outCol[baseIdx + cy] = 0f; return; }
 
             float freq  = P[1][idx], warpA = P[2][idx], warpF = P[3][idx], vsc = P[4][idx];
-            float wv    = P[5][idx], wvf   = P[6][idx], yoff  = P[7][idx];
+            float wv    = P[5][idx], wvf   = P[6][idx];
+            float seaAtten = P[7][idx], seaFade = P[8][idx], seaLevel = P[9][idx];
 
             var pool = Plugin._noisePool!;
             var wg   = args.wg ?? WorldGenerator.instance;
             float wx = args.worldX, wz = args.worldZ, s = args.s;
-            float addh = yoff != 0f ? (wg != null ? wg.GetHeight(wx, wz) : 0f) : 0f;
+
+            // Per-mode sea-level attenuation: shrink the tunnel radius (amplitude) as the surface
+            // approaches sea level. Must scale amplitude, NOT the output SDF — a carve mode's "off"
+            // state is radius->0 (giving a large-negative, solid SDF), not output->0 (which smoothmax
+            // reads as carved air).
+            if (seaFade > 0f)
+            {
+                float surfaceH = wg != null ? wg.GetHeight(wx, wz) : 0f;
+                float seaFac = seaAtten + (1f - seaAtten) * Mathf.Clamp01((surfaceH - seaLevel) / seaFade);
+                amp *= seaFac;
+            }
 
             for (int cy = 0; cy < args.bh; cy++)
             {
                 float wy = args.extLoS + cy * s;
-                float sy = (wy - addh + yoff) * vsc;
+                float sy = wy * vsc;
 
                 float awx1 = pool[11].GetNoise(wx * warpF, sy * warpF, wz * warpF) * warpA;
                 float awz1 = pool[12].GetNoise(wx * warpF, sy * warpF, wz * warpF) * warpA;
@@ -553,8 +574,6 @@ namespace ProceduralTerrain
         internal static int   _transitionBlurPasses = 3;     // min blur passes for any active zone
         internal static int   _fixpointMaxZones     = 8;     // EnsureFixpoint hop cap
         internal static float _coastFade           = 0f;     // world units above sea level over which Ocean inflates into blend (0=off)
-        internal static float _seaLevelFade        = 0f;     // distance above sea level where fade begins (factor=1 here, seaLevelAtten at sea level)
-        internal static float _seaLevelAtten       = 0f;     // factor at sea level (0=fully suppressed, 1=no suppression)
 
         // ── Bake download (client receiving from server) ──────────────────────────
         internal static bool   _bakeDownloadActive;
