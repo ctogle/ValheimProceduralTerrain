@@ -177,6 +177,15 @@ namespace ProceduralTerrain
         public override string[] ParamNames => _dynParamNames;
         public override float GetDefaultParam(int i) => i < _dynDefaults.Length ? _dynDefaults[i] : 0f;
 
+        // Surface-anchored lua modes (radial ridges/rings) ride on the injected bed height (terrain_h0).
+        // Setting surfaceAnchored=true in [Mode] gives them the same full-res baseline correction as
+        // native formation — replacing the coarse-baked bed with a per-column one, killing bed faceting.
+        // Baseline = GroundHeight (exactly what th0 is), so the correction cancels cleanly.
+        public bool SurfaceAnchoredFlag;
+        public override bool SurfaceAnchored => SurfaceAnchoredFlag;
+        public override float SampleBaselineFull(ref CarveBuffers cb, in ColumnCtx col, WorldGenerator? wg)
+            => Plugin.GroundHeight(col.worldX, col.worldZ, wg ?? WorldGenerator.instance);
+
         public override bool NeedsGradField => false;
         public override float GradBlurRadius
         {
@@ -214,7 +223,7 @@ namespace ProceduralTerrain
             s.Globals["lerp"]       = (Func<float,float,float,float>)Mathf.Lerp;
             s.Globals["smoothstep"] = (Func<float,float,float,float>)Mathf.SmoothStep;
             s.Globals["terrain_h"]  = (Func<float,float,float>)((x, z) =>
-                WorldGenerator.instance?.GetHeight(x, z) ?? 0f);
+                { var w = WorldGenerator.instance; return w != null ? Plugin.GroundHeight(x, z, w) : 0f; });
             s.DoString(_luaSrc!);
             // Pre-allocate params table — reused each BakeColumn, values updated in place.
             return new LuaEntry { s = s, p = new MoonSharp.Interpreter.Table(s) };
@@ -268,23 +277,28 @@ namespace ProceduralTerrain
         {
             if (_scriptPool == null) return;
             int pi = PipelineIndex;
-            float amp = cb.bkModeParams![pi][0][args.cellIdx];
-            int baseIdx = args.cellIdx * args.bh;
+            int idx = args.cellIdx;
+            float amp = cb.bkModeParams![pi][0][idx];
+            int baseIdx = idx * args.bh;
             float[]? auxBuf = cb.bkModeAux![pi][0];
+            var wg2 = args.wg ?? WorldGenerator.instance;
+
+            // Bed height (terrain_h0), vanilla-blended. For surface-anchored modes, store it as the
+            // baseline UNCONDITIONALLY — before the amp<=0 gate — so the full-res correction is defined
+            // at every cell (amp gates application, not existence; else stale baselines → boundary spikes).
+            float th0 = wg2 != null ? Plugin.GroundHeight(args.worldX, args.worldZ, wg2) : 0f;
+            if (SurfaceAnchoredFlag && cb.bkModeBaseline != null && pi < cb.bkModeBaseline.Length && cb.bkModeBaseline[pi] != null)
+                cb.bkModeBaseline[pi]![idx] = th0;
+
             if (amp <= 0f)
             {
                 for (int cy = 0; cy < args.bh; cy++) auxBuf![baseIdx + cy] = 0f;
                 return;
             }
 
-            int idx = args.cellIdx;
-            var wg2 = args.wg ?? WorldGenerator.instance;
             (float dirx, float dirz, float mag) = wg2 != null
                 ? Plugin.ZoneGradCache.Sample(wg2, args.worldX, args.worldZ, GradBlurRadius)
                 : (0f, 0f, 0f);
-            // Standardized per-column inputs computed once in C# and injected, so lua modes never
-            // recompute them via per-call interop (terrain_h) — grad already here; add base height.
-            float th0 = wg2 != null ? wg2.GetHeight(args.worldX, args.worldZ) : 0f;
 
             var e = RentEntry();
             var s = e.s; var p = e.p;
@@ -513,7 +527,7 @@ namespace ProceduralTerrain
             // reads as carved air).
             if (seaFade > 0f)
             {
-                float surfaceH = wg != null ? wg.GetHeight(wx, wz) : 0f;
+                float surfaceH = wg != null ? Plugin.GroundHeight(wx, wz, wg) : 0f;
                 float seaFac = seaAtten + (1f - seaAtten) * Mathf.Clamp01((surfaceH - seaLevel) / seaFade);
                 amp *= seaFac;
             }
@@ -818,7 +832,7 @@ namespace ProceduralTerrain
                     float s = _scale is { } sv && sv > 0f ? sv : 1f;
                     float wx, wy, wz;
                     if (args.Length >= 3 && float.TryParse(args[1], out float ax) && float.TryParse(args[2], out float az))
-                        { wx = ax; wz = az; wy = wg.GetHeight(ax, az); }
+                        { wx = ax; wz = az; wy = GroundHeight(ax, az, wg); }
                     else
                     {
                         var player = Player.m_localPlayer;
@@ -876,13 +890,13 @@ namespace ProceduralTerrain
 
                         // 3. Gradient magnitude + direction
                         float hStp = 2f;
-                        float dhdx = (wg.GetHeight(wx + hStp, wz) - wg.GetHeight(wx - hStp, wz)) / (2f * hStp);
-                        float dhdz = (wg.GetHeight(wx, wz + hStp) - wg.GetHeight(wx, wz - hStp)) / (2f * hStp);
+                        float dhdx = (GroundHeight(wx + hStp, wz, wg) - GroundHeight(wx - hStp, wz, wg)) / (2f * hStp);
+                        float dhdz = (GroundHeight(wx, wz + hStp, wg) - GroundHeight(wx, wz - hStp, wg)) / (2f * hStp);
                         float gm   = Mathf.Sqrt(dhdx * dhdx + dhdz * dhdz);
                         texGrad.SetPixel(ix, iz, new Color(Mathf.Clamp01(gm), dhdx * 0.5f + 0.5f, dhdz * 0.5f + 0.5f));
 
                         // 4. Formation SDF at rely=7 (mid-feature depth)
-                        float addh = wg.GetHeight(wx + wx4, wz + wz4);
+                        float addh = GroundHeight(wx + wx4, wz + wz4, wg);
                         float sdf  = rely - (nWarp - 0f) * 14f; // threshold=0, amp=14
                         float sv   = Mathf.Clamp01(sdf * 0.5f + 0.5f);
                         texSdf.SetPixel(ix, iz, new Color(sv, sv, sv));
@@ -1066,7 +1080,7 @@ namespace ProceduralTerrain
                 for (int cx = 0; cx < cw; cx++)
                 for (int cz2 = 0; cz2 < cw; cz2++)
                 {
-                    float h = wg.GetHeight(originX + cx * hStep, originZ + cz2 * hStep);
+                    float h = GroundHeight(originX + cx * hStep, originZ + cz2 * hStep, wg);
                     heights[cx * cw + cz2] = h;
                     if (h < hMin) hMin = h; if (h > hMax) hMax = h;
                 }

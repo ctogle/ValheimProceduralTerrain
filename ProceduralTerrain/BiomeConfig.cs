@@ -59,6 +59,7 @@ namespace ProceduralTerrain
                     if (k == "file")    { fileVal  = v.Trim(); continue; }
                     if (k == "blend")   { blendVal  = v.Trim().ToLowerInvariant(); continue; }
                     if (k == "blend_k") { blendKStr = v.Trim(); continue; }
+                    if (k == "surfaceanchored") { luaDef.SurfaceAnchoredFlag = v.Trim() == "1" || v.Trim().ToLowerInvariant() == "true"; continue; }
                     if (float.TryParse(v, System.Globalization.NumberStyles.Float, inv, out float fv))
                     {
                         if (k == "amplitude") { luaDef.Amplitude = fv; }
@@ -356,10 +357,46 @@ namespace ProceduralTerrain
             }
             _biomeParams = newBiomeParams;
 
+            WarnNyquistFrequencies();
+
             _modeDefinitions = modeDefs;
             _namedProfiles   = namedProfiles;
             _biomeProfiles   = profiles;
             Log.LogInfo($"[ProceduralTerrain] Config reloaded: {modeDefs.Count} modes, {namedProfiles.Count} profiles, {profiles.Count} biomes, pipeline={_pipeline.Length}.");
+        }
+
+        // Advisory at config load: a coarse bake (XZ cell = CellVox*s) can only faithfully represent
+        // feature wavelengths a few cells wide. Warn when a frequency param implies a wavelength below
+        // that — it will facet/alias under coarse bilinear unless the mode evaluates full-res. Heuristic:
+        // it can't know which freqs are XZ-spatial vs vertical/warp, so it's informational, not a hard error.
+        static void WarnNyquistFrequencies()
+        {
+            if (_pipeline == null) return;
+            float s       = _scale ?? 1f;
+            float cell    = Plugin.CellVox * s;   // coarse XZ sample interval, world units
+            float minWave = 3f * cell;            // ~3 samples/wavelength; below this bilinear visibly facets
+            var seen = new System.Collections.Generic.HashSet<string>();
+            foreach (var mode in _pipeline)
+            {
+                int mi = mode.PipelineIndex;
+                var names = mode.ParamNames;
+                for (int pi = 0; pi < mode.ParamCount; pi++)
+                {
+                    string nm = pi < names.Length ? names[pi].ToLowerInvariant() : "";
+                    if (!nm.Contains("freq")) continue;
+                    // Worst (highest) configured value across biomes, falling back to the mode default.
+                    float maxv = mode.GetDefaultParam(pi);
+                    foreach (var kv in _biomeParams)
+                    {
+                        var mp = (mi >= 0 && mi < kv.Value.Length) ? kv.Value[mi] : null;
+                        if (mp != null && pi < mp.Length && mp[pi] > maxv) maxv = mp[pi];
+                    }
+                    if (maxv <= 0f) continue;
+                    float wave = 1f / maxv;   // FastNoiseLite feature size ≈ 1/frequency (world units)
+                    if (wave < minWave && seen.Add(mode.Name + "." + nm))
+                        Log.LogWarning($"[ProceduralTerrain] Nyquist: {mode.Name}.{names[pi]}={maxv:G3} → ~{wave:F1}wu feature vs {cell:F1}wu coarse cell (want ≥{minWave:F1}wu). If XZ-spatial it will facet under coarse bake — lower the frequency, reduce coarseMult, or make the mode full-res.");
+                }
+            }
         }
 
         static void WriteDefaultBiomeConfig(string path)
@@ -627,7 +664,7 @@ namespace ProceduralTerrain
             if (_coastFade > 0f)
             {
                 const float SeaLevel = 30f;
-                float h = wg.GetHeight(worldX, worldZ);
+                float h = GroundHeight(worldX, worldZ, wg);
                 coastWProbe = 1f - Mathf.Clamp01((h - SeaLevel) / _coastFade);
                 if (coastWProbe > 0f)
                 {
@@ -698,7 +735,7 @@ namespace ProceduralTerrain
             // ── Input features at probe point ────────────────────────────────────────
             ProbeLog($"  input features at ({worldX:F1}, {worldY:F1}, {worldZ:F1}):");
 
-            float th = wg.GetHeight(worldX, worldZ);
+            float th = GroundHeight(worldX, worldZ, wg);
             ProbeLog($"    terrain_h={th:F2}");
 
             // Zone extent for the zone containing this world point
@@ -716,8 +753,8 @@ namespace ProceduralTerrain
 
             // Gradient via finite difference (same 4wu step as coarse grid)
             float hStep = 4f;
-            float dhx = wg.GetHeight(worldX + hStep, worldZ) - wg.GetHeight(worldX - hStep, worldZ);
-            float dhz = wg.GetHeight(worldX, worldZ + hStep) - wg.GetHeight(worldX, worldZ - hStep);
+            float dhx = GroundHeight(worldX + hStep, worldZ, wg) - GroundHeight(worldX - hStep, worldZ, wg);
+            float dhz = GroundHeight(worldX, worldZ + hStep, wg) - GroundHeight(worldX, worldZ - hStep, wg);
             float gradMag = Mathf.Sqrt(dhx * dhx + dhz * dhz) / (2f * hStep);
             float gradLen = Mathf.Max(gradMag * 2f * hStep, 1e-6f);
             float gdx = dhx / gradLen, gdz = dhz / gradLen; // uphill direction
@@ -940,7 +977,7 @@ namespace ProceduralTerrain
                 {
                     float wx = (ox - overlap + cx4 * cellVox + cellVox / 2) * s;
                     float wz = (oz - overlap + cz4 * cellVox + cellVox / 2) * s;
-                    float h  = wg.GetHeight(wx, wz);
+                    float h  = GroundHeight(wx, wz, wg);
                     float coastW = 1f - Mathf.Clamp01((h - SeaLevel) / _coastFade);
                     if (coastW <= 0f) continue;
                     int idx = cx4 * cw4 + cz4;

@@ -593,7 +593,7 @@ namespace ProceduralTerrain
             for (int gx = -overlap; gx <= w + overlap; gx++)
             for (int gz = -overlap; gz <= w + overlap; gz++)
             {
-                float h = wg.GetHeight((ox + gx) * s, (oz + gz) * s) / s;
+                float h = GroundHeight((ox + gx) * s, (oz + gz) * s, wg) / s;
                 if (h < minH) minH = h;
                 if (h > maxH) maxH = h;
             }
