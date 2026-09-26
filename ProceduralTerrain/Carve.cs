@@ -32,6 +32,8 @@ namespace ProceduralTerrain
         public float[][][]? bkModeParams;
         // Pipeline mode auxiliary data [pipelineIdx][auxIdx][dataIdx]
         public float[][][]? bkModeAux;
+        // Surface-anchored modes: coarse addh per cell [pipelineIdx][cellIdx], for full-res baseline correction
+        public float[][]? bkModeBaseline;
     }
 
     public partial class Plugin
@@ -74,7 +76,10 @@ namespace ProceduralTerrain
 
             const int overlap = 4;
             int bwEarly = width + 2 * overlap;
-            int cw4Early = (bwEarly + 3) / 4;
+            // +1 guard cell on the far (+x/+z) side: interpolation needs a coarse neighbor past the
+            // last owned voxel. Without it, far-edge owned voxels clamp to a flat cell when CellVox>overlap
+            // (coarseMult>1), stepping vs the neighbor zone. No-op at coarseMult=1 (clamp never triggers).
+            int cw4Early = (bwEarly + CellVox - 1) / CellVox + 1;
 
             if (wg != null) BakeBlendedProfiles(cw4Early, ox, oz, overlap, s, wg);
 
@@ -507,7 +512,7 @@ namespace ProceduralTerrain
         {
             try
             {
-                float coarseStep = 4f * s;
+                float coarseStep = CellVox * s;
                 int pad = (int)(_biomeBlendRadius / coarseStep) + 2;
                 int pcw = cw4 + 2 * pad;
 
@@ -539,7 +544,7 @@ namespace ProceduralTerrain
                 {
                     int idx = cx4 * cw4 + cz4;
                     bool last = (cx4 == cw4 - 1 && cz4 == cw4 - 1);
-                    float wx = (ox - overlap + cx4 * 4) * s, wz = (oz - overlap + cz4 * 4) * s;
+                    float wx = (ox - overlap + cx4 * CellVox) * s, wz = (oz - overlap + cz4 * CellVox) * s;
                     int pIdx2 = (cx4 + pad) * pcw + (cz4 + pad);
                     int biomeRaw = -1;
                     if (_biomeFrac != null) { float domF2=0f; for(int sl=0;sl<MaxBiomeSlots;sl++){float f=_biomeFrac[pIdx2*MaxBiomeSlots+sl];if(f>domF2){domF2=f;biomeRaw=sl;}} }
@@ -668,7 +673,7 @@ namespace ProceduralTerrain
             var   wg = WorldGenerator.instance;
 
             int bwZ = w + 2 * overlap;
-            int cw4 = (bwZ + 3) / 4;
+            int cw4 = (bwZ + CellVox - 1) / CellVox + 1;   // +1 far-side guard cell (see cw4Early note)
 
             if (wg != null) BakeBlendedProfiles(cw4, ox, oz, overlap, s, wg);
 
@@ -968,6 +973,14 @@ namespace ProceduralTerrain
                 if (_cb.bkModeAux[mi] == null)
                     _cb.bkModeAux[mi] = Array.Empty<float[]>();
 
+            // Ensure per-mode coarse baseline arrays (surface-anchored modes only)
+            if (_cb.bkModeBaseline == null || _cb.bkModeBaseline.Length < pLen)
+                _cb.bkModeBaseline = new float[pLen][];
+            for (int mi = 0; mi < pLen; mi++)
+                if (pipeline[mi].SurfaceAnchored &&
+                    (_cb.bkModeBaseline[mi] == null || _cb.bkModeBaseline[mi]!.Length < nb2Size))
+                    _cb.bkModeBaseline[mi] = new float[nb2Size];
+
             // Gradient arrays sized based on cw4+1 grid
             int mdSize = (cw4 + 1) * (cw4 + 1);
             if (_cb.bk2dTgX     == null || _cb.bk2dTgX.Length     < mdSize) _cb.bk2dTgX     = new float[mdSize];
@@ -1001,7 +1014,7 @@ namespace ProceduralTerrain
 
             if (anyMdActive && wg != null)
             {
-                ComputeGradField(wg, (ox - overlap) * s, (oz - overlap) * s, cw4 + 1, mdBlurRadius, 4f * s,
+                ComputeGradField(wg, (ox - overlap) * s, (oz - overlap) * s, cw4 + 1, mdBlurRadius, CellVox * s,
                                  _cb.bk2dTgX!, _cb.bk2dTgZ!, _cb.bk2dBlurH!, _cb.bk2dGradMag!);
                 // estimate island center as peak of blurH in coarse grid
                 float peakH = float.MinValue;
@@ -1010,7 +1023,7 @@ namespace ProceduralTerrain
                 for (int cz4 = 0; cz4 < cw4; cz4++)
                 {
                     float h = _cb.bk2dBlurH![cx4 * cw4 + cz4];
-                    if (h > peakH) { peakH = h; _mdPeakX = (ox - overlap + cx4 * 4) * s; _mdPeakZ = (oz - overlap + cz4 * 4) * s; }
+                    if (h > peakH) { peakH = h; _mdPeakX = (ox - overlap + cx4 * CellVox) * s; _mdPeakZ = (oz - overlap + cz4 * CellVox) * s; }
                 }
             }
 
@@ -1018,8 +1031,8 @@ namespace ProceduralTerrain
             for (int cx4 = 0; cx4 < cw4; cx4++)
             for (int cz4 = 0; cz4 < cw4; cz4++)
             {
-                int   cx4w  = Math.Min(cx4 * 4, bw - 1);
-                int   cz4w  = Math.Min(cz4 * 4, bw - 1);
+                int   cx4w  = Math.Min(cx4 * CellVox, bw - 1);
+                int   cz4w  = Math.Min(cz4 * CellVox, bw - 1);
                 int   gx4   = ox - overlap + cx4w, gz4 = oz - overlap + cz4w;
                 float wx4   = gx4 * s, wz4 = gz4 * s;
                 int   cellIdx = cx4 * cw4 + cz4;
@@ -1031,9 +1044,83 @@ namespace ProceduralTerrain
                     wg = wg!
                 };
 
-                foreach (var mode in pipeline)
-                    mode.BakeColumn(ref _cb, in args);
+                if (_blendMode == 1)
+                    foreach (var mode in pipeline)
+                        BakeColumnSdfBlend(mode, ref _cb, in args, cw4);
+                else
+                    foreach (var mode in pipeline)
+                        mode.BakeColumn(ref _cb, in args);
             }
+        }
+
+        // SDF-blend driver: instead of one BakeColumn on cross-biome-averaged params (which chirps
+        // when frequencies differ), bake each contributing biome's column at ITS OWN params — with
+        // amplitude scaled by coverageFrac so the mode fades toward its own correct off-state — then
+        // weighted-average the output columns among present biomes. Full-coverage boundaries
+        // (both biomes have the mode) reduce to a pure crisp crossfade. Interior cells (one present
+        // biome, coverageFrac=1) reduce to a single bake, identical cost to the param path.
+        // Leaves bkModeParams[mi][0] (the ComputeVoxel amplitude gate) as BakeBlendedProfiles set it.
+        static void BakeColumnSdfBlend(ModeDefinition mode, ref CarveBuffers cb, in BakeCellArgs args, int cw4)
+        {
+            int mi = mode.PipelineIndex;
+            if (mi < 0) return;
+            int idx = args.cellIdx, bh = args.bh, baseIdx = idx * bh;
+            int cellCount = cw4 * cw4;
+            float[] outCol = cb.bkModeAux![mi][0];
+
+            float totW     = (_biomeTotW  != null && idx < _biomeTotW.Length)  ? _biomeTotW[idx] : 0f;
+            float presentW = (_sdfPresentW != null) ? _sdfPresentW[mi * cellCount + idx] : 0f;
+            if (presentW <= 0f || totW <= 0f)
+            {
+                for (int cy = 0; cy < bh; cy++) outCol[baseIdx + cy] = 0f;
+                // Mode fully absent here, but the baseline field must still be defined for neighbors'
+                // bilinear correction. Canonical value = unwarped ground (matches param mode, where the
+                // blended warp params → 0 at fully-absent cells). Prevents stale-baseline boundary spikes.
+                if (mode.SurfaceAnchored && cb.bkModeBaseline != null
+                    && mi < cb.bkModeBaseline.Length && cb.bkModeBaseline[mi] != null)
+                    cb.bkModeBaseline[mi]![idx] = Plugin.GroundHeight(args.worldX, args.worldZ, args.wg ?? WorldGenerator.instance);
+                return;
+            }
+            float coverageFrac = presentW / totW;
+
+            var P  = cb.bkModeParams![mi];
+            int nP = mode.ParamCount;
+            float gate = P[0][idx];   // totW-normalized amplitude for the gate; clobbered below, restored after
+
+            Span<float> accum = stackalloc float[bh];
+            for (int cy = 0; cy < bh; cy++) accum[cy] = 0f;
+
+            // Surface-anchored modes store per-biome coarse addh into bkModeBaseline during BakeColumn;
+            // each biome overwrites it, so we crossfade the baseline with the SAME weights as the column
+            // (else the full-res correction in PrepareColumn uses only the last biome's addh at multi-biome cells).
+            bool surfAnch = mode.SurfaceAnchored && cb.bkModeBaseline != null
+                            && mi < cb.bkModeBaseline.Length && cb.bkModeBaseline[mi] != null;
+            float baseAccum = 0f;
+
+            int n = _sdfBiomeN![idx];
+            var biomeParams = _biomeParams;
+            for (int k = 0; k < n; k++)
+            {
+                int   biomeInt = _sdfBiomeInt![idx * MaxBiomeSlots + k];
+                float w        = _sdfBiomeW  ![idx * MaxBiomeSlots + k];
+                if (w <= 0f) continue;
+                if (!biomeParams.TryGetValue((Heightmap.Biome)biomeInt, out var bp)) continue;
+                float[]? mp = (mi < bp.Length) ? bp[mi] : null;
+                if (mp == null) continue;                       // biome lacks this mode (only diluted coverage)
+                float ampB = mp.Length > 0 ? mp[0] : 0f;
+                if (ampB <= 0f) continue;
+                // Feed this biome's params to the mode; amplitude coverage-faded so it fades toward off.
+                for (int pi = 0; pi < nP; pi++) P[pi][idx] = (pi < mp.Length) ? mp[pi] : 0f;
+                P[0][idx] = ampB * coverageFrac;
+                mode.BakeColumn(ref cb, in args);               // writes into outCol[baseIdx..] (and bkModeBaseline[mi][idx] if surface-anchored)
+                for (int cy = 0; cy < bh; cy++) accum[cy] += w * outCol[baseIdx + cy];
+                if (surfAnch) baseAccum += w * cb.bkModeBaseline![mi]![idx];
+            }
+
+            float rcp = 1f / presentW;
+            for (int cy = 0; cy < bh; cy++) outCol[baseIdx + cy] = accum[cy] * rcp;
+            if (surfAnch) cb.bkModeBaseline![mi]![idx] = baseAccum * rcp;   // crossfaded baseline matches crossfaded column
+            P[0][idx] = gate;   // restore the ComputeVoxel amplitude gate
         }
 
         // Shared gradient field computation used by both BakeSdfSetup and pt_gradmap.
@@ -1056,7 +1143,7 @@ namespace ProceduralTerrain
 
             for (int gi = 0; gi < gw2; gi++)
             for (int gj = 0; gj < gw2; gj++)
-                hGrid[gi * gw2 + gj] = wg.GetHeight(wxOrig + gi * hStep, wzOrig + gj * hStep);
+                hGrid[gi * gw2 + gj] = GroundHeight(wxOrig + gi * hStep, wzOrig + gj * hStep, wg);
 
             for (int gj = 0; gj < gw2; gj++)
             {
@@ -1113,10 +1200,10 @@ namespace ProceduralTerrain
                 float cz = (zz + 0.5f) * ZoneSize;
                 float r  = Mathf.Max(blurRadius, ZoneSize * 0.5f);
                 // 8-direction ring: cardinal + diagonal. Diagonal weight 0.5 (projected onto axes).
-                float hpx = wg.GetHeight(cx + r, cz),     hnx = wg.GetHeight(cx - r, cz);
-                float hpz = wg.GetHeight(cx, cz + r),     hnz = wg.GetHeight(cx, cz - r);
-                float hpp = wg.GetHeight(cx + r, cz + r), hnn = wg.GetHeight(cx - r, cz - r);
-                float hpn = wg.GetHeight(cx + r, cz - r), hnp = wg.GetHeight(cx - r, cz + r);
+                float hpx = Plugin.GroundHeight(cx + r, cz, wg),     hnx = Plugin.GroundHeight(cx - r, cz, wg);
+                float hpz = Plugin.GroundHeight(cx, cz + r, wg),     hnz = Plugin.GroundHeight(cx, cz - r, wg);
+                float hpp = Plugin.GroundHeight(cx + r, cz + r, wg), hnn = Plugin.GroundHeight(cx - r, cz - r, wg);
+                float hpn = Plugin.GroundHeight(cx + r, cz - r, wg), hnp = Plugin.GroundHeight(cx - r, cz + r, wg);
                 float gx = ((hpx - hnx) + 0.5f * ((hpp - hnp) + (hpn - hnn))) / (4f * r);
                 float gz = ((hpz - hnz) + 0.5f * ((hpp - hpn) + (hnp - hnn))) / (4f * r);
                 float mag = Mathf.Sqrt(gx * gx + gz * gz);
@@ -1159,12 +1246,91 @@ namespace ProceduralTerrain
             }
         }
 
+        // Vanilla-matching ground height. WorldGenerator.GetHeight is SINGLE-BIOME (steps ~tens of
+        // meters at biome boundaries); vanilla's rendered terrain is a per-zone bilinear blend of the
+        // 4 corner biomes' height functions, computed by HeightmapBuilder.Build. We reuse that exact
+        // pure function (private, via reflection — vanilla runs it on its own worker thread, so it's
+        // thread-safe) per 64m zone, cache the 65×65 grid, and bilinear-sample it. No replication.
+        internal static class VanillaHeight
+        {
+            const int   Wv       = 64;      // heightmap width; verts = Wv+1. Near terrain = 64m @ scale 1.
+            const int   Num      = Wv + 1;  // 65
+            const float ZoneSize = 64f;
+            const float ZoneHalf = 32f;
+
+            static System.Reflection.MethodInfo? _build;
+            static object? _builder;
+            static bool _init, _ok;
+            static readonly System.Collections.Concurrent.ConcurrentDictionary<(int, int), float[]?> _cache = new();
+
+            public static void Clear() => _cache.Clear();
+
+            static void Init()
+            {
+                if (_init) return;
+                _init = true;
+                try
+                {
+                    _builder = HeightmapBuilder.instance;
+                    _build   = typeof(HeightmapBuilder).GetMethod("Build",
+                        System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+                    _ok = _builder != null && _build != null;
+                    if (!_ok) Log.LogWarning("[ProceduralTerrain] VanillaHeight: reflection unavailable, using GetHeight fallback");
+                }
+                catch (System.Exception e) { _ok = false; Log.LogWarning($"[ProceduralTerrain] VanillaHeight init failed: {e.Message}"); }
+            }
+
+            static float[]? BuildZone((int, int) z, WorldGenerator wg)
+            {
+                try
+                {
+                    var center = new Vector3(z.Item1 * ZoneSize, 0f, z.Item2 * ZoneSize);
+                    var data   = new HeightmapBuilder.HMBuildData(center, Wv, 1f, false, wg);
+                    _build!.Invoke(_builder, new object[] { data });
+                    var list = data.m_baseHeights;
+                    return (list != null && list.Count >= Num * Num) ? list.ToArray() : null;
+                }
+                catch (System.Exception e) { Log.LogWarning($"[ProceduralTerrain] VanillaHeight build failed: {e.Message}"); return null; }
+            }
+
+            public static float Sample(float wx, float wz, WorldGenerator wg)
+            {
+                Init();
+                if (!_ok) return wg.GetHeight(wx, wz);
+                int zx = Mathf.FloorToInt((wx + ZoneHalf) / ZoneSize);
+                int zz = Mathf.FloorToInt((wz + ZoneHalf) / ZoneSize);
+                var grid = _cache.GetOrAdd((zx, zz), key => BuildZone(key, wg));
+                if (grid == null) return wg.GetHeight(wx, wz);
+                float ox = zx * ZoneSize - ZoneHalf;   // world pos of vertex (l=0,k=0)
+                float oz = zz * ZoneSize - ZoneHalf;
+                float lx = Mathf.Clamp(wx - ox, 0f, Wv);
+                float lz = Mathf.Clamp(wz - oz, 0f, Wv);
+                int il = Mathf.Min((int)lx, Wv - 1), ik = Mathf.Min((int)lz, Wv - 1);
+                float fx = lx - il, fz = lz - ik;
+                // vanilla layout: m_baseHeights[k*Num + l], vertex world = (ox+l, oz+k)
+                float h00 = grid[ik * Num + il],           h10 = grid[ik * Num + il + 1];
+                float h01 = grid[(ik + 1) * Num + il],     h11 = grid[(ik + 1) * Num + il + 1];
+                float a = h00 + (h10 - h00) * fx;
+                float b = h01 + (h11 - h01) * fx;
+                return a + (b - a) * fz;
+            }
+        }
+
+        // Ground surface height: vanilla-blended (matches rendered terrain) when _vanillaHeight, else raw single-biome.
+        internal static float GroundHeight(float wx, float wz, WorldGenerator? wg)
+        {
+            if (wg == null) return 0f;
+            return _vanillaHeight ? VanillaHeight.Sample(wx, wz, wg) : wg.GetHeight(wx, wz);
+        }
+
         static void FillPhase1(float[] buf, int bw, int bh, int extLo, float s,
             int ox, int oz, int overlap, WorldGenerator? wg, int cw4,
             List<(Vector2 pos, float extR)> nearbyLocs, Voxheim.Core.HeightGrid? heightGrid = null)
         {
             var pipeline = _pipeline;
             int pLen2 = pipeline.Length;
+            int cv = CellVox;               // voxels per coarse cell (coarseMult knob)
+            float invCv = 1f / cv;
             if (Plugin._modeColCtx == null || Plugin._modeColCtx.Length < pLen2)
                 Plugin._modeColCtx = new ModeColCtx[pLen2];
             for (int cx = 0; cx < bw; cx++)
@@ -1173,11 +1339,11 @@ namespace ProceduralTerrain
                 int   gx     = ox - overlap + cx, gz = oz - overlap + cz;
                 float worldX = gx * s,            worldZ = gz * s;
 
-                int cx4  = cx / 4, cz4  = cz / 4;
+                int cx4  = cx / cv, cz4  = cz / cv;
                 int cx4b = Math.Min(cx4 + 1, cw4 - 1);
                 int cz4b = Math.Min(cz4 + 1, cw4 - 1);
-                float bfx = (cx & 3) * 0.25f;
-                float bfz = (cz & 3) * 0.25f;
+                float bfx = (cx % cv) * invCv;
+                float bfz = (cz % cv) * invCv;
                 int b200 = cx4  * cw4 + cz4,  b210 = cx4b * cw4 + cz4;
                 int b201 = cx4  * cw4 + cz4b, b211 = cx4b * cw4 + cz4b;
 
@@ -1195,7 +1361,7 @@ namespace ProceduralTerrain
                     long hKey = (long)gx << 32 | (uint)gz;
                     if (!_heightCache.TryGetValue(hKey, out h))
                     {
-                        h = wg.GetHeight(worldX, worldZ);
+                        h = GroundHeight(worldX, worldZ, wg);
                         if (!_parallelBakeActive) _heightCache[hKey] = h;
                     }
                 }
@@ -1219,7 +1385,7 @@ namespace ProceduralTerrain
 
                 // mode D uses a (cw4+1)×(cw4+1) coarse grid
                 int mdCw  = cw4 + 1;
-                int mdCx4 = cx / 4, mdCz4 = cz / 4;
+                int mdCx4 = cx / cv, mdCz4 = cz / cv;
                 int md200 = mdCx4 * mdCw + mdCz4,       md210 = (mdCx4 + 1) * mdCw + mdCz4;
                 int md201 = mdCx4 * mdCw + (mdCz4 + 1), md211 = (mdCx4 + 1) * mdCw + (mdCz4 + 1);
                 float nmX = BL(_cb.bk2dTgX!, md200, md210, md201, md211, bfx, bfz);

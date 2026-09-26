@@ -44,6 +44,7 @@ namespace ProceduralTerrain
         public float bfx, bfz;               // BL fractions
         public int   b00, b10, b01, b11, bh; // BL3Y corner indices
         public float[]? arr0;                // finished SDF column aux buffer
+        public float baselineCorr;           // per-column surface-baseline correction (full-res addh vs coarse-interp), 0 if not surface-anchored
     }
 
     // ── Abstract ModeDefinition ───────────────────────────────────────────────
@@ -64,6 +65,15 @@ namespace ProceduralTerrain
 
         public virtual bool NeedsGradField => false;
         public virtual float GradBlurRadius => 128f;
+
+        // Surface-anchored modes reference the vanilla surface (addh) as their baseline. When true,
+        // BakeColumn writes that coarse addh into cb.bkModeBaseline[pi][cellIdx], and the framework
+        // replaces the coarse-interpolated baseline with a full-res one (kills coarse faceting/cliffs)
+        // by adding BL(addh_coarse) - SampleBaselineFull() per column. Cost: +1 GetHeight per column.
+        public virtual bool SurfaceAnchored => false;
+        // Recompute this mode's surface baseline (addh, world units) at the full-res column position
+        // col.worldX/worldZ, using BL-interpolated cell params. Only called when SurfaceAnchored && toggle on.
+        public virtual float SampleBaselineFull(ref CarveBuffers cb, in ColumnCtx col, WorldGenerator? wg) => 0f;
 
         // Per-mode blended param metadata. Param index 0 is always amplitude.
         public abstract int ParamCount { get; }
@@ -104,6 +114,16 @@ namespace ProceduralTerrain
             c.bfx = col.bfx; c.bfz = col.bfz;
             c.b00 = col.b3_00; c.b10 = col.b3_10; c.b01 = col.b3_01; c.b11 = col.b3_11; c.bh = col.bh;
             c.arr0 = cb.bkModeAux![PipelineIndex][0];
+            // Full-res surface baseline: replace the coarse-interpolated addh with an exact per-column one.
+            // correction = BL(addh_coarse) - addh_fullres; a constant vertical shift down the column.
+            c.baselineCorr = 0f;
+            if (SurfaceAnchored && Plugin._surfaceFullRes && cb.bkModeBaseline != null
+                && PipelineIndex < cb.bkModeBaseline.Length && cb.bkModeBaseline[PipelineIndex] != null)
+            {
+                float baseInterp = Plugin.BL(cb.bkModeBaseline[PipelineIndex]!, col.b200, col.b210, col.b201, col.b211, col.bfx, col.bfz);
+                float addhFull   = SampleBaselineFull(ref cb, in col, WorldGenerator.instance);
+                c.baselineCorr   = baseInterp - addhFull;
+            }
         }
 
         // Interpolate the finished SDF column to this voxel, clamp to the floor, and blend in.
@@ -112,7 +132,7 @@ namespace ProceduralTerrain
             ref var c = ref Plugin._modeColCtx![PipelineIndex];
             if (c.colAmp <= 0f || c.arr0 == null) return;
             float scale = Plugin._scale ?? 1f;
-            float raw   = Plugin.BL3Y(c.arr0, c.b00, c.b10, c.b01, c.b11, ctx.cy, c.bfx, c.bfz) * scale;
+            float raw   = (Plugin.BL3Y(c.arr0, c.b00, c.b10, c.b01, c.b11, ctx.cy, c.bfx, c.bfz) + c.baselineCorr) * scale;
             float sdf   = Mathf.Min(raw, ctx.worldY - ctx.floorY);
             switch (Blend)
             {
@@ -351,6 +371,36 @@ namespace ProceduralTerrain
         };
         protected override (string name, float def)[] ParamSpec => _spec;
 
+        public override bool SurfaceAnchored => true;
+
+        // Recompute addh (the warped vanilla surface this formation anchors to) at the full-res
+        // column position, using BL-interpolated cell params. Mirrors the addh block in BakeColumn.
+        public override float SampleBaselineFull(ref CarveBuffers cb, in ColumnCtx col, WorldGenerator? wg)
+        {
+            var P = cb.bkModeParams![PipelineIndex];
+            int c200 = col.b200, c210 = col.b210, c201 = col.b201, c211 = col.b211;
+            float fx = col.bfx, fz = col.bfz;
+            float BLp(int p) => Plugin.BL(P[p], c200, c210, c201, c211, fx, fz);
+            float warpAmp = BLp(2), warpFreq = BLp(3), yoffset = BLp(12), smoothR = BLp(13), yanchor = BLp(15);
+            wg ??= WorldGenerator.instance;
+            var pool = Plugin._noisePool!;
+            float wx = col.worldX, wz = col.worldZ;
+            float warpx = pool[3].GetNoise(wx * warpFreq, wz * warpFreq, 0f) * warpAmp;
+            float warpz = pool[4].GetNoise(wx * warpFreq, wz * warpFreq, 0f) * warpAmp;
+            float addh;
+            if (yanchor != 0f) addh = yanchor;
+            else if (smoothR > 0f)
+            {
+                float sum = 0f;
+                for (int dx = -1; dx <= 1; dx++)
+                for (int dz = -1; dz <= 1; dz++)
+                    sum += Plugin.GroundHeight(wx + dx * smoothR + warpx, wz + dz * smoothR + warpz, wg);
+                addh = sum / 9f;
+            }
+            else addh = Plugin.GroundHeight(wx + warpx, wz + warpz, wg);
+            return addh - yoffset;
+        }
+
         public override void BakeColumn(ref CarveBuffers cb, in BakeCellArgs args)
         {
             int pi = PipelineIndex;
@@ -359,7 +409,6 @@ namespace ProceduralTerrain
             float[] outCol = cb.bkModeAux![pi][0];
 
             float amp = P[0][idx];
-            if (amp <= 0f) { for (int cy = 0; cy < args.bh; cy++) outCol[baseIdx + cy] = 0f; return; }
 
             float freq      = P[1][idx],  warpAmp  = P[2][idx],  warpFreq = P[3][idx], vscale  = P[4][idx];
             float threshold = P[5][idx],  twist    = P[6][idx],  twistVary= P[7][idx], twistFq = P[8][idx];
@@ -381,11 +430,20 @@ namespace ProceduralTerrain
                 float sum = 0f;
                 for (int dx = -1; dx <= 1; dx++)
                 for (int dz = -1; dz <= 1; dz++)
-                    sum += wg != null ? wg.GetHeight(wx + dx * smoothR + warpx, wz + dz * smoothR + warpz) : 0f;
+                    sum += Plugin.GroundHeight(wx + dx * smoothR + warpx, wz + dz * smoothR + warpz, wg);
                 addh = sum / 9f;
             }
-            else addh = wg != null ? wg.GetHeight(wx + warpx, wz + warpz) : 0f;
+            else addh = Plugin.GroundHeight(wx + warpx, wz + warpz, wg);
             addh -= yoffset;
+            // Store coarse addh UNCONDITIONALLY — the baseline field must be defined at every cell for
+            // PrepareColumn's bilinear correction. Amplitude gates whether the correction is APPLIED
+            // (via colAmp), never whether the baseline EXISTS. Storing only at amp>0 left stale
+            // [ThreadStatic] baselines at absent/faded cells → garbage correction → boundary spikes.
+            if (cb.bkModeBaseline != null && pi < cb.bkModeBaseline.Length && cb.bkModeBaseline[pi] != null)
+                cb.bkModeBaseline[pi]![idx] = addh;
+
+            // Amplitude gate: no carving contribution here, but the baseline above is already recorded.
+            if (amp <= 0f) { for (int cy = 0; cy < args.bh; cy++) outCol[baseIdx + cy] = 0f; return; }
 
             float lamp = Mathf.Max(amp * (1f + ampVary * pool[5].GetNoise(wx * ampFreq, wz * ampFreq, 0f)), 0f);
             if (gradFade > 0f && wg != null)
@@ -574,6 +632,11 @@ namespace ProceduralTerrain
         internal static int   _transitionBlurPasses = 3;     // min blur passes for any active zone
         internal static int   _fixpointMaxZones     = 8;     // EnsureFixpoint hop cap
         internal static float _coastFade           = 0f;     // world units above sea level over which Ocean inflates into blend (0=off)
+        internal static int   _blendMode           = 1;      // default sdf: bake each present biome, crossfade output columns (correct at dissimilar-profile boundaries). 0=param (one blended bake; chirps at differing-frequency borders — ablation/compat only)
+        internal static float _coarseMult          = 1f;     // coarse bake cell = 4*mult voxels (0.5=2m, 1=4m, 2=8m, 4=16m; 0.25=1m≈per-voxel). Diagnostic knob for coarse-resolution faceting.
+        internal static int   CellVox { get { int v = Mathf.RoundToInt(4f * _coarseMult); return v < 1 ? 1 : v; } }  // voxels per coarse cell in XZ
+        internal static bool  _surfaceFullRes       = true;   // surface-anchored modes: replace coarse-interp baseline with full-res addh (kills coarse faceting cliffs)
+        internal static bool  _vanillaHeight        = true;   // sample ground via vanilla HeightmapBuilder (biome-blended, matches rendered terrain) instead of single-biome GetHeight
 
         // ── Bake download (client receiving from server) ──────────────────────────
         internal static bool   _bakeDownloadActive;
@@ -662,6 +725,16 @@ namespace ProceduralTerrain
         [ThreadStatic] static int[]?         _biomeBfsQ;
         [ThreadStatic] static float[]?       _biomeTotW;
         [ThreadStatic] static CaveProfile[]? _blendedProfs;
+
+        // SDF-blend (_blendMode==1) retained per-cell contributions, populated in BakeBlendedProfiles,
+        // consumed by BakeColumnSdfBlend. Only allocated/filled when _blendMode==1.
+        //   _sdfBiomeInt/_sdfBiomeW: [cellIdx*MaxBiomeSlots + k] biome enum-int + its geometric blend weight
+        //   _sdfBiomeN:  [cellIdx] number of contributing biomes at that cell
+        //   _sdfPresentW:[mi*cellCount + cellIdx] per-mode sum of weights over biomes that HAVE the mode
+        [ThreadStatic] static int[]?   _sdfBiomeInt;
+        [ThreadStatic] static float[]? _sdfBiomeW;
+        [ThreadStatic] static int[]?   _sdfBiomeN;
+        [ThreadStatic] static float[]? _sdfPresentW;
 
         // wg.GetHeight is a pure function of (worldX, worldZ) for a given world seed.
         // Cache it keyed by integer coarse voxel coords — cleared on world load only.

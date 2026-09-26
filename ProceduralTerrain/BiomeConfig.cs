@@ -262,6 +262,14 @@ namespace ProceduralTerrain
                             _fixpointMaxZones = Mathf.Max(1, fmz);
                         if (k == "coastfade" && float.TryParse(v, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float cf))
                             _coastFade = Mathf.Max(0f, cf);
+                        if (k == "blendmode")
+                            _blendMode = (v == "sdf" || v == "1") ? 1 : 0;
+                        if (k == "coarsemult" && float.TryParse(v, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float cm))
+                            _coarseMult = Mathf.Clamp(cm, 0.25f, 16f);
+                        if (k == "surfacefullres")
+                            _surfaceFullRes = !(v == "0" || v == "false");
+                        if (k == "vanillaheight")
+                            _vanillaHeight = !(v == "0" || v == "false");
                     }
                     continue;
                 }
@@ -316,6 +324,7 @@ namespace ProceduralTerrain
                 if (modeDefs.TryGetValue(mn, out var pmd)) { pmd.PipelineIndex = pipelineList.Count; pipelineList.Add(pmd); }
             _pipeline = pipelineList.ToArray();
             Plugin.ZoneGradCache.Clear();
+            Plugin.VanillaHeight.Clear();
 
             // Build _biomeParams [biome][pipelineIdx][paramIdx]
             var newBiomeParams = new Dictionary<Heightmap.Biome, float[][]>();
@@ -534,7 +543,7 @@ namespace ProceduralTerrain
         static Dictionary<int, int> SetupPointBlend(float worldX, float worldZ, WorldGenerator wg, float s,
             out float coarseStep, out int pcw, out int pgSize, out int maxHops, out int center)
         {
-            coarseStep = 4f * s;
+            coarseStep = CellVox * s;
             int pad  = (int)(_biomeBlendRadius / coarseStep) + 2;
             pcw      = 1 + 2 * pad;
             pgSize   = pcw * pcw;
@@ -768,7 +777,8 @@ namespace ProceduralTerrain
             CaveProfile GetP(Heightmap.Biome b) =>
                 profs.TryGetValue(b, out var p) ? p : CaveProfile.Default;
 
-            float coarseStep = 4f * s;
+            int   cellVox    = CellVox;
+            float coarseStep = cellVox * s;
             int pad    = (int)(_biomeBlendRadius / coarseStep) + 2;
             int pcw    = cw4 + 2 * pad;
             int pgSize = pcw * pcw;
@@ -787,14 +797,14 @@ namespace ProceduralTerrain
             for (int px = 0; px < pcw; px++)
             for (int pz = 0; pz < pcw; pz++)
             {
-                int gx0 = ox - overlap + (px - pad) * 4;
-                int gz0 = oz - overlap + (pz - pad) * 4;
+                int gx0 = ox - overlap + (px - pad) * cellVox;
+                int gz0 = oz - overlap + (pz - pad) * cellVox;
                 int cellBase = (px * pcw + pz) * MaxBiomeSlots;
                 for (int si = 0; si < SuperN; si++)
                 for (int sk = 0; sk < SuperN; sk++)
                 {
-                    float wx = (gx0 + (si + 0.5f) * 4f / SuperN) * s;
-                    float wz = (gz0 + (sk + 0.5f) * 4f / SuperN) * s;
+                    float wx = (gx0 + (si + 0.5f) * cellVox / SuperN) * s;
+                    float wz = (gz0 + (sk + 0.5f) * cellVox / SuperN) * s;
                     int b = (int)wg.GetBiome(wx, wz);
                     if (!biomeSlot.TryGetValue(b, out int slot))
                     {
@@ -813,6 +823,18 @@ namespace ProceduralTerrain
             if (_biomeTotW == null || _biomeTotW.Length < cellCount)
                 _biomeTotW = new float[cellCount];
             for (int i = 0; i < cellCount; i++) { _blendedProfs[i] = new CaveProfile(); _biomeTotW[i] = 0f; }
+
+            // SDF-blend: retain per-cell biome contributions (biome + weight) so BakeColumnSdfBlend
+            // can bake each present biome's own params and crossfade the output columns (no param chirp).
+            bool sdfBlend = _blendMode == 1;
+            if (sdfBlend)
+            {
+                int slotStride = cellCount * MaxBiomeSlots;
+                if (_sdfBiomeInt == null || _sdfBiomeInt.Length < slotStride) _sdfBiomeInt = new int[slotStride];
+                if (_sdfBiomeW   == null || _sdfBiomeW.Length   < slotStride) _sdfBiomeW   = new float[slotStride];
+                if (_sdfBiomeN   == null || _sdfBiomeN.Length   < cellCount)  _sdfBiomeN   = new int[cellCount];
+                Array.Clear(_sdfBiomeN, 0, cellCount);
+            }
 
             if (_biomeDist == null || _biomeDist.Length < pgSize) _biomeDist = new int[pgSize];
             if (_biomeBfsQ == null || _biomeBfsQ.Length < pgSize) _biomeBfsQ = new int[pgSize];
@@ -844,6 +866,8 @@ namespace ProceduralTerrain
             // Per-mode present weight: sum of biome weights where mode is non-null.
             // Used to normalize non-amplitude params so absent biomes don't pull them toward zero.
             var modePresentWAcc   = new float[pLen * cellCount];
+            if (sdfBlend && (_sdfPresentW == null || _sdfPresentW.Length < pLen * cellCount))
+                _sdfPresentW = new float[pLen * cellCount];
 
             foreach (var (biomeInt, slot) in biomeSlot)
             {
@@ -874,6 +898,16 @@ namespace ProceduralTerrain
                     int idx = cx4 * cw4 + cz4;
                     ref var acc = ref _blendedProfs![idx];
                     AccumulateProfile(ref acc, ref _biomeTotW![idx], in prof, w);
+                    if (sdfBlend)
+                    {
+                        int k = _sdfBiomeN![idx];
+                        if (k < MaxBiomeSlots)
+                        {
+                            _sdfBiomeInt![idx * MaxBiomeSlots + k] = biomeInt;
+                            _sdfBiomeW  ![idx * MaxBiomeSlots + k] = w;
+                            _sdfBiomeN[idx] = k + 1;
+                        }
+                    }
                     // Accumulate mode params
                     for (int mi = 0; mi < pLen; mi++)
                     {
@@ -904,8 +938,8 @@ namespace ProceduralTerrain
                 for (int cx4 = 0; cx4 < cw4; cx4++)
                 for (int cz4 = 0; cz4 < cw4; cz4++)
                 {
-                    float wx = (ox - overlap + cx4 * 4 + 2) * s;
-                    float wz = (oz - overlap + cz4 * 4 + 2) * s;
+                    float wx = (ox - overlap + cx4 * cellVox + cellVox / 2) * s;
+                    float wz = (oz - overlap + cz4 * cellVox + cellVox / 2) * s;
                     float h  = wg.GetHeight(wx, wz);
                     float coastW = 1f - Mathf.Clamp01((h - SeaLevel) / _coastFade);
                     if (coastW <= 0f) continue;
@@ -941,6 +975,7 @@ namespace ProceduralTerrain
                     int nP = pipeline[mi].ParamCount;
                     int accBase = (mi * maxParamCount) * cellCount + idx;
                     float presentW = modePresentWAcc[mi * cellCount + idx];
+                    if (sdfBlend) _sdfPresentW![mi * cellCount + idx] = presentW;
                     // Gather per-param accumulated sums into a temp span, then normalize.
                     Span<float> acc = stackalloc float[nP];
                     for (int pi = 0; pi < nP; pi++) acc[pi] = modeParamAcc[accBase + pi * cellCount];

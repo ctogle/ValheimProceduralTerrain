@@ -335,6 +335,7 @@ namespace ProceduralTerrain
             _bakeLoadAttempted = false;
             _sdfCache.Clear();
             _heightCache.Clear();
+            VanillaHeight.Clear();
             lock (_surfHCache) _surfHCache.Clear();
             _zoneFaceCache.Clear();
             _locationPositions.Clear();
@@ -354,6 +355,7 @@ namespace ProceduralTerrain
         {
             _sdfCache.Clear();
             _heightCache.Clear();
+            VanillaHeight.Clear();
             lock (_surfHCache) _surfHCache.Clear();
             _zoneFaceCache.Clear();
 
