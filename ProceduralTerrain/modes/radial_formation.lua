@@ -5,7 +5,10 @@
 -- params: featureAmp gaborCell gaborFreq gaborRadius gaborAniso contour slopeFade
 --         ringFreq ringWarp ringWarpF extendUp
 function bake(wx, wz, params, extLoS, s, bh)
-    local featureAmp  = params.featureamp  or 10
+    -- Feature strength: use the index-0 amplitude (coverage-faded by C# — totW-normalized in param
+    -- mode, ampB*coverageFrac in sdf) so one-sided modes taper out over blendRadius into neighbors
+    -- instead of hard-cutting. featureAmp kept only as a fallback for configs that don't set amplitude.
+    local strength    = params.amplitude   or params.featureamp or 10
     local gaborCell   = params.gaborcell   or 40    -- kernel spacing (world units); ~ feature size
     local gaborFreq   = params.gaborfreq   or 0.025 -- across-slope wave cycles per world unit
     local gaborRadius = params.gaborradius or 45    -- kernel envelope radius (world units)
@@ -75,7 +78,7 @@ function bake(wx, wz, params, extLoS, s, bh)
         amp = t * t * (3 - 2 * t)
     end
 
-    local surf_h = h0 + featureAmp * feat * amp
+    local surf_h = h0 + strength * feat * amp
 
     local result = {}
     for cy = 0, bh - 1 do
