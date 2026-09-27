@@ -132,7 +132,7 @@ namespace ProceduralTerrain
             InitNoise();
 
             int   cw4     = cw4Early;
-            BakeSdfSetup(ox, oz, overlap, s, extLo, bh, bw, cw4, wg, nearbyLocs);
+            BakeSdfSetup(ox, oz, overlap, s, extLo, bh, bw, cw4, wg, nearbyLocs, heightGrid);
 
             bool anyPipelineActive = _pipeline.Length > 0 && _cb.bkModeParams != null &&
                 _pipeline.Any(m => _cb.bkModeParams![m.PipelineIndex][0].Any(v => v > 0f));
@@ -947,7 +947,8 @@ namespace ProceduralTerrain
         // ── BakeSdfSetup ─────────────────────────────────────────────────────────
         static void BakeSdfSetup(
             int ox, int oz, int overlap, float s, int extLo, int bh, int bw, int cw4,
-            WorldGenerator? wg, List<(Vector2 pos, float extR)> nearbyLocs)
+            WorldGenerator? wg, List<(Vector2 pos, float extR)> nearbyLocs,
+            Voxheim.Core.HeightGrid? heightGrid = null)
         {
             var pipeline = _pipeline;
             int pLen     = pipeline.Length;
@@ -1072,9 +1073,15 @@ namespace ProceduralTerrain
                     int cell   = cx4 * cw4 + cz4;
                     int cbaseF = cell * bh;                       // full-Y mode-column base
                     int cbaseC = cell * ch;                       // coarse-Y running-field base
-                    float wx = (ox - overlap + Math.Min(cx4 * cv, bw - 1)) * s;
-                    float wz = (oz - overlap + Math.Min(cz4 * cv, bw - 1)) * s;
-                    float hCell  = wg != null ? GroundHeight(wx, wz, wg) : 0f;
+                    int cxw = Math.Min(cx4 * cv, bw - 1);
+                    int czw = Math.Min(cz4 * cv, bw - 1);
+                    float wx = (ox - overlap + cxw) * s;
+                    float wz = (oz - overlap + czw) * s;
+                    // Base = groundworked height (vanilla TerrainModifiers that flatten locations) when a
+                    // heightGrid is present — matches legacy's effectiveH so location protection has parity.
+                    // Falls back to raw GroundHeight otherwise (same as legacy without a grid).
+                    float hCell = heightGrid != null ? heightGrid[cxw - overlap, czw - overlap] * s
+                                : (wg != null ? GroundHeight(wx, wz, wg) : 0f);
                     float floorD = (_blendedProfs != null && cell < _blendedProfs.Length) ? _blendedProfs[cell].floorDepth : 0f;
                     float floorY = hCell - floorD;
                     for (int cyc = 0; cyc < ch; cyc++) _runSDF![cbaseC + cyc] = (extLoS2 + cyc * yStep) - hCell;   // base column
