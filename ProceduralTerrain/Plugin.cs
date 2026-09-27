@@ -138,6 +138,13 @@ namespace ProceduralTerrain
             {
                 case "smoothmax": combined = Plugin.SmoothMax(combined, sdf, BlendK * scale); break;
                 case "max":       if (sdf > combined) combined = sdf; break;
+                // "add": base = the INCOMING sdf (compose on the running result) instead of vanilla.
+                // Stack this mode's displacement-above-base onto whatever's already there, so additive
+                // modes sum rather than the taller one winning. Order-dependent (unlike min/max/smoothmax).
+                case "add":       combined += sdf - (ctx.worldY - ctx.effectiveH); break;
+                // "subtract": add's inverse — apply this mode's displacement-above-base as a carve
+                // (raise-pattern -> valley). Distinct from negative amplitude (modes clamp amp >= 0).
+                case "subtract":  combined -= sdf - (ctx.worldY - ctx.effectiveH); break;
                 default:          if (sdf < combined) combined = sdf; break; // "min"
             }
         }
