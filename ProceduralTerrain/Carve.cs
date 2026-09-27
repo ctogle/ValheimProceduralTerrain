@@ -1051,6 +1051,56 @@ namespace ProceduralTerrain
                     foreach (var mode in pipeline)
                         mode.BakeColumn(ref _cb, in args);
             }
+
+            // ── Path B (composeMode=1): sequential composition into a running coarse SDF ─────────
+            // Instead of per-voxel blending in FillPhase1, compose each mode's coarse column into a
+            // running SDF in pipeline order (mirrors ComputeVoxel's per-mode logic at coarse res).
+            // Coarse field, no surfaceFullRes correction here; FillPhase1 interpolates the final field.
+            // Eikonal redistance (so |grad|->1 and modes can sample true distance/normal) = increment 2.
+            if (_composeMode == 1)
+            {
+                int cellCount = cw4 * cw4;
+                if (_runSDF == null || _runSDF.Length < cellCount * bh) _runSDF = new float[cellCount * bh];
+                float scale2  = _scale ?? 1f;
+                float extLoS2 = extLo * s;
+                for (int cx4 = 0; cx4 < cw4; cx4++)
+                for (int cz4 = 0; cz4 < cw4; cz4++)
+                {
+                    int cell  = cx4 * cw4 + cz4;
+                    int cbase = cell * bh;
+                    float wx = (ox - overlap + Math.Min(cx4 * CellVox, bw - 1)) * s;
+                    float wz = (oz - overlap + Math.Min(cz4 * CellVox, bw - 1)) * s;
+                    float hCell  = wg != null ? GroundHeight(wx, wz, wg) : 0f;
+                    float floorD = (_blendedProfs != null && cell < _blendedProfs.Length) ? _blendedProfs[cell].floorDepth : 0f;
+                    float floorY = hCell - floorD;
+                    for (int cy = 0; cy < bh; cy++) _runSDF![cbase + cy] = (extLoS2 + cy * s) - hCell;   // base column
+                    foreach (var mode in pipeline)
+                    {
+                        int mi = mode.PipelineIndex;
+                        if (mi < 0) continue;
+                        float gate = _cb.bkModeParams![mi][0][cell];
+                        if (gate <= 0f) continue;                       // mode inactive at this cell
+                        var aux = _cb.bkModeAux![mi][0];
+                        string blend = mode.Blend;
+                        float k = mode.BlendK * scale2;
+                        for (int cy = 0; cy < bh; cy++)
+                        {
+                            float worldY = extLoS2 + cy * s;
+                            float raw = aux[cbase + cy] * scale2;
+                            float sdf = Mathf.Min(raw, worldY - floorY);
+                            ref float r = ref _runSDF![cbase + cy];
+                            switch (blend)
+                            {
+                                case "smoothmax": r = Plugin.SmoothMax(r, sdf, k); break;
+                                case "max":       if (sdf > r) r = sdf; break;
+                                case "add":       r += sdf - (worldY - hCell); break;
+                                case "subtract":  r -= sdf - (worldY - hCell); break;
+                                default:          if (sdf < r) r = sdf; break; // "min"
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         // SDF-blend driver: instead of one BakeColumn on cross-biome-averaged params (which chirps
@@ -1405,7 +1455,8 @@ namespace ProceduralTerrain
                     cw4=cw4, bh=bh,
                     cx=cx, cz=cz, bw=bw
                 };
-                foreach (var mode in pipeline) mode.PrepareColumn(ref _cb, in col);
+                bool compose = _composeMode == 1;
+                if (!compose) foreach (var mode in pipeline) mode.PrepareColumn(ref _cb, in col);
 
                 // Voxel loop
                 float floorY = effectiveH - profFlD;
@@ -1413,12 +1464,22 @@ namespace ProceduralTerrain
                 {
                     float worldY  = (extLo + cy) * s;
                     float baseSDF = worldY - effectiveH;
-                    float combined = baseSDF;
-                    var vox = new VoxelCtx {
-                        worldX=worldX, worldY=worldY, worldZ=worldZ, effectiveH=effectiveH,
-                        cy=cy, locFac=locFac, floorY=floorY, floorFade=profFlFade
-                    };
-                    foreach (var mode in pipeline) mode.ComputeVoxel(ref combined, in vox);
+                    float combined;
+                    if (compose)
+                    {
+                        // Path B: sample the pre-composed running SDF (world units already). Same corner
+                        // indices / fractions as a mode column — runSDF shares the [cell*bh+cy] layout.
+                        combined = BL3Y(_runSDF!, col.b3_00, col.b3_10, col.b3_01, col.b3_11, cy, col.bfx, col.bfz);
+                    }
+                    else
+                    {
+                        combined = baseSDF;
+                        var vox = new VoxelCtx {
+                            worldX=worldX, worldY=worldY, worldZ=worldZ, effectiveH=effectiveH,
+                            cy=cy, locFac=locFac, floorY=floorY, floorFade=profFlFade
+                        };
+                        foreach (var mode in pipeline) mode.ComputeVoxel(ref combined, in vox);
+                    }
                     float _fade = profFlFade > 0f ? Mathf.Clamp01((worldY - floorY) / profFlFade) : 1f;
                     buf[(cx * bh + cy) * bw + cz] = baseSDF + (combined - baseSDF) * locFac * _fade;
                 }

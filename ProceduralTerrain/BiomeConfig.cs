@@ -265,6 +265,8 @@ namespace ProceduralTerrain
                             _coastFade = Mathf.Max(0f, cf);
                         if (k == "blendmode")
                             _blendMode = (v == "sdf" || v == "1") ? 1 : 0;
+                        if (k == "composemode")
+                            _composeMode = (v == "sequential" || v == "1") ? 1 : 0;
                         if (k == "coarsemult" && float.TryParse(v, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float cm))
                             _coarseMult = Mathf.Clamp(cm, 0.25f, 16f);
                         if (k == "surfacefullres")

@@ -654,6 +654,7 @@ namespace ProceduralTerrain
         internal static int   _fixpointMaxZones     = 8;     // EnsureFixpoint hop cap
         internal static float _coastFade           = 0f;     // world units above sea level over which Ocean inflates into blend (0=off)
         internal static int   _blendMode           = 1;      // default sdf: bake each present biome, crossfade output columns (correct at dissimilar-profile boundaries). 0=param (one blended bake; chirps at differing-frequency borders — ablation/compat only)
+        internal static int   _composeMode         = 0;      // 0=legacy (per-voxel blend in FillPhase1); 1=sequential (Path B: compose modes into a running coarse SDF in pipeline order, then interpolate)
         internal static float _coarseMult          = 1f;     // coarse bake cell = 4*mult voxels (0.5=2m, 1=4m, 2=8m, 4=16m; 0.25=1m≈per-voxel). Diagnostic knob for coarse-resolution faceting.
         internal static int   CellVox { get { int v = Mathf.RoundToInt(4f * _coarseMult); return v < 1 ? 1 : v; } }  // voxels per coarse cell in XZ
         internal static bool  _surfaceFullRes       = true;   // surface-anchored modes: replace coarse-interp baseline with full-res addh (kills coarse faceting cliffs)
@@ -746,6 +747,7 @@ namespace ProceduralTerrain
         [ThreadStatic] static int[]?         _biomeBfsQ;
         [ThreadStatic] static float[]?       _biomeTotW;
         [ThreadStatic] static CaveProfile[]? _blendedProfs;
+        [ThreadStatic] static float[]?       _runSDF;   // Path B: running coarse SDF (cellCount*bh, world units) modes compose into sequentially
 
         // SDF-blend (_blendMode==1) retained per-cell contributions, populated in BakeBlendedProfiles,
         // consumed by BakeColumnSdfBlend. Only allocated/filled when _blendMode==1.
