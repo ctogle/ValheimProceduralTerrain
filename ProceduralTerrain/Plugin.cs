@@ -293,7 +293,12 @@ namespace ProceduralTerrain
             // Bed height (terrain_h0), vanilla-blended. For surface-anchored modes, store it as the
             // baseline UNCONDITIONALLY — before the amp<=0 gate — so the full-res correction is defined
             // at every cell (amp gates application, not existence; else stale baselines → boundary spikes).
-            float th0 = wg2 != null ? Plugin.GroundHeight(args.worldX, args.worldZ, wg2) : 0f;
+            // Sequential compose: a surface-anchored mode reads the COMPOSED surface (the running field
+            // of PRIOR modes) as its bed + frame, so it conforms to what's already there. Else vanilla.
+            bool inc = Plugin._composeIncoming && SurfaceAnchoredFlag
+                       && Plugin._composeInH != null && idx < Plugin._composeInH.Length;
+            float th0 = inc ? Plugin._composeInH![idx]
+                            : (wg2 != null ? Plugin.GroundHeight(args.worldX, args.worldZ, wg2) : 0f);
             if (SurfaceAnchoredFlag && cb.bkModeBaseline != null && pi < cb.bkModeBaseline.Length && cb.bkModeBaseline[pi] != null)
                 cb.bkModeBaseline[pi]![idx] = th0;
 
@@ -303,9 +308,9 @@ namespace ProceduralTerrain
                 return;
             }
 
-            (float dirx, float dirz, float mag) = wg2 != null
-                ? Plugin.ZoneGradCache.Sample(wg2, args.worldX, args.worldZ, GradBlurRadius)
-                : (0f, 0f, 0f);
+            (float dirx, float dirz, float mag) = inc
+                ? (Plugin._composeInGX![idx], Plugin._composeInGZ![idx], Plugin._composeInGMag![idx])
+                : (wg2 != null ? Plugin.ZoneGradCache.Sample(wg2, args.worldX, args.worldZ, GradBlurRadius) : (0f, 0f, 0f));
 
             var e = RentEntry();
             var s = e.s; var p = e.p;
@@ -374,6 +379,27 @@ namespace ProceduralTerrain
             if (idx < 0) return;
             _defs![idx] = v;
             if (idx == 0) Amplitude = v;
+        }
+    }
+
+    // ── SurfaceBlobs: the first SDF→SDF operator (Path B proof-of-concept) ─────
+    // Unlike bake-vs-params modes, this reads the running distance field D and unions noise-modulated
+    // balls onto EVERY surface (floors and cave ceilings alike) via |D| − rEff. Applied directly to
+    // the running field in the sequential compose (see the SurfaceBlobs branch there); needs
+    // eikonal=true so |D| is metric (uniform ball size). BakeColumn is a no-op — composed specially.
+    internal sealed class SurfaceBlobs : NativeModeDef
+    {
+        static readonly (string, float)[] _spec = {
+            ("amplitude", 3f),    // ball radius r (world units); also the on/off gate
+            ("frequency", 0.05f), // 3D-noise frequency (lump scale)
+            ("noiseamp",  3f),    // radius modulation → pinches the shell into discrete balls
+        };
+        protected override (string name, float def)[] ParamSpec => _spec;
+        public override void BakeColumn(ref CarveBuffers cb, in BakeCellArgs args)
+        {
+            int pi = PipelineIndex, baseIdx = args.cellIdx * args.bh;
+            var outCol = cb.bkModeAux![pi][0];
+            for (int cy = 0; cy < args.bh; cy++) outCol[baseIdx + cy] = 0f;   // no-op; unioned specially
         }
     }
 
@@ -655,8 +681,11 @@ namespace ProceduralTerrain
         internal static float _coastFade           = 0f;     // world units above sea level over which Ocean inflates into blend (0=off)
         internal static int   _blendMode           = 1;      // default sdf: bake each present biome, crossfade output columns (correct at dissimilar-profile boundaries). 0=param (one blended bake; chirps at differing-frequency borders — ablation/compat only)
         internal static int   _composeMode         = 0;      // 0=legacy (per-voxel blend in FillPhase1); 1=sequential (Path B: compose modes into a running coarse SDF in pipeline order, then interpolate)
-        internal static float _coarseMult          = 1f;     // coarse bake cell = 4*mult voxels (0.5=2m, 1=4m, 2=8m, 4=16m; 0.25=1m≈per-voxel). Diagnostic knob for coarse-resolution faceting.
-        internal static int   CellVox { get { int v = Mathf.RoundToInt(4f * _coarseMult); return v < 1 ? 1 : v; } }  // voxels per coarse cell in XZ
+        internal static bool  _eikonal             = false;   // Path B: redistance the running field to true distance after each mode. OFF by default — current modes read zero-crossing elevation/normal (don't need |grad|=1). Enable only for distance-metric modes; it's a per-mode cost that explodes at fine coarseXZ.
+        internal static int   _coarseXZ            = 4;      // coarse bake cell size in voxels, XZ (4=default; higher=cheaper/blockier). The XZ resolution of the whole bake grid.
+        internal static int   _coarseY             = 1;      // Path B running-field cell size in voxels, Y (1=full-res Y; higher=cheaper/less vertical detail).
+        internal static int   CellVox  { get { return _coarseXZ < 1 ? 1 : _coarseXZ; } }  // XZ coarse cell size (voxels)
+        internal static int   CellVoxY { get { return _coarseY  < 1 ? 1 : _coarseY;  } }  // Path B field Y coarse cell size (voxels)
         internal static bool  _surfaceFullRes       = true;   // surface-anchored modes: replace coarse-interp baseline with full-res addh (kills coarse faceting cliffs)
         internal static bool  _vanillaHeight        = true;   // sample ground via vanilla HeightmapBuilder (biome-blended, matches rendered terrain) instead of single-biome GetHeight
 
@@ -687,8 +716,7 @@ namespace ProceduralTerrain
         const float LocProtectR = 10f; // minimum protection radius when exteriorRadius is unavailable
 
         // ── Zone tracking for hot-reload ──────────────────────────────────────────
-        internal static MethodInfo? _finishSkinNowMethod;
-        internal static MethodInfo? _activateMethod;
+        internal static MethodInfo? _skinMethod;          // 0.1.7: static Skin(Heightmap) — re-adds VoxelZone + queues worker
         internal static MethodInfo? _unskinMethod;
         internal static FieldInfo?  _hmapField;
 
@@ -749,6 +777,15 @@ namespace ProceduralTerrain
         [ThreadStatic] static CaveProfile[]? _blendedProfs;
         [ThreadStatic] static float[]?       _runSDF;   // Path B: running coarse SDF (cellCount*bh, world units) modes compose into sequentially
         [ThreadStatic] static float[]?       _eikScratch;   // Path B: unsigned-distance scratch for the eikonal redistance pass
+        // Path B increment 3: composed-surface inputs a surface-anchored mode reads (per coarse cell)
+        // while it bakes during sequential compose — derived from the running field of PRIOR modes.
+        [ThreadStatic] internal static float[]? _composeInH;    // composed-surface elevation (zero-crossing of runSDF)
+        [ThreadStatic] internal static float[]? _composeInGX;   // downslope dir x (from the composed surface)
+        [ThreadStatic] internal static float[]? _composeInGZ;   // downslope dir z
+        [ThreadStatic] internal static float[]? _composeInGMag; // slope magnitude
+        [ThreadStatic] internal static bool     _composeIncoming; // true while a surface-anchored mode bakes in sequential compose
+        [ThreadStatic] static float[]?          _composeHCell;    // per-cell groundworked base height (cached across the per-mode passes)
+        [ThreadStatic] static float[]?          _composeFloorY;   // per-cell floor Y = hCell - floorDepth
 
         // SDF-blend (_blendMode==1) retained per-cell contributions, populated in BakeBlendedProfiles,
         // consumed by BakeColumnSdfBlend. Only allocated/filled when _blendMode==1.

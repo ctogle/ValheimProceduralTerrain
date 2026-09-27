@@ -1045,6 +1045,7 @@ namespace ProceduralTerrain
                     wg = wg!
                 };
 
+                if (_composeMode == 1) continue;   // Path B bakes per-mode inside the sequential compose below
                 if (_blendMode == 1)
                     foreach (var mode in pipeline)
                         BakeColumnSdfBlend(mode, ref _cb, in args, cw4);
@@ -1053,50 +1054,188 @@ namespace ProceduralTerrain
                         mode.BakeColumn(ref _cb, in args);
             }
 
-            // ── Path B (composeMode=1): sequential compose into a running ISO-COARSE SDF ──────────
-            // Compose each mode's column into a running SDF in pipeline order (mirrors ComputeVoxel's
-            // per-mode logic), on an ISOTROPIC coarse grid — CellVox spacing in Y too (¼ the Y samples
-            // vs voxel res), so the eikonal is clean/isotropic and cheap. FillPhase1 trilinearly
-            // upsamples the field to voxels. No surfaceFullRes here; eikonal makes it a true distance field.
+            // ── Path B (composeMode=1): TRUE sequential composition into a running iso-coarse SDF ──
+            // For each mode in pipeline order: surface-anchored modes derive their {elevation, frame}
+            // from the running field of PRIOR modes (so they conform to the built-up surface); the mode
+            // bakes; its column composes into the running field; an isotropic eikonal redistances it so
+            // the next mode reads a true distance field. FillPhase1 trilinearly upsamples the result.
             if (_composeMode == 1)
             {
-                int cv = CellVox;
-                int ch = (bh + cv - 1) / cv + 1;                // coarse-Y levels (iso spacing cv*s), +1 guard
+                int cvXZ = CellVox, cvY = CellVoxY;
+                int ch = (bh + cvY - 1) / cvY + 1;              // coarse-Y levels (Y cell = cvY voxels), +1 guard
                 int cellCount = cw4 * cw4;
-                if (_runSDF == null || _runSDF.Length < cellCount * ch) _runSDF = new float[cellCount * ch];
+                if (_runSDF     == null || _runSDF.Length     < cellCount * ch) _runSDF     = new float[cellCount * ch];
+                if (_composeInH == null || _composeInH.Length < cellCount)
+                { _composeInH = new float[cellCount]; _composeInGX = new float[cellCount]; _composeInGZ = new float[cellCount]; _composeInGMag = new float[cellCount]; }
+                if (_composeHCell == null || _composeHCell.Length < cellCount)
+                { _composeHCell = new float[cellCount]; _composeFloorY = new float[cellCount]; }
                 float scale2  = _scale ?? 1f;
                 float extLoS2 = extLo * s;
-                float yStep   = cv * s;                          // isotropic Y world spacing (== XZ)
+                float xzStep  = cvXZ * s;                        // XZ world spacing
+                float yStep   = cvY  * s;                        // Y world spacing (aniso-aware eikonal below)
+
+                // (1) init the running field = groundworked base column per cell; cache hCell/floorY.
                 for (int cx4 = 0; cx4 < cw4; cx4++)
                 for (int cz4 = 0; cz4 < cw4; cz4++)
                 {
-                    int cell   = cx4 * cw4 + cz4;
-                    int cbaseF = cell * bh;                       // full-Y mode-column base
-                    int cbaseC = cell * ch;                       // coarse-Y running-field base
-                    int cxw = Math.Min(cx4 * cv, bw - 1);
-                    int czw = Math.Min(cz4 * cv, bw - 1);
-                    float wx = (ox - overlap + cxw) * s;
-                    float wz = (oz - overlap + czw) * s;
-                    // Base = groundworked height (vanilla TerrainModifiers that flatten locations) when a
-                    // heightGrid is present — matches legacy's effectiveH so location protection has parity.
-                    // Falls back to raw GroundHeight otherwise (same as legacy without a grid).
+                    int cell = cx4 * cw4 + cz4, cbaseC = cell * ch;
+                    int cxw = Math.Min(cx4 * cvXZ, bw - 1), czw = Math.Min(cz4 * cvXZ, bw - 1);
+                    float wx = (ox - overlap + cxw) * s, wz = (oz - overlap + czw) * s;
                     float hCell = heightGrid != null ? heightGrid[cxw - overlap, czw - overlap] * s
                                 : (wg != null ? GroundHeight(wx, wz, wg) : 0f);
                     float floorD = (_blendedProfs != null && cell < _blendedProfs.Length) ? _blendedProfs[cell].floorDepth : 0f;
-                    float floorY = hCell - floorD;
-                    for (int cyc = 0; cyc < ch; cyc++) _runSDF![cbaseC + cyc] = (extLoS2 + cyc * yStep) - hCell;   // base column
-                    foreach (var mode in pipeline)
+                    _composeHCell![cell]  = hCell;
+                    _composeFloorY![cell] = hCell - floorD;
+                    for (int cyc = 0; cyc < ch; cyc++) _runSDF![cbaseC + cyc] = (extLoS2 + cyc * yStep) - hCell;
+                }
+
+                // (2) per mode: [derive incoming] -> bake -> compose -> redistance.
+                foreach (var mode in pipeline)
+                {
+                    int mi = mode.PipelineIndex;
+                    if (mi < 0) continue;
+
+                    // SurfaceBlobs: SDF→SDF operator — union noise-modulated balls onto EVERY surface
+                    // (floors + ceilings) via |D| − rEff, reading the running distance field in place.
+                    // Needs eikonal=true for metric |D|. Skips the normal bake/compose path.
+                    if (mode is SurfaceBlobs)
                     {
-                        int mi = mode.PipelineIndex;
-                        if (mi < 0) continue;
-                        float gate = _cb.bkModeParams![mi][0][cell];
-                        if (gate <= 0f) continue;                 // mode inactive at this cell
-                        var aux = _cb.bkModeAux![mi][0];
-                        string blend = mode.Blend;
-                        float k = mode.BlendK * scale2;
+                        // Discrete spheres CENTERED ON the surface → clear hemispheres. Snap a jittered
+                        // 3D lattice to the surface (c = p − D·∇D), then union min(runSDF, |x−c| − r).
+                        int cc = (cw4 / 2) * cw4 + (cw4 / 2);
+                        float rad = _cb.bkModeParams![mi][0][cc];
+                        if (rad <= 0f) { continue; }
+                        float freq = _cb.bkModeParams![mi][1][cc];
+                        float L = freq > 1e-4f ? 1f / freq : 20f;              // lattice spacing (world units)
+                        float ox0 = (ox - overlap), oz0 = (oz - overlap);
+
+                        // trilinear sample of the running field at a world position
+                        float SampleD(float wx, float wy, float wz)
+                        {
+                            float gx = (wx / s - ox0) / cvXZ, gz = (wz / s - oz0) / cvXZ, gy = (wy - extLoS2) / yStep;
+                            gx = Mathf.Clamp(gx, 0f, cw4 - 1.001f); gz = Mathf.Clamp(gz, 0f, cw4 - 1.001f); gy = Mathf.Clamp(gy, 0f, ch - 1.001f);
+                            int x0 = (int)gx, z0 = (int)gz, y0 = (int)gy; float fx = gx - x0, fz = gz - z0, fy = gy - y0;
+                            int x1 = x0 + 1, z1 = z0 + 1, y1 = y0 + 1;
+                            float V(int x, int z, int y) => _runSDF![(x * cw4 + z) * ch + y];
+                            float c00 = V(x0,z0,y0) + (V(x0,z0,y1)-V(x0,z0,y0))*fy, c01 = V(x0,z1,y0) + (V(x0,z1,y1)-V(x0,z1,y0))*fy;
+                            float c10 = V(x1,z0,y0) + (V(x1,z0,y1)-V(x1,z0,y0))*fy, c11 = V(x1,z1,y0) + (V(x1,z1,y1)-V(x1,z1,y0))*fy;
+                            float c0 = c00 + (c01-c00)*fz, c1 = c10 + (c11-c10)*fz;
+                            return c0 + (c1-c0)*fx;
+                        }
+                        // deterministic hash jitter in [0,1)
+                        float Hash(int a, int b, int c2) { float n = Mathf.Sin(a*127.1f + b*311.7f + c2*74.7f) * 43758.5453f; return n - Mathf.Floor(n); }
+
+                        // world extent of the running field
+                        float wxLo = ox0 * s, wxHi = (ox0 + bw) * s, wzLo = oz0 * s, wzHi = (oz0 + bw) * s;
+                        float wyLo = extLoS2, wyHi = extLoS2 + (ch - 1) * yStep;
+                        int li0 = Mathf.FloorToInt(wxLo/L)-1, li1 = Mathf.FloorToInt(wxHi/L)+1;
+                        int lj0 = Mathf.FloorToInt(wzLo/L)-1, lj1 = Mathf.FloorToInt(wzHi/L)+1;
+                        int lk0 = Mathf.FloorToInt(wyLo/L)-1, lk1 = Mathf.FloorToInt(wyHi/L)+1;
+
+                        // precompute surface-snapped centers
+                        var centers = new List<Vector3>(256);
+                        float h = 1.5f;   // gradient sample step
+                        for (int li = li0; li <= li1; li++)
+                        for (int lj = lj0; lj <= lj1; lj++)
+                        for (int lk = lk0; lk <= lk1; lk++)
+                        {
+                            float px = (li + Hash(li, lj, lk)) * L, pz = (lj + Hash(lj+7, li-3, lk)) * L, py = (lk + Hash(lk+13, li+5, lj-2)) * L;
+                            float Dp = SampleD(px, py, pz);
+                            if (Mathf.Abs(Dp) > L) continue;                   // lattice point not near a surface
+                            float nx = SampleD(px+h,py,pz) - SampleD(px-h,py,pz);
+                            float ny = SampleD(px,py+h,pz) - SampleD(px,py-h,pz);
+                            float nz = SampleD(px,py,pz+h) - SampleD(px,py,pz-h);
+                            float nl = Mathf.Sqrt(nx*nx+ny*ny+nz*nz); if (nl < 1e-4f) continue; nx/=nl; ny/=nl; nz/=nl;
+                            centers.Add(new Vector3(px - Dp*nx, py - Dp*ny, pz - Dp*nz));  // snap to surface
+                        }
+
+                        // union spheres into the running field
+                        int dbgHit = 0;
+                        for (int cx4 = 0; cx4 < cw4; cx4++)
+                        for (int cz4 = 0; cz4 < cw4; cz4++)
+                        {
+                            int cell = cx4 * cw4 + cz4, cbaseC = cell * ch;
+                            if (_cb.bkModeParams![mi][0][cell] <= 0f) continue;
+                            int cxw = Math.Min(cx4 * cvXZ, bw - 1), czw = Math.Min(cz4 * cvXZ, bw - 1);
+                            float wx = (ox0 + cxw) * s, wz = (oz0 + czw) * s;
+                            for (int cyc = 0; cyc < ch; cyc++)
+                            {
+                                float wy = extLoS2 + cyc * yStep;
+                                float best = 1e9f;
+                                for (int ci = 0; ci < centers.Count; ci++)
+                                {
+                                    var c = centers[ci];
+                                    float dx = wx-c.x, dy = wy-c.y, dz = wz-c.z;
+                                    float dd = Mathf.Sqrt(dx*dx+dy*dy+dz*dz) - rad;
+                                    if (dd < best) best = dd;
+                                }
+                                ref float r = ref _runSDF![cbaseC + cyc];
+                                if (best < r) { r = best; dbgHit++; }
+                            }
+                        }
+                        Log.LogInfo($"[PT-blobs] centers={centers.Count} L={L:F0} rad={rad:F1} solidVoxels={dbgHit}");
+                        if (_eikonal) RedistanceEikonal(_runSDF!, cw4, cw4, ch, xzStep, xzStep, yStep, 2);
+                        continue;
+                    }
+
+                    bool anchored = mode is LuaModeDef lm && lm.SurfaceAnchoredFlag;
+
+                    if (anchored)
+                    {
+                        // composed-surface elevation (zero-crossing of the running field) per cell...
+                        for (int cell = 0; cell < cellCount; cell++)
+                            _composeInH![cell] = SurfaceElevation(_runSDF!, cell * ch, ch, extLoS2, yStep);
+                        // DIAGNOSTIC: how far the incoming (composed) surface departs from the bare base
+                        // ground. >0 ⇒ this mode is conforming to PRIOR modes (composition working);
+                        // ~0 ⇒ it's only seeing vanilla ground (wiring bug). Logged once per mode/zone.
+                        {
+                            float maxD = 0f;
+                            for (int cell = 0; cell < cellCount; cell++)
+                                maxD = Mathf.Max(maxD, Mathf.Abs(_composeInH![cell] - _composeHCell![cell]));
+                            Log.LogInfo($"[PT-compose] {mode.Name}: incoming surface vs base ground maxΔ={maxD:F1}m (>0 ⇒ conforming to prior modes)");
+                        }
+                        // ...then the downslope frame from that elevation field (central difference).
+                        for (int cx4 = 0; cx4 < cw4; cx4++)
+                        for (int cz4 = 0; cz4 < cw4; cz4++)
+                        {
+                            int cell = cx4 * cw4 + cz4;
+                            int xm = ((cx4 > 0 ? cx4 - 1 : cx4) * cw4 + cz4), xp = ((cx4 < cw4 - 1 ? cx4 + 1 : cx4) * cw4 + cz4);
+                            int zm = (cx4 * cw4 + (cz4 > 0 ? cz4 - 1 : cz4)), zp = (cx4 * cw4 + (cz4 < cw4 - 1 ? cz4 + 1 : cz4));
+                            float gx = (_composeInH![xp] - _composeInH![xm]) / (2f * xzStep);
+                            float gz = (_composeInH![zp] - _composeInH![zm]) / (2f * xzStep);
+                            float mag = Mathf.Sqrt(gx * gx + gz * gz), inv = 1f / (mag + 1e-4f);
+                            _composeInGX![cell] = gx * inv; _composeInGZ![cell] = gz * inv; _composeInGMag![cell] = mag;
+                        }
+                        _composeIncoming = true;
+                    }
+
+                    // bake this mode (respecting blendMode) with incoming inputs active for anchored modes
+                    for (int cx4 = 0; cx4 < cw4; cx4++)
+                    for (int cz4 = 0; cz4 < cw4; cz4++)
+                    {
+                        int cxw = Math.Min(cx4 * cvXZ, bw - 1), czw = Math.Min(cz4 * cvXZ, bw - 1);
+                        var bargs = new BakeCellArgs {
+                            worldX = (ox - overlap + cxw) * s, worldZ = (oz - overlap + czw) * s,
+                            cx4 = cx4, cz4 = cz4, cellIdx = cx4 * cw4 + cz4, cw4 = cw4, bh = bh,
+                            s = s, extLoS = extLoS2, wg = wg!
+                        };
+                        if (_blendMode == 1) BakeColumnSdfBlend(mode, ref _cb, in bargs, cw4);
+                        else                 mode.BakeColumn(ref _cb, in bargs);
+                    }
+                    _composeIncoming = false;
+
+                    // compose this mode's coarse-sampled column into the running field
+                    var aux = _cb.bkModeAux![mi][0];
+                    string blend = mode.Blend;
+                    float k = mode.BlendK * scale2;
+                    for (int cell = 0; cell < cellCount; cell++)
+                    {
+                        if (_cb.bkModeParams![mi][0][cell] <= 0f) continue;   // mode inactive here
+                        int cbaseF = cell * bh, cbaseC = cell * ch;
+                        float hCell = _composeHCell![cell], floorY = _composeFloorY![cell];
                         for (int cyc = 0; cyc < ch; cyc++)
                         {
-                            int cyf = Math.Min(cyc * cv, bh - 1);       // sample full-Y column at this coarse level
+                            int cyf = Math.Min(cyc * cvY, bh - 1);
                             float worldY = extLoS2 + cyc * yStep;
                             float raw = aux[cbaseF + cyf] * scale2;
                             float sdf = Mathf.Min(raw, worldY - floorY);
@@ -1111,11 +1250,30 @@ namespace ProceduralTerrain
                             }
                         }
                     }
+
+                    // redistance so the next mode reads a true distance field — only when enabled
+                    // (current modes read zero-crossing elevation/normal, which don't need |grad|=1;
+                    // this per-mode pass is what makes fine coarseXZ explode, so it's off by default).
+                    if (_eikonal) RedistanceEikonal(_runSDF!, cw4, cw4, ch, xzStep, xzStep, yStep, 2);
                 }
-                // Increment 2: isotropic 3-D eikonal → true distance field (spacing yStep all axes) so
-                // modes can sample metric distance/normal. Preserves the zero-crossing (surface unchanged).
-                RedistanceEikonal(_runSDF!, cw4, cw4, ch, yStep, yStep, yStep, 2);
             }
+        }
+
+        // Topmost surface elevation (world units) from a coarse SDF column [baseIdx .. baseIdx+ch).
+        // Scans top→down for the first air(>0)-above / solid(<=0)-below transition and linearly
+        // interpolates the zero-crossing. Falls back to window extremes if all-air or all-solid.
+        static float SurfaceElevation(float[] f, int baseIdx, int ch, float extLoS, float yStep)
+        {
+            for (int cyc = ch - 1; cyc > 0; cyc--)
+            {
+                float hi = f[baseIdx + cyc], lo = f[baseIdx + cyc - 1];
+                if (hi > 0f && lo <= 0f)
+                {
+                    float t = (hi == lo) ? 0f : (0f - lo) / (hi - lo);   // fraction lo→hi where sdf=0
+                    return extLoS + (cyc - 1 + t) * yStep;
+                }
+            }
+            return f[baseIdx] > 0f ? extLoS : extLoS + (ch - 1) * yStep;
         }
 
         // Bilinear over the 4 XZ corner values (v00=base, v10=+x, v01=+z, v11=+xz).
@@ -1574,9 +1732,10 @@ namespace ProceduralTerrain
                     {
                         // Path B: trilinearly upsample the iso-coarse running field ([cell*ch + cyc],
                         // world units) to this voxel — XZ bilinear + linear in Y between two coarse levels.
-                        int ch = (bh + cv - 1) / cv + 1;
-                        int cyc0 = cy / cv; if (cyc0 > ch - 2) cyc0 = ch - 2;
-                        float fyc = (cy - cyc0 * cv) / (float)cv;
+                        int cvY = CellVoxY;
+                        int ch = (bh + cvY - 1) / cvY + 1;
+                        int cyc0 = cy / cvY; if (cyc0 > ch - 2) cyc0 = ch - 2;
+                        float fyc = (cy - cyc0 * cvY) / (float)cvY;
                         int aa = col.b200 * ch, bb = col.b210 * ch, cc = col.b201 * ch, dd = col.b211 * ch;
                         float lo = Bilerp(_runSDF![aa + cyc0],     _runSDF![bb + cyc0],     _runSDF![cc + cyc0],     _runSDF![dd + cyc0],     col.bfx, col.bfz);
                         float hi = Bilerp(_runSDF![aa + cyc0 + 1], _runSDF![bb + cyc0 + 1], _runSDF![cc + cyc0 + 1], _runSDF![dd + cyc0 + 1], col.bfx, col.bfz);

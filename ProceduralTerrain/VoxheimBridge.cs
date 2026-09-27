@@ -34,16 +34,16 @@ namespace ProceduralTerrain
                 BindingFlags.NonPublic | BindingFlags.Static);
             if (_scaleField == null) Log.LogWarning("[ProceduralTerrain] s_scale not found, will assume 1.");
 
-            _finishSkinNowMethod = zoneT?.GetMethod("FinishSkinNow",
-                BindingFlags.NonPublic | BindingFlags.Instance);
-            _activateMethod      = zoneT?.GetMethod("Activate",
-                BindingFlags.NonPublic | BindingFlags.Instance);
+            // Voxheim 0.1.7: skinning is async (worker pump + CompleteWorkerSkin); FinishSkinNow is gone
+            // and Unskin() DestroyImmediate's the VoxelZone. Hot-reload = Unskin then the static Skin(hmap),
+            // which re-adds a VoxelZone, Activates, and enqueues it (s_pendingZones) so the worker finishes it.
+            _skinMethod          = zoneT?.GetMethod("Skin",
+                BindingFlags.NonPublic | BindingFlags.Static);
             _unskinMethod        = zoneT?.GetMethod("Unskin",
                 BindingFlags.NonPublic | BindingFlags.Instance);
             _hmapField           = zoneT?.GetField("_hmap",
                 BindingFlags.NonPublic | BindingFlags.Instance);
-            if (_finishSkinNowMethod == null) Log.LogWarning("[ProceduralTerrain] FinishSkinNow not found.");
-            if (_activateMethod      == null) Log.LogWarning("[ProceduralTerrain] Activate not found — hot-reload will not work.");
+            if (_skinMethod          == null) Log.LogWarning("[ProceduralTerrain] Skin(Heightmap) not found — hot-reload will not work.");
             if (_unskinMethod        == null) Log.LogWarning("[ProceduralTerrain] Unskin not found — hot-reload will not work.");
             if (_hmapField           == null) Log.LogWarning("[ProceduralTerrain] _hmap field not found — hot-reload will not work.");
 

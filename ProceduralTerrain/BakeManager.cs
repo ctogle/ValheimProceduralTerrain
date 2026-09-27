@@ -359,7 +359,7 @@ namespace ProceduralTerrain
             lock (_surfHCache) _surfHCache.Clear();
             _zoneFaceCache.Clear();
 
-            if (_activateMethod == null || _unskinMethod == null || _hmapField == null || _finishSkinNowMethod == null)
+            if (_skinMethod == null || _unskinMethod == null || _hmapField == null)
             {
                 Log.LogWarning("[ProceduralTerrain] Hot-reload reflection handles missing — skipping.");
                 return;
@@ -384,10 +384,11 @@ namespace ProceduralTerrain
                 }
                 try
                 {
-                    _unskinMethod.Invoke(zoneObj, null);
-                    _activateMethod.Invoke(zoneObj, new[] { hmap });
-                    _finishSkinNowMethod.Invoke(zoneObj, null);
-                    Log.LogDebug($"[ProceduralTerrain] Hot-reload: re-activated zone {key}.");
+                    _unskinMethod.Invoke(zoneObj, null);       // destroys the old VoxelZone, restores vanilla hmap
+                    _skinMethod.Invoke(null, new[] { hmap });  // static Skin: fresh VoxelZone + Activate + s_pendingZones.Add
+                    // 0.1.7: Skin enqueues the zone; Voxheim's worker pump completes it over the next frames
+                    // (CompleteWorkerSkin). No synchronous finish — re-mesh lands async, which is fine.
+                    Log.LogDebug($"[ProceduralTerrain] Hot-reload: re-skinned zone {key}.");
                 }
                 catch (Exception e) { var inner = e.InnerException ?? e; Log.LogWarning($"[ProceduralTerrain] Hot-reload zone {key}: {inner.GetType().Name}: {inner.Message}\n{inner.StackTrace}"); }
             }

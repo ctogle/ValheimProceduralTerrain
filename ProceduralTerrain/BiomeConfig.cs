@@ -107,6 +107,7 @@ namespace ProceduralTerrain
             {
                 { "isotropic_formation", () => new IsotropicFormation() },
                 { "isotropic_tunnel",    () => new IsotropicTunnel()    },
+                { "surface_blobs",       () => new SurfaceBlobs()       },
             };
 
         // Parse a [Profile:name] section into a TerrainProfile.
@@ -267,8 +268,12 @@ namespace ProceduralTerrain
                             _blendMode = (v == "sdf" || v == "1") ? 1 : 0;
                         if (k == "composemode")
                             _composeMode = (v == "sequential" || v == "1") ? 1 : 0;
-                        if (k == "coarsemult" && float.TryParse(v, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float cm))
-                            _coarseMult = Mathf.Clamp(cm, 0.25f, 16f);
+                        if (k == "eikonal")
+                            _eikonal = v == "1" || v == "true";
+                        if (k == "coarsexz" && int.TryParse(v, out int cxz))
+                            _coarseXZ = Mathf.Clamp(cxz, 1, 64);
+                        if (k == "coarsey" && int.TryParse(v, out int cyv))
+                            _coarseY = Mathf.Clamp(cyv, 1, 64);
                         if (k == "surfacefullres")
                             _surfaceFullRes = !(v == "0" || v == "false");
                         if (k == "vanillaheight")
@@ -396,7 +401,7 @@ namespace ProceduralTerrain
                     if (maxv <= 0f) continue;
                     float wave = 1f / maxv;   // FastNoiseLite feature size ≈ 1/frequency (world units)
                     if (wave < minWave && seen.Add(mode.Name + "." + nm))
-                        Log.LogWarning($"[ProceduralTerrain] Nyquist: {mode.Name}.{names[pi]}={maxv:G3} → ~{wave:F1}wu feature vs {cell:F1}wu coarse cell (want ≥{minWave:F1}wu). If XZ-spatial it will facet under coarse bake — lower the frequency, reduce coarseMult, or make the mode full-res.");
+                        Log.LogWarning($"[ProceduralTerrain] Nyquist: {mode.Name}.{names[pi]}={maxv:G3} → ~{wave:F1}wu feature vs {cell:F1}wu coarse cell (want ≥{minWave:F1}wu). If XZ-spatial it will facet under coarse bake — lower the frequency, lower coarseXZ/coarseY, or make the mode full-res.");
                 }
             }
         }
