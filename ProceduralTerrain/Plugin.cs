@@ -748,6 +748,7 @@ namespace ProceduralTerrain
         [ThreadStatic] static float[]?       _biomeTotW;
         [ThreadStatic] static CaveProfile[]? _blendedProfs;
         [ThreadStatic] static float[]?       _runSDF;   // Path B: running coarse SDF (cellCount*bh, world units) modes compose into sequentially
+        [ThreadStatic] static float[]?       _eikScratch;   // Path B: unsigned-distance scratch for the eikonal redistance pass
 
         // SDF-blend (_blendMode==1) retained per-cell contributions, populated in BakeBlendedProfiles,
         // consumed by BakeColumnSdfBlend. Only allocated/filled when _blendMode==1.
