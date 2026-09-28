@@ -1107,6 +1107,9 @@ namespace ProceduralTerrain
                         if (rad <= 0f) { continue; }
                         float freq = _cb.bkModeParams![mi][1][cc];
                         float L = freq > 1e-4f ? 1f / freq : 20f;              // lattice spacing (world units)
+                        // (3) Enforce L >= 2*rad: spheres closer than a diameter apart merge into a
+                        // blanket ("mush") instead of reading as discrete blobs on the surface.
+                        L = Mathf.Max(L, 2f * rad);
                         float ox0 = (ox - overlap), oz0 = (oz - overlap);
 
                         // trilinear sample of the running field at a world position
@@ -1125,12 +1128,29 @@ namespace ProceduralTerrain
                         // deterministic hash jitter in [0,1)
                         float Hash(int a, int b, int c2) { float n = Mathf.Sin(a*127.1f + b*311.7f + c2*74.7f) * 43758.5453f; return n - Mathf.Floor(n); }
 
+                        // (1) In-field test: is a world point (plus the gradient stencil ±h) fully inside
+                        // the input field this zone actually covers? SampleD clamps out-of-range reads,
+                        // which would snap the SAME lattice point to DIFFERENT places in adjacent zones →
+                        // seams. Instead we skip a point whose stencil isn't covered here; the neighbour
+                        // zone that DOES cover it snaps it identically (shared overlap region agrees), so
+                        // any sphere reaching this zone is placed with a matching center. Requires the
+                        // blob reach (rad) to sit within the running field's overlap margin.
+                        bool InField(float wx, float wy, float wz)
+                        {
+                            float gx = (wx / s - ox0) / cvXZ, gz = (wz / s - oz0) / cvXZ, gy = (wy - extLoS2) / yStep;
+                            return gx >= 0f && gx <= cw4 - 1.001f && gz >= 0f && gz <= cw4 - 1.001f && gy >= 0f && gy <= ch - 1.001f;
+                        }
+
                         // world extent of the running field
                         float wxLo = ox0 * s, wxHi = (ox0 + bw) * s, wzLo = oz0 * s, wzHi = (oz0 + bw) * s;
                         float wyLo = extLoS2, wyHi = extLoS2 + (ch - 1) * yStep;
-                        int li0 = Mathf.FloorToInt(wxLo/L)-1, li1 = Mathf.FloorToInt(wxHi/L)+1;
-                        int lj0 = Mathf.FloorToInt(wzLo/L)-1, lj1 = Mathf.FloorToInt(wzHi/L)+1;
-                        int lk0 = Mathf.FloorToInt(wyLo/L)-1, lk1 = Mathf.FloorToInt(wyHi/L)+1;
+                        // (2) Pad the lattice range by the blob reach so a sphere straddling this zone's
+                        // boundary is enumerated (and drawn) by every zone it touches — its center may sit
+                        // outside the owned region but within reach. Points beyond coverage get InField-skipped.
+                        int latPad = Mathf.CeilToInt(rad / L) + 1;
+                        int li0 = Mathf.FloorToInt(wxLo/L)-latPad, li1 = Mathf.FloorToInt(wxHi/L)+latPad;
+                        int lj0 = Mathf.FloorToInt(wzLo/L)-latPad, lj1 = Mathf.FloorToInt(wzHi/L)+latPad;
+                        int lk0 = Mathf.FloorToInt(wyLo/L)-latPad, lk1 = Mathf.FloorToInt(wyHi/L)+latPad;
 
                         // precompute surface-snapped centers
                         var centers = new List<Vector3>(256);
@@ -1140,6 +1160,9 @@ namespace ProceduralTerrain
                         for (int lk = lk0; lk <= lk1; lk++)
                         {
                             float px = (li + Hash(li, lj, lk)) * L, pz = (lj + Hash(lj+7, li-3, lk)) * L, py = (lk + Hash(lk+13, li+5, lj-2)) * L;
+                            // Skip points whose snap stencil isn't covered by this zone's input field —
+                            // the owning zone snaps them identically (no clamp divergence → no seams).
+                            if (!InField(px-h, py-h, pz-h) || !InField(px+h, py+h, pz+h)) continue;
                             float Dp = SampleD(px, py, pz);
                             if (Mathf.Abs(Dp) > L) continue;                   // lattice point not near a surface
                             float nx = SampleD(px+h,py,pz) - SampleD(px-h,py,pz);
