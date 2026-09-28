@@ -253,11 +253,22 @@ namespace ProceduralTerrain
                     {
                         var (zox, zoz) = zone;
                         var (yLo, yHi) = ComputeYBounds(zox, zoz, zoneW, s, wg);
-                        // Location-conformed heights (if any) bake the edits in; else raw procedural carve.
-                        if (bakeGroundwork.TryGetValue(zone, out var gw))
-                            Carve(gw, zox, zoz, zoneW, yLo, yHi, s, gw);
-                        else
-                            Carve(null, zox, zoz, zoneW, yLo, yHi);
+                        // Per-zone guard: a throw on a bake worker otherwise surfaces as an AggregateException
+                        // to the bake caller and (if unhandled) silently kills the process — no [PT] Carve,
+                        // since that catch only covers the live main-thread path. Log the zone + full stack so
+                        // a managed failure (e.g. an indexing bug at fine coarseXZ) is diagnosable, not fatal.
+                        try
+                        {
+                            // Location-conformed heights (if any) bake the edits in; else raw procedural carve.
+                            if (bakeGroundwork.TryGetValue(zone, out var gw))
+                                Carve(gw, zox, zoz, zoneW, yLo, yHi, s, gw);
+                            else
+                                Carve(null, zox, zoz, zoneW, yLo, yHi);
+                        }
+                        catch (Exception ce)
+                        {
+                            Log.LogError($"[ProceduralTerrain] bake Carve threw at zone ({zox},{zoz}) coarseXZ={Plugin._coarseXZ} coarseY={Plugin._coarseY}: {ce.GetType().Name}: {ce.Message}\n{ce.StackTrace}");
+                        }
                         int n = System.Threading.Interlocked.Increment(ref doneCount);
                         Plugin._bakeProgressDone = n;
                         if (n % 50 == 0 || n == toCarve.Count)

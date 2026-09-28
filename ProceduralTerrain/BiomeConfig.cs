@@ -1008,6 +1008,12 @@ namespace ProceduralTerrain
             }
 
             // ── Step 3: Normalize ─────────────────────────────────────────────────────
+            // NOTE: these scratch spans are allocated ONCE here, not inside the loops below.
+            // stackalloc inside a loop is not freed per-iteration — it accumulates until the
+            // method returns, so a per-cell/per-mode stackalloc overflows the stack at fine
+            // coarseXZ (cellCount grows as (bw/CellVox)²). maxParamCount bounds every mode's nP.
+            Span<float> paramAcc    = stackalloc float[maxParamCount > 0 ? maxParamCount : 1];
+            Span<float> paramResult = stackalloc float[maxParamCount > 0 ? maxParamCount : 1];
             for (int idx = 0; idx < cellCount; idx++)
             {
                 ref var p = ref _blendedProfs![idx];
@@ -1020,12 +1026,10 @@ namespace ProceduralTerrain
                     int accBase = (mi * maxParamCount) * cellCount + idx;
                     float presentW = modePresentWAcc[mi * cellCount + idx];
                     if (sdfBlend) _sdfPresentW![mi * cellCount + idx] = presentW;
-                    // Gather per-param accumulated sums into a temp span, then normalize.
-                    Span<float> acc = stackalloc float[nP];
-                    for (int pi = 0; pi < nP; pi++) acc[pi] = modeParamAcc[accBase + pi * cellCount];
-                    Span<float> result = stackalloc float[nP];
-                    ModeDefinition.BlendParams(result, acc, tw, presentW, nP);
-                    for (int pi = 0; pi < nP; pi++) _cb.bkModeParams![mi][pi][idx] = result[pi];
+                    // Gather per-param accumulated sums into the reused scratch spans (hoisted above).
+                    for (int pi = 0; pi < nP; pi++) paramAcc[pi] = modeParamAcc[accBase + pi * cellCount];
+                    ModeDefinition.BlendParams(paramResult, paramAcc, tw, presentW, nP);
+                    for (int pi = 0; pi < nP; pi++) _cb.bkModeParams![mi][pi][idx] = paramResult[pi];
                 }
             }
 
