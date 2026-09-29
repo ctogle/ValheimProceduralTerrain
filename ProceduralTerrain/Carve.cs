@@ -125,7 +125,9 @@ namespace ProceduralTerrain
             if (_cb.bufC == null || _cb.bufC.Length < bufSize) _cb.bufC = new float[bufSize];
             float[] buf = _cb.bufA, tmp = _cb.bufB, orig = _cb.bufC;
 
+            long _tRec0 = System.Diagnostics.Stopwatch.GetTimestamp();
             bool fromBake = _bakeData != null && TryPopulateFromBake(ox, oz, bw, bh, extLo, s, buf);
+            long _tRec1 = System.Diagnostics.Stopwatch.GetTimestamp();
 
             if (!fromBake)
             {
@@ -497,6 +499,16 @@ namespace ProceduralTerrain
             if (!_parallelBakeActive || System.Threading.Thread.CurrentThread.ManagedThreadId == Plugin._mainThreadId)
                 _sdfCache[zoneKey] = (extLo, bh, width, cacheData);
 
+            }
+
+            if (fromBake)
+            {
+                long _tEnd = System.Diagnostics.Stopwatch.GetTimestamp();
+                double freq = System.Diagnostics.Stopwatch.Frequency;
+                double recMs  = (_tRec1 - _tRec0) * 1000.0 / freq;
+                double restMs = (_tEnd  - _tRec1) * 1000.0 / freq;
+                if (recMs + restMs > 2.0)
+                    Log.LogInfo($"[PT-load] baked zone ({ox},{oz}) reconstruct={recMs:F2}ms fill+surfH={restMs:F2}ms (bh={bh})");
             }
 
             if (_dumpZonesRemaining > 0)

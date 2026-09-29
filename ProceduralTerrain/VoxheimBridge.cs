@@ -136,6 +136,7 @@ namespace ProceduralTerrain
             builder.SetFloor(context.Floor);
             builder.IncludeY(c.extLo, c.extLo + c.bh - 1);
 
+            long _tSet0 = System.Diagnostics.Stopwatch.GetTimestamp();
             for (int ci = 0; ci < width; ci++)
             for (int ri = 0; ri < width; ri++)
             {
@@ -147,6 +148,8 @@ namespace ProceduralTerrain
                     builder.Field.Set(new Voxheim.Core.Int3(wx, wy, wz), d);
                 }
             }
+            double setMs = (System.Diagnostics.Stopwatch.GetTimestamp() - _tSet0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+            if (setMs > 2.0) Plugin.Log.LogInfo($"[PT-load] Field.Set zone ({ox},{oz}) = {setMs:F2}ms ({width}x{width}x{c.bh})");
         }
 
         // Build a per-zone height grid with overlapping LOCATION terrain ops baked in, using vanilla
