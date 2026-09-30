@@ -28,7 +28,7 @@ namespace ProceduralTerrain
         }
 
         static string BakeFilePath(int seed, uint cfgHash) =>
-            Path.Combine(BepInEx.Paths.ConfigPath, $"procedural_terrain_bake_{seed:X8}_{cfgHash:X8}.bin");
+            Path.Combine(PTConfigDir, $"procedural_terrain_bake_{seed:X8}_{cfgHash:X8}.bin");
 
         static void LoadBakeFile()
         {
@@ -48,25 +48,43 @@ namespace ProceduralTerrain
                 using var br  = new BinaryReader(inStream);
                 if (br.ReadUInt32() != 0x564F5846u) { Log.LogWarning("[ProceduralTerrain] bake: invalid magic."); _bakeData = null; return; }
                 ushort ver = br.ReadUInt16();
-                if (ver != 1 && ver != 2) { Log.LogWarning($"[ProceduralTerrain] bake: unsupported version {ver}."); _bakeData = null; return; }
+                if (ver != 3) { Log.LogWarning($"[ProceduralTerrain] bake: unsupported version {ver} (need v3 — rebake)."); _bakeData = null; return; }
                 if (br.ReadUInt64() != (ulong)(uint)seed || br.ReadUInt32() != cfgHash)
                     { Log.LogWarning("[ProceduralTerrain] bake: seed/cfg mismatch."); _bakeData = null; return; }
-                _bakeFileStep = br.ReadUInt16();
                 int count = (int)br.ReadUInt32();
-                var data = new Dictionary<(int, int), (int extLo, int bh, int bw, sbyte[] data)>(count);
+                var data = new Dictionary<(int, int), BakeZone>(count);
+                int maxStep = 1;
                 for (int i = 0; i < count; i++)
                 {
                     int eox = br.ReadInt32(), eoz = br.ReadInt32(), extLo = br.ReadInt32();
-                    int bh = br.ReadUInt16(), ebw = br.ReadUInt16();
+                    int bh = br.ReadUInt16(), ebw = br.ReadUInt16(), step = br.ReadUInt16();
                     int nsx = br.ReadInt32(), nsy = br.ReadInt32(), nsz = br.ReadInt32();
-                    int len   = nsx * nsy * nsz;
-                    var raw   = new sbyte[len];
-                    var bytes = br.ReadBytes(len);
-                    Buffer.BlockCopy(bytes, 0, raw, 0, len);
-                    data[(eox, eoz)] = (extLo, bh, ebw, raw);
+                    int ncol = nsx * nsz;
+                    var colYLo = new int[ncol]; var colYLen = new int[ncol];
+                    var colBelow = new sbyte[ncol]; var colAbove = new sbyte[ncol]; var colOff = new int[ncol];
+                    int off = 0;
+                    for (int c = 0; c < ncol; c++)
+                    {
+                        colYLo[c]  = br.ReadUInt16();
+                        colYLen[c] = br.ReadUInt16();
+                        colBelow[c] = br.ReadSByte();
+                        colAbove[c] = br.ReadSByte();
+                        colOff[c] = off; off += colYLen[c];
+                    }
+                    int slen = (int)br.ReadUInt32();
+                    var samples = new sbyte[slen];
+                    var bytes = br.ReadBytes(slen);
+                    Buffer.BlockCopy(bytes, 0, samples, 0, slen);
+                    data[(eox, eoz)] = new BakeZone {
+                        extLo = extLo, bh = bh, bw = ebw, step = step, nsx = nsx, nsy = nsy, nsz = nsz,
+                        colYLo = colYLo, colYLen = colYLen, colOff = colOff,
+                        colBelow = colBelow, colAbove = colAbove, samples = samples
+                    };
+                    if (step > maxStep) maxStep = step;
                 }
                 _bakeData = data;
-                Log.LogInfo($"[ProceduralTerrain] Bake loaded: {count} zones, step={_bakeFileStep} from {path}");
+                _bakeFileStep = maxStep;   // per-zone now; keep the max for the "is-current" heuristic
+                Log.LogInfo($"[ProceduralTerrain] Bake loaded: {count} zones (v3 sparse) from {path}");
             }
             catch (Exception ex) { Log.LogWarning($"[ProceduralTerrain] bake: load failed: {ex.GetType().Name}: {ex.Message}\n{ex.StackTrace}"); _bakeData = null; }
         }
@@ -88,75 +106,203 @@ namespace ProceduralTerrain
             return 0.5f * ((2*p1) + (-p0+p2)*t + (2*p0-5*p1+4*p2-p3)*t2 + (-p0+3*p1-3*p2+p3)*t3);
         }
 
-        static bool TryPopulateFromBake(int ox, int oz, int bw, int bh, int extLo, float s, float[] buf)
+        // Piece 2 / v3: fused per-column reconstruction straight into the SPARSE cache — no dense buf.
+        // Reorders to X → Z (into small reused temps), then reconstructs each column's Y into a tiny reused
+        // float column (cache-friendly, unlike a 1.5MB volume write), band-limited (tricubic only near a
+        // transition, nearest in constant runs). From that column it emits surfH + the deviating band run.
+        // Returns false (→ caller falls back to the dense path) on any bake mismatch.
+        static bool PopulateSparseFromBake(int ox, int oz, int bw, int bh, int extLo, float s, int voxelFloorY, int overlap)
         {
-            if (_bakeData == null) { Log.LogInfo($"[ProceduralTerrain] bake miss ({ox},{oz}): no bake data loaded"); return false; }
-            if (!_bakeData.TryGetValue((ox, oz), out var e)) { Log.LogInfo($"[ProceduralTerrain] bake miss ({ox},{oz}): zone not in file"); return false; }
-            if (e.bw != bw) { Log.LogInfo($"[ProceduralTerrain] bake miss ({ox},{oz}): bw mismatch baked={e.bw} live={bw}"); return false; }
-            int step = _bakeFileStep;
-            int nsx  = (bw   + step - 1) / step;
-            int nsy  = (e.bh + step - 1) / step;
-            int nsz  = (bw   + step - 1) / step;
-            sbyte[] raw = e.data;
-            if (raw.Length != nsx * nsy * nsz) { Log.LogInfo($"[ProceduralTerrain] bake miss ({ox},{oz}): data length mismatch"); return false; }
+            if (_bakeData == null) return false;
+            if (!_bakeData.TryGetValue((ox, oz), out var e)) return false;
+            if (e.bw != bw) return false;
+            int owned = bw - 2 * overlap;
+            int fY    = voxelFloorY;
+
+            // ── step==1 FAST path: band samples are already full-res → map straight into the sparse
+            // cache, no rehydrate and no tricubic. This is the "is full-res load faster?" test. ──
+            if (e.step == 1)
+            {
+                var surfH1 = new float[bw * bw];
+                if (_colVScratch   == null || _colVScratch.Length   < bh) _colVScratch = new sbyte[bh];
+                if (_sparseScratch == null || _sparseScratch.Length < owned * bh * owned) _sparseScratch = new sbyte[owned * bh * owned];
+                var colV1 = _colVScratch; var scratch1 = _sparseScratch;
+                var cStart = new int[owned * owned]; var cLen = new int[owned * owned]; var cOff = new int[owned * owned];
+                int tot = 0;
+                for (int cx = 0; cx < bw; cx++)
+                for (int cz = 0; cz < bw; cz++)
+                {
+                    int col = cx * e.nsz + cz;
+                    int yLo = e.colYLo[col], yLen = e.colYLen[col], off = e.colOff[col];
+                    sbyte below = e.colBelow[col], above = e.colAbove[col];
+                    float sh = float.NaN;
+                    for (int cy = 0; cy < bh; cy++)
+                    {
+                        int bakCy = (extLo + cy) - e.extLo;
+                        sbyte v;
+                        if (bakCy < 0) v = -127;
+                        else if (bakCy >= e.bh) v = 127;
+                        else { int ys = bakCy; v = (ys < yLo) ? below : (ys < yLo + yLen) ? e.samples[off + (ys - yLo)] : above; }
+                        colV1[cy] = v;
+                        if (v < 0) sh = (extLo + cy) * s;
+                    }
+                    surfH1[cx * bw + cz] = sh;
+                    if (cx >= overlap && cx < overlap + owned && cz >= overlap && cz < overlap + owned)
+                    {
+                        int oc = (cx - overlap) * owned + (cz - overlap);
+                        int first = -1, last = -1;
+                        for (int cy = 0; cy < bh; cy++)
+                        {
+                            int wy = extLo + cy; sbyte v = colV1[cy];
+                            bool isDefault = (wy < fY) ? (v == -127) : (v == 127);
+                            if (!isDefault) { if (first < 0) first = cy; last = cy; }
+                        }
+                        cOff[oc] = tot;
+                        if (first < 0) { cStart[oc] = -1; cLen[oc] = 0; }
+                        else { cStart[oc] = first; int len = last - first + 1; cLen[oc] = len; Array.Copy(colV1, first, scratch1, tot, len); tot += len; }
+                    }
+                }
+                var band1 = new sbyte[tot]; Array.Copy(scratch1, 0, band1, 0, tot);
+                _sdfCache[$"{ox},{oz}"] = new ZoneField { extLo = extLo, bh = bh, width = owned, colStart = cStart, colLen = cLen, colOff = cOff, band = band1 };
+                lock (_surfHCache) _surfHCache[(ox, oz)] = (bw, extLo, s, surfH1);
+                return true;
+            }
+
+            int step = e.step;
+            int nsx = e.nsx, nsy = e.nsy, nsz = e.nsz;
             float scale = 32f * s / 127f;
 
-            // Separable tricubic Catmull-Rom reconstruction: three axis passes through
-            // temporary buffers. O(bw*bh*bw*4) reads vs O(bw*bh*bw*64) for naive 3D CR.
-            // Pass 1: expand X — raw[xs,ys,zs] → temp1[cx,ys,zs]
-            int t1Len = bw * nsy * nsz, t2Len = bw * bh * nsz;
+            // Rehydrate the sparse per-column bands into a dense coarse grid (reused buffer) that the
+            // reconstruction below reads. For step==1 this grid is already full-res, so the tricubic
+            // passes are an identity — correct, though not yet specialized to skip the work.
+            int rawLen = nsx * nsy * nsz;
+            if (_rehydrateScratch == null || _rehydrateScratch.Length < rawLen) _rehydrateScratch = new sbyte[rawLen];
+            var raw = _rehydrateScratch;
+            for (int xs = 0; xs < nsx; xs++)
+            for (int zs = 0; zs < nsz; zs++)
+            {
+                int col = xs * nsz + zs;
+                int yLo = e.colYLo[col], yLen = e.colYLen[col], off = e.colOff[col];
+                sbyte below = e.colBelow[col], above = e.colAbove[col];
+                for (int ys = 0; ys < nsy; ys++)
+                    raw[(xs * nsy + ys) * nsz + zs] = (ys < yLo) ? below : (ys < yLo + yLen) ? e.samples[off + (ys - yLo)] : above;
+            }
+
+            int t1Len = bw * nsy * nsz, t2Len = bw * nsy * bw;
             if (_crTemp1.Length < t1Len) _crTemp1 = new float[t1Len];
             if (_crTemp2.Length < t2Len) _crTemp2 = new float[t2Len];
-            var temp1 = _crTemp1;
-            var temp2 = _crTemp2;
+            var temp1 = _crTemp1;  // [cx, ys, zs]
+            var temp2 = _crTemp2;  // [cx, ys, cz]  (X- and Z-expanded, coarse Y)
+
+            // Pass 1: expand X
             for (int ys = 0; ys < nsy; ys++)
             for (int zs = 0; zs < nsz; zs++)
             for (int cx = 0; cx < bw; cx++)
             {
-                float xf = (float)cx / step;
-                int xs = Math.Min((int)xf, nsx - 2); if (xs < 0) xs = 0;
-                float tx = xf - xs;
+                float xf = (float)cx / step; int xs = Math.Min((int)xf, nsx - 2); if (xs < 0) xs = 0; float tx = xf - xs;
                 int xA = Math.Max(xs-1,0), xB=xs, xC=Math.Min(xs+1,nsx-1), xD=Math.Min(xs+2,nsx-1);
-                temp1[(cx * nsy + ys) * nsz + zs] = CatmullRom(
-                    raw[(xA*nsy+ys)*nsz+zs], raw[(xB*nsy+ys)*nsz+zs],
-                    raw[(xC*nsy+ys)*nsz+zs], raw[(xD*nsy+ys)*nsz+zs], tx);
+                temp1[(cx*nsy+ys)*nsz+zs] = CatmullRom(raw[(xA*nsy+ys)*nsz+zs], raw[(xB*nsy+ys)*nsz+zs], raw[(xC*nsy+ys)*nsz+zs], raw[(xD*nsy+ys)*nsz+zs], tx);
             }
-
-            // Pass 2: expand Y — temp1[cx,ys,zs] → temp2[cx,cy,zs]
+            // Pass 2: expand Z (coarse Y retained)
             for (int cx = 0; cx < bw; cx++)
-            for (int zs = 0; zs < nsz; zs++)
-            for (int cy = 0; cy < bh; cy++)
-            {
-                int bakCy = (extLo + cy) - e.extLo;
-                if (bakCy < 0 || bakCy >= e.bh)
-                {
-                    temp2[(cx * bh + cy) * nsz + zs] = (bakCy < 0) ? -127f : 127f;
-                    continue;
-                }
-                float yf = (float)bakCy / step;
-                int ys = Math.Min((int)yf, nsy - 2); if (ys < 0) ys = 0;
-                float ty = yf - ys;
-                int yA=Math.Max(ys-1,0), yB=ys, yC=Math.Min(ys+1,nsy-1), yD=Math.Min(ys+2,nsy-1);
-                temp2[(cx * bh + cy) * nsz + zs] = CatmullRom(
-                    temp1[(cx*nsy+yA)*nsz+zs], temp1[(cx*nsy+yB)*nsz+zs],
-                    temp1[(cx*nsy+yC)*nsz+zs], temp1[(cx*nsy+yD)*nsz+zs], ty);
-            }
-
-            // Pass 3: expand Z — temp2[cx,cy,zs] → buf[cx,cy,cz]
-            for (int cx = 0; cx < bw; cx++)
-            for (int cy = 0; cy < bh; cy++)
+            for (int ys = 0; ys < nsy; ys++)
             for (int cz = 0; cz < bw; cz++)
             {
-                float zf = (float)cz / step;
-                int zs = Math.Min((int)zf, nsz - 2); if (zs < 0) zs = 0;
-                float tz = zf - zs;
+                float zf = (float)cz / step; int zs = Math.Min((int)zf, nsz - 2); if (zs < 0) zs = 0; float tz = zf - zs;
                 int zA=Math.Max(zs-1,0), zB=zs, zC=Math.Min(zs+1,nsz-1), zD=Math.Min(zs+2,nsz-1);
-                buf[(cx * bh + cy) * bw + cz] = CatmullRom(
-                    temp2[(cx*bh+cy)*nsz+zA], temp2[(cx*bh+cy)*nsz+zB],
-                    temp2[(cx*bh+cy)*nsz+zC], temp2[(cx*bh+cy)*nsz+zD], tz) * scale;
+                temp2[(cx*nsy+ys)*bw+cz] = CatmullRom(temp1[(cx*nsy+ys)*nsz+zA], temp1[(cx*nsy+ys)*nsz+zB], temp1[(cx*nsy+ys)*nsz+zC], temp1[(cx*nsy+ys)*nsz+zD], tz);
             }
+
+            int width = bw - 2 * overlap;
+            var surfH = new float[bw * bw];
+            if (_colFloatScratch == null || _colFloatScratch.Length < bh) _colFloatScratch = new float[bh];
+            if (_sparseScratch   == null || _sparseScratch.Length   < width * bh * width) _sparseScratch = new sbyte[width * bh * width];
+            if (_colVScratch     == null || _colVScratch.Length     < bh) _colVScratch = new sbyte[bh];
+            var colF = _colFloatScratch; var scratch = _sparseScratch; var colV = _colVScratch;
+            var transBytes = new sbyte[bh]; var transHasOvr = new bool[bh];
+            var colStart = new int[width * width]; var colLen = new int[width * width]; var colOff = new int[width * width];
+            int total = 0, floorY = voxelFloorY;
+            const float SAT = 120f;
+
+            for (int cx = 0; cx < bw; cx++)
+            for (int cz = 0; cz < bw; cz++)
+            {
+                int cb = cx * nsy;   // temp2 base: (cb+ys)*bw + cz
+                // Active coarse-Y band (near a transition); constant runs outside get nearest-neighbor.
+                int bandLo = int.MaxValue, bandHi = int.MinValue;
+                float prev = temp2[(cb + 0) * bw + cz];
+                for (int ys = 0; ys < nsy; ys++)
+                {
+                    float v = temp2[(cb + ys) * bw + cz];
+                    if (Math.Abs(v) < SAT || (ys > 0 && ((v < 0f) != (prev < 0f)))) { if (ys < bandLo) bandLo = ys; if (ys > bandHi) bandHi = ys; }
+                    prev = v;
+                }
+                if (bandLo != int.MaxValue) { bandLo -= 2; bandHi += 2; }
+
+                float sh = float.NaN;
+                for (int cy = 0; cy < bh; cy++)
+                {
+                    int bakCy = (extLo + cy) - e.extLo;
+                    float outv;
+                    if (bakCy < 0) outv = -127f;
+                    else if (bakCy >= e.bh) outv = 127f;
+                    else
+                    {
+                        float yf = (float)bakCy / step; int ys = Math.Min((int)yf, nsy - 2); if (ys < 0) ys = 0;
+                        if (ys >= bandLo && ys <= bandHi)
+                        {
+                            float ty = yf - ys; int yA=Math.Max(ys-1,0), yB=ys, yC=Math.Min(ys+1,nsy-1), yD=Math.Min(ys+2,nsy-1);
+                            outv = CatmullRom(temp2[(cb+yA)*bw+cz], temp2[(cb+yB)*bw+cz], temp2[(cb+yC)*bw+cz], temp2[(cb+yD)*bw+cz], ty);
+                        }
+                        else outv = temp2[(cb + Math.Min((int)(yf + 0.5f), nsy - 1)) * bw + cz];
+                    }
+                    float fv = outv * scale;
+                    colF[cy] = fv;
+                    if (fv < 0f) sh = (extLo + cy) * s;   // ascending → ends at topmost solid
+                }
+                surfH[cx * bw + cz] = sh;
+
+                // Owned columns → emit the sparse deviating run (same transition logic as the live fill).
+                if (cx >= overlap && cx < overlap + width && cz >= overlap && cz < overlap + width)
+                {
+                    int col = (cx - overlap) * width + (cz - overlap);
+                    Array.Clear(transHasOvr, 0, bh);
+                    float av = colF[bh - 1];
+                    for (int cy = bh - 2; cy >= 0; cy--)
+                    {
+                        float bv = colF[cy];
+                        bool topSurf = av > 0f && bv <= 0f, botSurf = av <= 0f && bv > 0f;
+                        if (topSurf || botSurf)
+                        {
+                            float d = av - bv; float t = Mathf.Clamp01(d != 0f ? (-bv) / d : 0.5f); sbyte lo, hi;
+                            if (topSurf) { lo = (sbyte)(int)Math.Round(-t * 127f); hi = (sbyte)(int)Math.Round((1f - t) * 127f); }
+                            else         { lo = (sbyte)(int)Math.Round(t * 127f);  hi = (sbyte)(int)Math.Round(-(1f - t) * 127f); }
+                            transBytes[cy] = lo; transHasOvr[cy] = true; transBytes[cy + 1] = hi; transHasOvr[cy + 1] = true;
+                        }
+                        av = bv;
+                    }
+                    int first = -1, last = -1;
+                    for (int cy = 0; cy < bh; cy++)
+                    {
+                        sbyte v = transHasOvr[cy] ? transBytes[cy] : ToSDFByte(colF[cy], s);
+                        colV[cy] = v; int wy = extLo + cy;
+                        bool isDefault = (wy < floorY) ? (v == -127) : (v == 127);
+                        if (!isDefault) { if (first < 0) first = cy; last = cy; }
+                    }
+                    colOff[col] = total;
+                    if (first < 0) { colStart[col] = -1; colLen[col] = 0; }
+                    else { colStart[col] = first; int len = last - first + 1; colLen[col] = len; Array.Copy(colV, first, scratch, total, len); total += len; }
+                }
+            }
+
+            var band = new sbyte[total]; Array.Copy(scratch, 0, band, 0, total);
+            string zoneKey = $"{ox},{oz}";
+            _sdfCache[zoneKey] = new ZoneField { extLo = extLo, bh = bh, width = width, colStart = colStart, colLen = colLen, colOff = colOff, band = band };
+            lock (_surfHCache) _surfHCache[(ox, oz)] = (bw, extLo, s, surfH);
             return true;
         }
+
+        const float BakeSAT = 120f;   // |sample| >= this ⇒ saturated (constant) coarse sample
 
         static void StageBakeEntry(int ox, int oz, int bw, int bh, int extLo, float s, float[] buf)
         {
@@ -164,17 +310,51 @@ namespace ProceduralTerrain
             int nsx  = (bw + step - 1) / step;
             int nsy  = (bh + step - 1) / step;
             int nsz  = (bw + step - 1) / step;
-            var raw  = new sbyte[nsx * nsy * nsz];
+            int ncol = nsx * nsz;
+            var colYLo   = new int[ncol];
+            var colYLen  = new int[ncol];
+            var colOff   = new int[ncol];
+            var colBelow = new sbyte[ncol];
+            var colAbove = new sbyte[ncol];
+            var colV     = new sbyte[nsy];
+            var packed   = new List<sbyte>(ncol * 4);
+
             for (int xs = 0; xs < nsx; xs++)
-            for (int ys = 0; ys < nsy; ys++)
             for (int zs = 0; zs < nsz; zs++)
             {
                 int cx = Math.Min(xs * step, bw - 1);
-                int cy = Math.Min(ys * step, bh - 1);
                 int cz = Math.Min(zs * step, bw - 1);
-                raw[(xs * nsy + ys) * nsz + zs] = ToSDFByte(buf[(cx * bh + cy) * bw + cz], 32f * s);
+                for (int ys = 0; ys < nsy; ys++)
+                {
+                    int cy = Math.Min(ys * step, bh - 1);
+                    colV[ys] = ToSDFByte(buf[(cx * bh + cy) * bw + cz], 32f * s);
+                }
+                // Active band: non-saturated or straddling a sign change; the rest is constant fill.
+                int minA = int.MaxValue, maxA = int.MinValue;
+                for (int ys = 0; ys < nsy; ys++)
+                {
+                    sbyte v = colV[ys];
+                    bool active = Math.Abs((int)v) < BakeSAT || (ys > 0 && ((v < 0) != (colV[ys - 1] < 0)));
+                    if (active) { if (ys < minA) minA = ys; if (ys > maxA) maxA = ys; }
+                }
+                int col = xs * nsz + zs;
+                colBelow[col] = colV[0];
+                colAbove[col] = colV[nsy - 1];
+                colOff[col]   = packed.Count;
+                if (minA == int.MaxValue) { colYLo[col] = 0; colYLen[col] = 0; }
+                else
+                {
+                    colYLo[col]  = minA;
+                    colYLen[col] = maxA - minA + 1;
+                    for (int ys = minA; ys <= maxA; ys++) packed.Add(colV[ys]);
+                }
             }
-            _bakePending[(ox, oz)] = (extLo, bh, bw, raw);
+
+            _bakePending[(ox, oz)] = new BakeZone {
+                extLo = extLo, bh = bh, bw = bw, step = step, nsx = nsx, nsy = nsy, nsz = nsz,
+                colYLo = colYLo, colYLen = colYLen, colOff = colOff,
+                colBelow = colBelow, colAbove = colAbove, samples = packed.ToArray()
+            };
         }
 
         static void WriteBakeFile(float radius)
@@ -285,56 +465,45 @@ namespace ProceduralTerrain
             finally { _parallelBakeActive = false; }
 
             // Merge staged + existing bake data (staged takes priority).
-            var toWrite = new Dictionary<(int, int), (int extLo, int bh, int bw, sbyte[] data)>();
+            var toWrite = new Dictionary<(int, int), BakeZone>();
             if (_bakeData != null)
                 foreach (var kv in _bakeData) toWrite[kv.Key] = kv.Value;
             foreach (var kv in _bakePending)
                 toWrite[kv.Key] = kv.Value;
 
             string path = BakeFilePath(seed, cfgHash);
+            Directory.CreateDirectory(PTConfigDir);
             using var fs  = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None);
             Stream outStream = _compressBake ? new GZipStream(fs, System.IO.Compression.CompressionLevel.Optimal) : fs;
             using var bw2 = new BinaryWriter(outStream);
             bw2.Write(0x564F5846u);          // magic
-            bw2.Write((ushort)(_compressBake ? 2 : 1)); // version: 1=raw, 2=gzip
+            bw2.Write((ushort)3);            // version 3 = sparse per-column, per-zone step
             bw2.Write((ulong)(uint)seed);
             bw2.Write(cfgHash);
-            bw2.Write((ushort)_bakeStep);
-            // Only write entries whose raw data is consistent with the current step.
-            // Stale entries (different step) are dropped so the file stays self-consistent.
-            var validEntries = new List<((int, int) key, (int extLo, int bh, int bw, sbyte[] data) entry)>();
-            foreach (var kv in toWrite)
-            {
-                var (extLo, bh, ebw, raw) = kv.Value;
-                int nsx = (ebw + _bakeStep - 1) / _bakeStep;
-                int nsy = (bh  + _bakeStep - 1) / _bakeStep;
-                int nsz = (ebw + _bakeStep - 1) / _bakeStep;
-                if (raw.Length != nsx * nsy * nsz)
-                {
-                    Log.LogInfo($"[ProceduralTerrain] bake: dropping zone {kv.Key} — raw size {raw.Length} != expected {nsx*nsy*nsz} (stale step?)");
-                    continue;
-                }
-                validEntries.Add((kv.Key, kv.Value));
-            }
-            bw2.Write((uint)validEntries.Count);
-            foreach (var (key, entry) in validEntries)
+            bw2.Write((uint)toWrite.Count);
+            foreach (var (key, z) in toWrite)
             {
                 var (eox, eoz) = key;
-                var (extLo, bh, ebw, raw) = entry;
-                int nsx = (ebw + _bakeStep - 1) / _bakeStep;
-                int nsy = (bh  + _bakeStep - 1) / _bakeStep;
-                int nsz = (ebw + _bakeStep - 1) / _bakeStep;
-                bw2.Write(eox); bw2.Write(eoz); bw2.Write(extLo);
-                bw2.Write((ushort)bh); bw2.Write((ushort)ebw);
-                bw2.Write(nsx); bw2.Write(nsy); bw2.Write(nsz);
-                var bytes = new byte[raw.Length];
-                Buffer.BlockCopy(raw, 0, bytes, 0, raw.Length);
+                bw2.Write(eox); bw2.Write(eoz); bw2.Write(z.extLo);
+                bw2.Write((ushort)z.bh); bw2.Write((ushort)z.bw); bw2.Write((ushort)z.step);
+                bw2.Write(z.nsx); bw2.Write(z.nsy); bw2.Write(z.nsz);
+                int ncol = z.nsx * z.nsz;
+                for (int c = 0; c < ncol; c++)
+                {
+                    bw2.Write((ushort)z.colYLo[c]);
+                    bw2.Write((ushort)z.colYLen[c]);
+                    bw2.Write(z.colBelow[c]);
+                    bw2.Write(z.colAbove[c]);
+                }
+                bw2.Write((uint)z.samples.Length);
+                var bytes = new byte[z.samples.Length];
+                Buffer.BlockCopy(z.samples, 0, bytes, 0, z.samples.Length);
                 bw2.Write(bytes);
             }
             _bakeData = toWrite;
             _bakeFileStep = _bakeStep;
             _bakePending.Clear();
-            Log.LogInfo($"[ProceduralTerrain] Bake written: {validEntries.Count} zones (dropped {toWrite.Count - validEntries.Count} stale), radius={radius:F0}m, step={_bakeStep} → {path}");
+            Log.LogInfo($"[ProceduralTerrain] Bake written: {toWrite.Count} zones, radius={radius:F0}m, step={_bakeStep} → {path}");
         }
 
         // ── Hot-reload: re-run the full voxel pipeline on every loaded zone ───────

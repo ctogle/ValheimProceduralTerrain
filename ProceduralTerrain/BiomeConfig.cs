@@ -31,8 +31,11 @@ namespace ProceduralTerrain
             };
 
         // ── Config file ───────────────────────────────────────────────────────────
+        // The PT-specific config folder (holds the biomes cfg, mode lua, and bake .bin files).
+        internal static string PTConfigDir =>
+            Path.Combine(BepInEx.Paths.ConfigPath, "ProceduralTerrain");
         internal static string ConfigPath =>
-            Path.Combine(BepInEx.Paths.ConfigPath, "ProceduralTerrain", "procedural_terrain_biomes.cfg");
+            Path.Combine(PTConfigDir, "procedural_terrain_biomes.cfg");
 
         // Parse a [Mode:name] section into a ModeDefinition subclass.
         static ModeDefinition? ParseModeDefinition(string name, List<(string key, string val)> kvs)

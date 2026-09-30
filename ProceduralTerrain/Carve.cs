@@ -44,7 +44,7 @@ namespace ProceduralTerrain
             Mathf.Lerp(Mathf.Lerp(a[i00], a[i10], fx), Mathf.Lerp(a[i01], a[i11], fx), fz);
 
         // ── Carve pass ────────────────────────────────────────────────────────────
-        internal static void Carve(object? grid, int ox, int oz, int width, int yLo, int yHi, float gridScale = 0f, Voxheim.Core.HeightGrid? heightGrid = null)
+        internal static void Carve(object? grid, int ox, int oz, int width, int yLo, int yHi, float gridScale = 0f, Voxheim.Core.HeightGrid? heightGrid = null, int voxelFloorY = int.MinValue)
         {
             float s;
             if (gridScale > 0f)
@@ -125,9 +125,23 @@ namespace ProceduralTerrain
             if (_cb.bufC == null || _cb.bufC.Length < bufSize) _cb.bufC = new float[bufSize];
             float[] buf = _cb.bufA, tmp = _cb.bufB, orig = _cb.bufC;
 
-            long _tRec0 = System.Diagnostics.Stopwatch.GetTimestamp();
-            bool fromBake = _bakeData != null && TryPopulateFromBake(ox, oz, bw, bh, extLo, s, buf);
-            long _tRec1 = System.Diagnostics.Stopwatch.GetTimestamp();
+            // Piece 2: for baked zones on the main/load path, reconstruct per-column straight into the
+            // sparse cache (surfH + band) with no dense buf. Falls through to the dense path on mismatch.
+            if ((!_parallelBakeActive || System.Threading.Thread.CurrentThread.ManagedThreadId == Plugin._mainThreadId)
+                && _bakeData != null && _bakeData.ContainsKey((ox, oz)))
+            {
+                long ft0 = System.Diagnostics.Stopwatch.GetTimestamp();
+                if (PopulateSparseFromBake(ox, oz, bw, bh, extLo, s, voxelFloorY, overlap))
+                {
+                    double fms = (System.Diagnostics.Stopwatch.GetTimestamp() - ft0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+                    if (fms > 2.0) Log.LogInfo($"[PT-load] baked zone ({ox},{oz}) fused reconstruct+fill={fms:F2}ms (bh={bh})");
+                    return;
+                }
+            }
+
+            // Baked zones are fully handled by PopulateSparseFromBake above (early return). Reaching here
+            // means the zone is unbaked → live carve.
+            bool fromBake = false;
 
             if (!fromBake)
             {
@@ -453,17 +467,26 @@ namespace ProceduralTerrain
                     lock (_surfHCache) _surfHCache[(ox, oz)] = (bw, extLo, s, surfH);
             }
 
-            int maxYC  = yHi;
-            int maxYAny = yHi;
+            // Bake threads skip sdfCache (they stage the dense file via StageBakeEntry from buf). Only the
+            // main-thread live/load path builds the sparse per-column cache PTGenerator consumes.
+            if (!_parallelBakeActive || System.Threading.Thread.CurrentThread.ManagedThreadId == Plugin._mainThreadId)
             {
             var transBytes  = new sbyte[bh];
             var transHasOvr = new bool[bh];
-            var cacheData   = new sbyte[width * bh * width];
+            if (_sparseScratch == null || _sparseScratch.Length < width * bh * width) _sparseScratch = new sbyte[width * bh * width];
+            if (_colVScratch   == null || _colVScratch.Length   < bh)                 _colVScratch   = new sbyte[bh];
+            var scratch = _sparseScratch; var colV = _colVScratch;
+            var colStart = new int[width * width];
+            var colLen   = new int[width * width];
+            var colOff   = new int[width * width];
+            int total  = 0;
+            int floorY = voxelFloorY;   // int.MinValue ⇒ default is air everywhere (skip air only)
 
             for (int ci = 0; ci < width; ci++)
             for (int ri = 0; ri < width; ri++)
             {
                 int cx = ci + overlap, cz = ri + overlap;
+                int col = ci * width + ri;
                 Array.Clear(transHasOvr, 0, bh);
                 float av = buf[(cx * bh + (bh - 1)) * bw + cz];
                 for (int cy = bh - 2; cy >= 0; cy--)
@@ -483,32 +506,31 @@ namespace ProceduralTerrain
                     }
                     av = bv;
                 }
+                // Compute the column and its deviating run [first..last] vs the floor-rule default.
+                int first = -1, last = -1;
                 for (int cy = 0; cy < bh; cy++)
                 {
-                    float finalSDF = buf[(cx * bh + cy) * bw + cz];
-                    sbyte v = transHasOvr[cy] ? transBytes[cy] : ToSDFByte(finalSDF, s);
-                    cacheData[(ci * bh + cy) * width + ri] = v;
-                    int gy = extLo + cy;
-                    if (gy > maxYAny) maxYAny = gy;
-                    if (v < 0 && gy > maxYC) maxYC = gy;
+                    sbyte v = transHasOvr[cy] ? transBytes[cy] : ToSDFByte(buf[(cx * bh + cy) * bw + cz], s);
+                    colV[cy] = v;
+                    int wy = extLo + cy;
+                    bool isDefault = (wy < floorY) ? (v == -127) : (v == 127);   // solid below floorY, air above
+                    if (!isDefault) { if (first < 0) first = cy; last = cy; }
                 }
+                colOff[col] = total;
+                if (first < 0) { colStart[col] = -1; colLen[col] = 0; continue; }
+                colStart[col] = first;
+                int len = last - first + 1;
+                colLen[col] = len;
+                Array.Copy(colV, first, scratch, total, len);
+                total += len;
             }
 
-            // Bake threads skip sdfCache to avoid accumulating hundreds of MB during bake.
-            // Main-thread live carves (PTGenerator) always write so Voxheim fallback works.
-            if (!_parallelBakeActive || System.Threading.Thread.CurrentThread.ManagedThreadId == Plugin._mainThreadId)
-                _sdfCache[zoneKey] = (extLo, bh, width, cacheData);
-
-            }
-
-            if (fromBake)
-            {
-                long _tEnd = System.Diagnostics.Stopwatch.GetTimestamp();
-                double freq = System.Diagnostics.Stopwatch.Frequency;
-                double recMs  = (_tRec1 - _tRec0) * 1000.0 / freq;
-                double restMs = (_tEnd  - _tRec1) * 1000.0 / freq;
-                if (recMs + restMs > 2.0)
-                    Log.LogInfo($"[PT-load] baked zone ({ox},{oz}) reconstruct={recMs:F2}ms fill+surfH={restMs:F2}ms (bh={bh})");
+            var band = new sbyte[total];
+            Array.Copy(scratch, 0, band, 0, total);
+            _sdfCache[zoneKey] = new Plugin.ZoneField {
+                extLo = extLo, bh = bh, width = width,
+                colStart = colStart, colLen = colLen, colOff = colOff, band = band
+            };
             }
 
             if (_dumpZonesRemaining > 0)

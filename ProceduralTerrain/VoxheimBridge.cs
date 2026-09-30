@@ -127,8 +127,11 @@ namespace ProceduralTerrain
 
                 if (!haveCache)
                 {
-                    try { Plugin.Carve(heights, ox, oz, width, context.InitialScanLo, context.InitialScanHi, heights.Scale, heights); }
+                    long _tc0 = System.Diagnostics.Stopwatch.GetTimestamp();
+                    try { Plugin.Carve(heights, ox, oz, width, context.InitialScanLo, context.InitialScanHi, heights.Scale, heights, context.Floor.Y); }
                     catch (Exception e) { Plugin.Log.LogError($"[PT] Carve ({ox},{oz}): {e.Message}"); return; }
+                    double carveMs = (System.Diagnostics.Stopwatch.GetTimestamp() - _tc0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+                    if (carveMs > 3.0) Plugin.Log.LogInfo($"[PT-load] Carve ({ox},{oz}) = {carveMs:F2}ms (live/unbaked)");
                     if (!Plugin._sdfCache.TryGetValue(zoneKey, out c)) return;
                 }
             }
@@ -136,32 +139,27 @@ namespace ProceduralTerrain
             builder.SetFloor(context.Floor);
             builder.IncludeY(c.extLo, c.extLo + c.bh - 1);
 
-            // Phase 1 band-limit: the field is sparse over a SolidFloorRule (solid below floor.Y, air
-            // above). A saturated voxel (|d|==127) whose sign already matches that default is redundant —
-            // leaving it unset yields the same solid/air result via the floor rule. So we set only the
-            // transition band (|d|<127) plus any saturated voxel that DEVIATES from the default (solid
-            // terrain body above floor.Y, cave air below it). Meshing is unchanged; we skip constant fill.
-            // PT convention: d<0 solid, d>0 air.  Floor: y<floor.Y ⇒ solid default.
-            int floorY = context.Floor.Y;
+            // Sparse consume: Carve already stored only the deviating band per column (everything else is
+            // served by the SolidFloorRule default — solid below floor.Y, air above). Just replay the runs.
             long _tSet0 = System.Diagnostics.Stopwatch.GetTimestamp();
-            int setCount = 0, skipCount = 0;
+            int setCount = 0;
             for (int ci = 0; ci < width; ci++)
             for (int ri = 0; ri < width; ri++)
             {
+                int col = ci * c.width + ri;
+                int len = c.colLen[col];
+                if (len == 0) continue;
+                int start = c.colStart[col], off = c.colOff[col];
                 int wx = ox + ci, wz = oz + ri;
-                for (int cy = 0; cy < c.bh; cy++)
+                for (int k = 0; k < len; k++)
                 {
-                    sbyte d = c.data[(ci * c.bh + cy) * c.width + ri];
-                    int   wy = c.extLo + cy;
-                    // Skip saturated voxels equal to the floor-rule default.
-                    if (d == 127 && wy >= floorY) { skipCount++; continue; }   // air above floor → default air
-                    if (d == -127 && wy < floorY) { skipCount++; continue; }   // solid below floor → default solid
-                    builder.Field.Set(new Voxheim.Core.Int3(wx, wy, wz), d);
+                    int   wy = c.extLo + start + k;
+                    builder.Field.Set(new Voxheim.Core.Int3(wx, wy, wz), c.band[off + k]);
                     setCount++;
                 }
             }
             double setMs = (System.Diagnostics.Stopwatch.GetTimestamp() - _tSet0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
-            if (setMs > 2.0) Plugin.Log.LogInfo($"[PT-load] Field.Set zone ({ox},{oz}) = {setMs:F2}ms set={setCount} skip={skipCount} ({width}x{width}x{c.bh})");
+            if (setMs > 2.0) Plugin.Log.LogInfo($"[PT-load] Field.Set zone ({ox},{oz}) = {setMs:F2}ms set={setCount} ({width}x{width}x{c.bh})");
         }
 
         // Build a per-zone height grid with overlapping LOCATION terrain ops baked in, using vanilla

@@ -105,7 +105,7 @@ namespace ProceduralTerrain
             if (!isAdmin) { Log.LogWarning($"[ProceduralTerrain] ClearBake from non-admin peer {sender} rejected."); return; }
             int seed = (int)(ZNet.instance?.GetWorldUID() ?? 0L);
             string pattern = $"procedural_terrain_bake_{seed:X8}_*.bin";
-            var matches = System.IO.Directory.GetFiles(BepInEx.Paths.ConfigPath, pattern);
+            var matches = System.IO.Directory.GetFiles(PTConfigDir, pattern);
             string msg;
             if (matches.Length > 0)
             {
@@ -145,7 +145,7 @@ namespace ProceduralTerrain
             }
             if (!isAdmin) { Log.LogWarning($"[ProceduralTerrain] ListBakes from non-admin peer {sender} rejected."); return; }
 
-            string dir   = Paths.ConfigPath;
+            string dir   = PTConfigDir;
             var    files = System.IO.Directory.GetFiles(dir, "procedural_terrain_bake_*.bin");
             var    resp  = new ZPackage();
             resp.Write(files.Length);
@@ -316,6 +316,7 @@ namespace ProceduralTerrain
             int  seed    = (int)(ZNet.instance?.GetWorldUID() ?? 0L);
             uint cfgHash = ComputeCfgHash();
             string path  = BakeFilePath(seed, cfgHash);
+            System.IO.Directory.CreateDirectory(PTConfigDir);
             File.WriteAllBytes(path, data);
             long ms = _bakeDownloadTimer?.ElapsedMilliseconds ?? 0;
             Log.LogInfo($"[ProceduralTerrain] Bake downloaded in {ms / 1000.0:F1}s — written to {path}. Reloading.");

@@ -706,10 +706,24 @@ namespace ProceduralTerrain
         // ── SDF bake ─────────────────────────────────────────────────────────────
         static float _bakeRadius = 0f;
         static int   _bakeStep   = 8;
-        // Staged: subsampled SDF written by Carve() when within bakeRadius.
-        static readonly System.Collections.Concurrent.ConcurrentDictionary<(int, int), (int extLo, int bh, int bw, sbyte[] data)> _bakePending = new();
+        // Sparse per-zone bake (file v3). Per coarse column (col = xs*nsz + zs) we store only the
+        // non-saturated band [colYLo .. colYLo+colYLen) plus the saturated fill below/above it. `step` is
+        // PER ZONE: step==1 ⇒ band samples are already full-res (load skips reconstruct); step>1 ⇒ load
+        // rehydrates the dense coarse grid from the band and tricubic-upsamples as before.
+        internal sealed class BakeZone
+        {
+            public int extLo, bh, bw, step, nsx, nsy, nsz;
+            public int[]   colYLo   = System.Array.Empty<int>();
+            public int[]   colYLen  = System.Array.Empty<int>();
+            public int[]   colOff   = System.Array.Empty<int>();   // offset into samples[]
+            public sbyte[] colBelow = System.Array.Empty<sbyte>(); // fill for ys < colYLo
+            public sbyte[] colAbove = System.Array.Empty<sbyte>(); // fill for ys >= colYLo+colYLen
+            public sbyte[] samples  = System.Array.Empty<sbyte>(); // packed band samples
+        }
+        // Staged: sparse SDF written by Carve() when within bakeRadius.
+        static readonly System.Collections.Concurrent.ConcurrentDictionary<(int, int), BakeZone> _bakePending = new();
         // Loaded from disk: populated at world load; null if no valid file exists.
-        internal static Dictionary<(int, int), (int extLo, int bh, int bw, sbyte[] data)>? _bakeData;
+        internal static Dictionary<(int, int), BakeZone>? _bakeData;
         static int _bakeFileStep = 8;
         static bool _bakeLoadAttempted = false;
 
@@ -801,9 +815,26 @@ namespace ProceduralTerrain
         // Cache it keyed by integer coarse voxel coords — cleared on world load only.
         internal static readonly System.Collections.Concurrent.ConcurrentDictionary<long, float> _heightCache = new();
 
-        // Per-zone SDF cache: filled by Phase 3, queried by FallbackDensityPatch.
-        // Layout: data[(ci * bh + cy) * width + ri]  (ci=zoneX, ri=zoneZ, cy=Y-extLo)
-        internal static readonly System.Collections.Concurrent.ConcurrentDictionary<string, (int extLo, int bh, int width, sbyte[] data)> _sdfCache = new();
+        // Per-zone SDF cache (SPARSE): stores only the deviating band per column. Voxheim's field is
+        // sparse over a SolidFloorRule (solid below floor.Y, air above); voxels matching that default are
+        // omitted and served by the rule, so we never materialize/hand over the constant fill. Queried by
+        // PTGenerator.Generate. Per column (col = ci*width + ri): a single contiguous run of `colLen`
+        // densities starting at world-Y (extLo + colStart), packed into `band` at `colOff`.
+        internal sealed class ZoneField
+        {
+            public int extLo, bh, width;
+            public int[]   colStart = System.Array.Empty<int>();   // first cy of the run (-1 if empty)
+            public int[]   colLen   = System.Array.Empty<int>();   // run length (voxels)
+            public int[]   colOff   = System.Array.Empty<int>();   // offset into band[]
+            public sbyte[] band     = System.Array.Empty<sbyte>(); // packed run densities
+        }
+        internal static readonly System.Collections.Concurrent.ConcurrentDictionary<string, ZoneField> _sdfCache = new();
+
+        // Reused (thread-local) scratch for sparse packing — avoids per-zone dense allocations (GC).
+        [ThreadStatic] static sbyte[]? _sparseScratch;
+        [ThreadStatic] static sbyte[]? _colVScratch;
+        [ThreadStatic] static float[]? _colFloatScratch;   // Piece 2: per-column reconstruct (no dense buf)
+        [ThreadStatic] static sbyte[]? _rehydrateScratch;  // v3: sparse bake → dense coarse grid for reconstruction
 
         // Zones whose SDF has already been carved with location groundwork baked in. Used to drop a
         // stale (mod-less/early) cache entry once, so the zone re-carves with the edits applied.
@@ -1009,7 +1040,7 @@ namespace ProceduralTerrain
                         // Specific filename given (with or without directory).
                         path = System.IO.Path.IsPathRooted(arg)
                             ? arg
-                            : System.IO.Path.Combine(Paths.ConfigPath, arg);
+                            : System.IO.Path.Combine(PTConfigDir, arg);
                     }
                     else
                     {
@@ -1034,7 +1065,7 @@ namespace ProceduralTerrain
                 optionsFetcher: () =>
                 {
                     var opts = new List<string> { "server" };
-                    opts.AddRange(System.IO.Directory.GetFiles(Paths.ConfigPath, "procedural_terrain_bake_*.bin")
+                    opts.AddRange(System.IO.Directory.GetFiles(PTConfigDir, "procedural_terrain_bake_*.bin")
                         .Select(System.IO.Path.GetFileName));
                     return opts;
                 });
@@ -1052,7 +1083,7 @@ namespace ProceduralTerrain
                     Console.instance?.Print("[ProceduralTerrain] Querying server bake files…");
                     return;
                 }
-                string dir = Paths.ConfigPath;
+                string dir = PTConfigDir;
                 var files  = System.IO.Directory.GetFiles(dir, "procedural_terrain_bake_*.bin");
                 if (files.Length == 0)
                 {
