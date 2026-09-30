@@ -101,6 +101,9 @@ namespace ProceduralTerrain
             string zoneKey = $"{ox},{oz}";
             Plugin.EnsureBakeLoaded();
             bool haveCache = Plugin._sdfCache.TryGetValue(zoneKey, out var c);
+            // GC correlation: did serving this zone trigger a collection? (gen0 = churn, gen2 = big pause)
+            int _gc0 = GC.CollectionCount(0), _gc1 = GC.CollectionCount(1), _gc2 = GC.CollectionCount(2);
+            bool _genThisZone = !haveCache;
 
             // Location groundwork (villages/spawn) is the deterministic initial condition, so it's baked
             // into the baseline. On a bake HIT the baked baseline already conforms — we must not run the
@@ -160,6 +163,9 @@ namespace ProceduralTerrain
             }
             double setMs = (System.Diagnostics.Stopwatch.GetTimestamp() - _tSet0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
             if (setMs > 2.0) Plugin.Log.LogInfo($"[PT-load] Field.Set zone ({ox},{oz}) = {setMs:F2}ms set={setCount} ({width}x{width}x{c.bh})");
+            int d0 = GC.CollectionCount(0) - _gc0, d1 = GC.CollectionCount(1) - _gc1, d2 = GC.CollectionCount(2) - _gc2;
+            if (d0 > 0 || d1 > 0 || d2 > 0)
+                Plugin.Log.LogInfo($"[PT-gc] zone ({ox},{oz}) load triggered GC: gen0+{d0} gen1+{d1} gen2+{d2}  (gen={_genThisZone})");
         }
 
         // Build a per-zone height grid with overlapping LOCATION terrain ops baked in, using vanilla

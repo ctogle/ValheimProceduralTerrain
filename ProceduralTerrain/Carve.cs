@@ -76,12 +76,32 @@ namespace ProceduralTerrain
 
             const int overlap = 4;
             int bwEarly = width + 2 * overlap;
+
+            // A: baked zones need NONE of the live machinery (BakeBlendedProfiles, margins, BakeSdfSetup,
+            // FillPhase1). Serve straight from the bake using its OWN baked extent, before any of that runs.
+            // This is what makes a baked world cheap per zone (previously BakeBlendedProfiles ~60ms/zone ran
+            // even for baked zones because it sat above the old early-return).
+            if ((!_parallelBakeActive || System.Threading.Thread.CurrentThread.ManagedThreadId == Plugin._mainThreadId)
+                && _bakeData != null && _bakeData.TryGetValue((ox, oz), out var bakedE) && bakedE.bw == bwEarly)
+            {
+                long ft0 = System.Diagnostics.Stopwatch.GetTimestamp();
+                if (PopulateSparseFromBake(ox, oz, bwEarly, bakedE.bh, bakedE.extLo, s, voxelFloorY, overlap))
+                {
+                    double fms = (System.Diagnostics.Stopwatch.GetTimestamp() - ft0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+                    if (fms > 2.0) Log.LogInfo($"[PT-load] baked zone ({ox},{oz}) fused={fms:F2}ms (bh={bakedE.bh})");
+                    return;
+                }
+            }
+
             // +1 guard cell on the far (+x/+z) side: interpolation needs a coarse neighbor past the
             // last owned voxel. Without it, far-edge owned voxels clamp to a flat cell when CellVox>overlap
             // (coarseMult>1), stepping vs the neighbor zone. No-op at coarseMult=1 (clamp never triggers).
             int cw4Early = (bwEarly + CellVox - 1) / CellVox + 1;
 
+            long _tbbp = System.Diagnostics.Stopwatch.GetTimestamp();
             if (wg != null) BakeBlendedProfiles(cw4Early, ox, oz, overlap, s, wg);
+            double bbpMs = (System.Diagnostics.Stopwatch.GetTimestamp() - _tbbp) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+            if (bbpMs > 3.0) Log.LogInfo($"[PT-load] BakeBlendedProfiles ({ox},{oz}) = {bbpMs:F2}ms cw4Early={cw4Early} (runs for EVERY zone incl. baked)");
 
             CaveProfile ProfAt(int cx4, int cz4) =>
                 (_blendedProfs != null && cx4 * cw4Early + cz4 < _blendedProfs.Length)
@@ -124,20 +144,7 @@ namespace ProceduralTerrain
             if (_cb.bufB == null || _cb.bufB.Length < bufSize) _cb.bufB = new float[bufSize];
             if (_cb.bufC == null || _cb.bufC.Length < bufSize) _cb.bufC = new float[bufSize];
             float[] buf = _cb.bufA, tmp = _cb.bufB, orig = _cb.bufC;
-
-            // Piece 2: for baked zones on the main/load path, reconstruct per-column straight into the
-            // sparse cache (surfH + band) with no dense buf. Falls through to the dense path on mismatch.
-            if ((!_parallelBakeActive || System.Threading.Thread.CurrentThread.ManagedThreadId == Plugin._mainThreadId)
-                && _bakeData != null && _bakeData.ContainsKey((ox, oz)))
-            {
-                long ft0 = System.Diagnostics.Stopwatch.GetTimestamp();
-                if (PopulateSparseFromBake(ox, oz, bw, bh, extLo, s, voxelFloorY, overlap))
-                {
-                    double fms = (System.Diagnostics.Stopwatch.GetTimestamp() - ft0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
-                    if (fms > 2.0) Log.LogInfo($"[PT-load] baked zone ({ox},{oz}) fused reconstruct+fill={fms:F2}ms (bh={bh})");
-                    return;
-                }
-            }
+            // (baked zones already returned above, before the live machinery ran)
 
             // Baked zones are fully handled by PopulateSparseFromBake above (early return). Reaching here
             // means the zone is unbaked → live carve.
