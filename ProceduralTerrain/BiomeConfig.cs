@@ -825,9 +825,16 @@ namespace ProceduralTerrain
                 profs.TryGetValue(b, out var p) ? p : CaveProfile.Default;
 
             int   cellVox    = CellVox;
-            float coarseStep = cellVox * s;
+            // B: decouple biome sampling from carve resolution. Biomes vary over 100m+, so supersampling
+            // them at a 1m carve cell was pure waste (the ~60ms/zone). Use a biome grid cell >= 4 voxels
+            // and map carve cells to it by nearest-neighbor. At cellVox >= 4 this is IDENTITY: bCell ==
+            // cellVox → biomeCw == cw4 → pIdx == (cx4+pad)*pcw+(cz4+pad), i.e. exactly the old behavior.
+            int   bCell      = Math.Max(cellVox, 4);
+            float coarseStep = bCell * s;
+            int   ownedVox   = (cw4 - 1) * cellVox;                 // zone+overlap extent in voxels
+            int   biomeCw    = (ownedVox + bCell - 1) / bCell + 1;  // biome grid width (== cw4 when bCell==cellVox)
             int pad    = (int)(_biomeBlendRadius / coarseStep) + 2;
-            int pcw    = cw4 + 2 * pad;
+            int pcw    = biomeCw + 2 * pad;
             int pgSize = pcw * pcw;
             int maxHops = (int)(_biomeBlendRadius / coarseStep) + 1;
 
@@ -844,14 +851,14 @@ namespace ProceduralTerrain
             for (int px = 0; px < pcw; px++)
             for (int pz = 0; pz < pcw; pz++)
             {
-                int gx0 = ox - overlap + (px - pad) * cellVox;
-                int gz0 = oz - overlap + (pz - pad) * cellVox;
+                int gx0 = ox - overlap + (px - pad) * bCell;
+                int gz0 = oz - overlap + (pz - pad) * bCell;
                 int cellBase = (px * pcw + pz) * MaxBiomeSlots;
                 for (int si = 0; si < SuperN; si++)
                 for (int sk = 0; sk < SuperN; sk++)
                 {
-                    float wx = (gx0 + (si + 0.5f) * cellVox / SuperN) * s;
-                    float wz = (gz0 + (sk + 0.5f) * cellVox / SuperN) * s;
+                    float wx = (gx0 + (si + 0.5f) * bCell / SuperN) * s;
+                    float wz = (gz0 + (sk + 0.5f) * bCell / SuperN) * s;
                     int b = (int)wg.GetBiome(wx, wz);
                     if (!biomeSlot.TryGetValue(b, out int slot))
                     {
@@ -931,7 +938,13 @@ namespace ProceduralTerrain
                 for (int cx4 = 0; cx4 < cw4; cx4++)
                 for (int cz4 = 0; cz4 < cw4; cz4++)
                 {
-                    int pIdx = (cx4 + pad) * pcw + (cz4 + pad);
+                    // Nearest-neighbor map this carve cell to the (coarser) biome grid. Identity when
+                    // bCell == cellVox: (cx4*cellVox)/bCell == cx4 → bpx == cx4+pad, as before.
+                    int bpx = (int)((cx4 * cellVox) / (float)bCell + 0.5f) + pad;
+                    int bpz = (int)((cz4 * cellVox) / (float)bCell + 0.5f) + pad;
+                    if (bpx >= pcw) bpx = pcw - 1;
+                    if (bpz >= pcw) bpz = pcw - 1;
+                    int pIdx = bpx * pcw + bpz;
                     int distCells = _biomeDist![pIdx];
                     if (distCells > maxHops) continue;
                     float t = distCells * coarseStep / _biomeBlendRadius;
