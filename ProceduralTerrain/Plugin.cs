@@ -671,6 +671,7 @@ namespace ProceduralTerrain
         internal static readonly List<(Vector2 pos, float extR)> _locationPositions = new();
         internal static bool _locationsCached;
         internal static bool  _protectLocations    = true;
+        internal static bool  _applyGroundwork     = true;   // bake location terrain modifiers into the baseline
         internal static bool  _flatPlaneLocations  = true;
         internal static bool  _islandRemoval       = true;
         internal static bool  _pocketRemoval       = true;
@@ -791,6 +792,7 @@ namespace ProceduralTerrain
         [ThreadStatic] static CaveProfile[]? _blendedProfs;
         [ThreadStatic] static float[]?       _runSDF;   // Path B: running coarse SDF (cellCount*bh, world units) modes compose into sequentially
         [ThreadStatic] static float[]?       _eikScratch;   // Path B: unsigned-distance scratch for the eikonal redistance pass
+        internal static float[]?             _gwOverlayScratch;   // groundwork overlay: pad-region signed SDF (main thread, build-then-consume)
         // Path B increment 3: composed-surface inputs a surface-anchored mode reads (per coarse cell)
         // while it bakes during sequential compose — derived from the running field of PRIOR modes.
         [ThreadStatic] internal static float[]? _composeInH;    // composed-surface elevation (zero-crossing of runSDF)
@@ -839,6 +841,10 @@ namespace ProceduralTerrain
         // Zones whose SDF has already been carved with location groundwork baked in. Used to drop a
         // stale (mod-less/early) cache entry once, so the zone re-carves with the edits applied.
         internal static readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> _groundworkedZones = new();
+        // Groundworked heights cached from the first successful gather (modifiers loaded), reused on revisit
+        // when the transient TerrainModifier objects aren't loaded — keeps the baseline deterministic so
+        // Voxheim's authority doesn't rebase to vanilla. Keyed by Valheim zone index "x,z"; survives unload.
+        internal static readonly Dictionary<string, (Voxheim.Core.HeightGrid grid, Voxheim.Core.HeightGrid vanilla, int nmods)> _groundworkCache = new();
 
         // Per-zone surface height cache: filled after Phase 2, queried by GetWorldHeight patch.
         // Layout: surfH[cx * bw + cz] = world-Y of topmost solid voxel (NaN = no solid in column).

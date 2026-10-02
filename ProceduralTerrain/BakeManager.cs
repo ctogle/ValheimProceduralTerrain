@@ -397,22 +397,9 @@ namespace ProceduralTerrain
                 if (_bakeData != null && _bakeFileStep == _bakeStep && _bakeData.ContainsKey((ox, oz))) continue;
                 toCarve.Add((ox, oz));
             }
-            // Pre-gather LOCATION groundwork on the MAIN thread — TerrainModifier.GetAllInstances and
-            // HeightmapBuilder.RequestTerrainSync are main-thread-only, so worker threads can't do it.
-            // Zones with no overlapping location modifiers get nothing (cheap: the gather returns null
-            // before any RequestTerrainSync). Worker threads then carve from these conformed heights,
-            // baking the deterministic location edits into the file. Player edits are never baked —
-            // Voxheim overlays them on top at runtime.
-            var bakeGroundwork = new Dictionary<(int ox, int oz), Voxheim.Core.HeightGrid>();
-            foreach (var (zox, zoz) in toCarve)
-            {
-                float cx = (zox + zoneW * 0.5f) * s;
-                float cz = (zoz + zoneW * 0.5f) * s;
-                var gw = PTGenerator.BuildGroundworkedHeights(cx, 0f, cz, zoneW, s, out int nm);
-                if (gw != null && nm > 0) bakeGroundwork[(zox, zoz)] = gw;
-            }
-            if (bakeGroundwork.Count > 0)
-                Log.LogInfo($"[ProceduralTerrain] bake: {bakeGroundwork.Count} zone(s) with location groundwork baked in");
+            // The bake is PURELY PROCEDURAL — location groundwork is NOT frozen in. It's applied as a live
+            // overlay at load (PTGenerator.Generate), so the bake needs no location data (cold-bakeable,
+            // deterministic) and groundwork is always applied with modifiers present + cached for revisit.
 
             int threads = Math.Max(1, Environment.ProcessorCount - 1);
             Log.LogInfo($"[ProceduralTerrain] bake: {toCarve.Count} zones to carve (radius={radius:F0}m, threads={threads})...");
@@ -439,11 +426,8 @@ namespace ProceduralTerrain
                         // a managed failure (e.g. an indexing bug at fine coarseXZ) is diagnosable, not fatal.
                         try
                         {
-                            // Location-conformed heights (if any) bake the edits in; else raw procedural carve.
-                            if (bakeGroundwork.TryGetValue(zone, out var gw))
-                                Carve(gw, zox, zoz, zoneW, yLo, yHi, s, gw);
-                            else
-                                Carve(null, zox, zoz, zoneW, yLo, yHi);
+                            // Purely procedural carve — groundwork is a live overlay applied at load, not baked.
+                            Carve(null, zox, zoz, zoneW, yLo, yHi);
                         }
                         catch (Exception ce)
                         {
@@ -514,6 +498,8 @@ namespace ProceduralTerrain
             _bakeData = null;
             _bakeLoadAttempted = false;
             _sdfCache.Clear();
+            _groundworkedZones.Clear();   // keyed by zone index — must not leak across worlds
+            _groundworkCache.Clear();     // ditto: a prior world's groundworked heights would be served for the same index
             _heightCache.Clear();
             VanillaHeight.Clear();
             lock (_surfHCache) _surfHCache.Clear();

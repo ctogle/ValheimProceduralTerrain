@@ -251,6 +251,8 @@ namespace ProceduralTerrain
                             _disableVegetation = v == "1" || v == "true";
                         if (k == "protectlocations")
                             _protectLocations = !(v == "0" || v == "false");
+                        if (k == "applygroundwork")
+                            _applyGroundwork = !(v == "0" || v == "false");
                         if (k == "flatplanelocations")
                             _flatPlaneLocations = !(v == "0" || v == "false");
                         if (k == "islandremoval")
@@ -520,7 +522,7 @@ namespace ProceduralTerrain
         }
 
         // ── Per-column analytic floor ─────────────────────────────────────────────
-        static sbyte ToSDFByte(float sdf, float s)
+        internal static sbyte ToSDFByte(float sdf, float s)
         {
             // Match Density.FromSdf exactly: clamp to ±1 voxel then round to nearest sbyte.
             // No snap — snapping collapsed sub-voxel fractions to ±12 on flat tops,
