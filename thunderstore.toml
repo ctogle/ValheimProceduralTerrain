@@ -11,7 +11,7 @@ containsNsfwContent = false
 
 [package.dependencies]
 denikson-BepInExPack_Valheim = "5.4.2333"
-Voxheim-Voxheim = "0.1.3"
+Voxheim-Voxheim = "0.1.8"
 
 [build]
 icon = "./icon.png"
