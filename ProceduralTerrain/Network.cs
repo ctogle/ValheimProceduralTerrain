@@ -109,6 +109,7 @@ namespace ProceduralTerrain
             string msg;
             if (matches.Length > 0)
             {
+                CloseBakeStream();   // release the open read handle so the file isn't locked on delete
                 foreach (var f in matches) File.Delete(f);
                 _bakeData = null; _bakeLoadAttempted = false;
                 msg = $"Deleted {matches.Length} server bake file(s).";
@@ -317,6 +318,7 @@ namespace ProceduralTerrain
             uint cfgHash = ComputeCfgHash();
             string path  = BakeFilePath(seed, cfgHash);
             System.IO.Directory.CreateDirectory(PTConfigDir);
+            CloseBakeStream();   // release any open read handle before overwriting the file
             File.WriteAllBytes(path, data);
             long ms = _bakeDownloadTimer?.ElapsedMilliseconds ?? 0;
             Log.LogInfo($"[ProceduralTerrain] Bake downloaded in {ms / 1000.0:F1}s — written to {path}. Reloading.");

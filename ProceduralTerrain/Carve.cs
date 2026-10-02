@@ -82,7 +82,7 @@ namespace ProceduralTerrain
             // This is what makes a baked world cheap per zone (previously BakeBlendedProfiles ~60ms/zone ran
             // even for baked zones because it sat above the old early-return).
             if ((!_parallelBakeActive || System.Threading.Thread.CurrentThread.ManagedThreadId == Plugin._mainThreadId)
-                && _bakeData != null && _bakeData.TryGetValue((ox, oz), out var bakedE) && bakedE.bw == bwEarly)
+                && TryGetBakeZone(ox, oz, out var bakedE) && bakedE.bw == bwEarly)
             {
                 long ft0 = System.Diagnostics.Stopwatch.GetTimestamp();
                 if (PopulateSparseFromBake(ox, oz, bwEarly, bakedE.bh, bakedE.extLo, s, voxelFloorY, overlap))

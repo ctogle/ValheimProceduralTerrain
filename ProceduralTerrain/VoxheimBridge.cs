@@ -63,6 +63,51 @@ namespace ProceduralTerrain
             return true;
         }
 
+        // ── Brick-blit writer ─────────────────────────────────────────────────────
+        // Full-res volumetric terrain fills ~85% of a zone's voxels, so Generate was doing ~240k per-voxel
+        // VoxelField.Set calls (each a brick dictionary lookup) ≈ 13ms/zone → stutter. Voxheim's field is 16³
+        // bricks; a column's Y-run touches the same brick for 16 consecutive voxels. This caches the current
+        // brick and writes straight to it via the public Brick.Set, doing the dictionary lookup only on the
+        // first voxel of each brick (routed through Field.Set so the brick is created with the correct
+        // background + min/maxY bookkeeping). Brick tracking is off during baseline build, so the direct
+        // writes are equivalent to Field.Set. Falls back to Field.Set if the _bricks field can't be reflected.
+        internal sealed class BrickWriter
+        {
+            static FieldInfo _bricksFI;
+            static bool _resolved;
+            readonly Voxheim.Core.VoxelField _field;
+            readonly Dictionary<Voxheim.Core.Int3, Voxheim.Core.Brick> _bricks;
+            Voxheim.Core.Brick _cur;
+            int _kx, _ky, _kz;
+            bool _have;
+            internal BrickWriter(Voxheim.Core.VoxelField field)
+            {
+                _field = field;
+                if (!_resolved)
+                {
+                    _bricksFI = typeof(Voxheim.Core.VoxelField).GetField("_bricks", BindingFlags.NonPublic | BindingFlags.Instance);
+                    _resolved = true;
+                    if (_bricksFI == null) Log.LogWarning("[ProceduralTerrain] VoxelField._bricks not found — brick-blit disabled, using per-voxel Set.");
+                }
+                _bricks = _bricksFI?.GetValue(field) as Dictionary<Voxheim.Core.Int3, Voxheim.Core.Brick>;
+            }
+            public void Set(int wx, int wy, int wz, sbyte v)
+            {
+                if (_bricks == null) { _field.Set(new Voxheim.Core.Int3(wx, wy, wz), v); return; }
+                int kx = wx >> 4, ky = wy >> 4, kz = wz >> 4;
+                if (!_have || kx != _kx || ky != _ky || kz != _kz)
+                {
+                    _have = _bricks.TryGetValue(new Voxheim.Core.Int3(kx, ky, kz), out _cur);
+                    _kx = kx; _ky = ky; _kz = kz;
+                }
+                if (_have && _cur != null) { _cur.Set(wx & 0xF, wy & 0xF, wz & 0xF, v); return; }
+                // Brick doesn't exist yet: let Field.Set create it (background + bookkeeping), then cache it.
+                _field.Set(new Voxheim.Core.Int3(wx, wy, wz), v);
+                _have = _bricks.TryGetValue(new Voxheim.Core.Int3(kx, ky, kz), out _cur);
+                _kx = kx; _ky = ky; _kz = kz;
+            }
+        }
+
         // ── Groundwork overlay ────────────────────────────────────────────────────
         // Patches the pad columns of a procedural (baked or live) zone with the groundworked surface. The
         // footprint is where the groundworked height differs from PURE vanilla (location protection guarantees
@@ -153,8 +198,7 @@ namespace ProceduralTerrain
 
             // Groundwork overlay (distinct LIVE step): groundworked surface heights for this zone (cache-backed
             // for revisit determinism). Footprint = where groundwork changed PURE vanilla (context.Heights
-            // already has groundwork, so it can't be the reference). The patched columns get an eikonal
-            // redistance pass so the pad rim has true distance/normals — matching Carve's post-mod eikonal.
+            // already has groundwork, so it can't be the reference). Patched columns emit the groundworked surface.
             Voxheim.Core.HeightGrid gwGrid = null, vanGrid = null;
             if (Plugin._applyGroundwork)
             {
@@ -176,6 +220,9 @@ namespace ProceduralTerrain
             int ovCols = 0;
             long _tSet0 = System.Diagnostics.Stopwatch.GetTimestamp();
             int setCount = 0;
+            // Brick-blit writer: caches the current 16³ brick so a column's contiguous Y-run writes go straight
+            // to the brick array, skipping the per-voxel dictionary lookup that dominated Field.Set at full res.
+            var bw = new Plugin.BrickWriter(builder.Field);
             for (int ci = 0; ci < width; ci++)
             for (int ri = 0; ri < width; ri++)
             {
@@ -187,7 +234,7 @@ namespace ProceduralTerrain
                         sbyte d = gw.Sample(ci, ri, wy);
                         if (d == 127 && wy >= floorY) continue;
                         if (d == -127 && wy < floorY) continue;
-                        builder.Field.Set(new Voxheim.Core.Int3(wx, wy, wz), d);
+                        bw.Set(wx, wy, wz, d);
                         setCount++;
                     }
                     ovCols++;
@@ -200,7 +247,7 @@ namespace ProceduralTerrain
                 for (int k = 0; k < len; k++)
                 {
                     int   wy = c.extLo + start + k;
-                    builder.Field.Set(new Voxheim.Core.Int3(wx, wy, wz), c.band[off + k]);
+                    bw.Set(wx, wy, wz, c.band[off + k]);
                     setCount++;
                 }
             }

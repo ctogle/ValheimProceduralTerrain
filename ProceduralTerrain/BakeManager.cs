@@ -30,63 +30,177 @@ namespace ProceduralTerrain
         static string BakeFilePath(int seed, uint cfgHash) =>
             Path.Combine(PTConfigDir, $"procedural_terrain_bake_{seed:X8}_{cfgHash:X8}.bin");
 
+        static readonly object _bakeStreamLock = new();
+        static byte[] _bakeBlkScratch;   // reused compressed-block buffer (guarded by _bakeStreamLock)
+
         static void LoadBakeFile()
         {
             var wg = WorldGenerator.instance;
-            if (wg == null) { _bakeData = null; return; }
+            CloseBakeStream();
+            _bakeData = null;
+            if (wg == null) return;
             int seed = (int)(ZNet.instance?.GetWorldUID() ?? 0L);
             uint cfgHash = ComputeCfgHash();
             string path = BakeFilePath(seed, cfgHash);
-            if (!File.Exists(path)) { _bakeData = null; return; }
+            if (!File.Exists(path)) return;
             try
             {
-                using var fs  = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
-                // Detect gzip by magic bytes (0x1f 0x8b) without consuming the stream.
+                var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+                // Detect whole-file gzip (v3 compressed) by magic bytes without consuming the stream.
                 bool isGzip = fs.ReadByte() == 0x1f && fs.ReadByte() == 0x8b;
                 fs.Seek(0, SeekOrigin.Begin);
-                Stream inStream = isGzip ? new GZipStream(fs, CompressionMode.Decompress) : fs;
-                using var br  = new BinaryReader(inStream);
-                if (br.ReadUInt32() != 0x564F5846u) { Log.LogWarning("[ProceduralTerrain] bake: invalid magic."); _bakeData = null; return; }
-                ushort ver = br.ReadUInt16();
-                if (ver != 3) { Log.LogWarning($"[ProceduralTerrain] bake: unsupported version {ver} (need v3 — rebake)."); _bakeData = null; return; }
-                if (br.ReadUInt64() != (ulong)(uint)seed || br.ReadUInt32() != cfgHash)
-                    { Log.LogWarning("[ProceduralTerrain] bake: seed/cfg mismatch."); _bakeData = null; return; }
-                int count = (int)br.ReadUInt32();
-                var data = new Dictionary<(int, int), BakeZone>(count);
-                int maxStep = 1;
-                for (int i = 0; i < count; i++)
+
+                // v4 STREAMED: raw (not whole-file gzip), per-zone gzip blocks + an offset index at the end.
+                // Load only the index and keep the file open — zones are read on demand (no 6GB into RAM).
+                if (!isGzip)
                 {
-                    int eox = br.ReadInt32(), eoz = br.ReadInt32(), extLo = br.ReadInt32();
-                    int bh = br.ReadUInt16(), ebw = br.ReadUInt16(), step = br.ReadUInt16();
-                    int nsx = br.ReadInt32(), nsy = br.ReadInt32(), nsz = br.ReadInt32();
-                    int ncol = nsx * nsz;
-                    var colYLo = new int[ncol]; var colYLen = new int[ncol];
-                    var colBelow = new sbyte[ncol]; var colAbove = new sbyte[ncol]; var colOff = new int[ncol];
-                    int off = 0;
-                    for (int c = 0; c < ncol; c++)
+                    var pr = new BinaryReader(fs, System.Text.Encoding.UTF8, leaveOpen: true);
+                    if (pr.ReadUInt32() != 0x564F5846u) { Log.LogWarning("[ProceduralTerrain] bake: invalid magic."); fs.Dispose(); return; }
+                    ushort pver = pr.ReadUInt16();
+                    if (pver == 4)
                     {
-                        colYLo[c]  = br.ReadUInt16();
-                        colYLen[c] = br.ReadUInt16();
-                        colBelow[c] = br.ReadSByte();
-                        colAbove[c] = br.ReadSByte();
-                        colOff[c] = off; off += colYLen[c];
+                        if (pr.ReadUInt64() != (ulong)(uint)seed || pr.ReadUInt32() != cfgHash)
+                            { Log.LogWarning("[ProceduralTerrain] bake: seed/cfg mismatch."); fs.Dispose(); return; }
+                        int cnt = (int)pr.ReadUInt32();
+                        fs.Seek(-8, SeekOrigin.End);
+                        long indexOff = pr.ReadInt64();
+                        fs.Seek(indexOff, SeekOrigin.Begin);
+                        var idx = new Dictionary<(int, int), (long, int)>(cnt);
+                        for (int i = 0; i < cnt; i++)
+                        {
+                            int ox = pr.ReadInt32(), oz = pr.ReadInt32();
+                            long off = pr.ReadInt64(); int len = pr.ReadInt32();
+                            idx[(ox, oz)] = (off, len);
+                        }
+                        _bakeIndex = idx;
+                        _bakeStream = fs;             // KEEP OPEN for per-zone seeks
+                        _bakeFileStep = _bakeStep;    // v4 treated as current
+                        Log.LogInfo($"[ProceduralTerrain] Bake streamed: {cnt} zones (v4), index-only, from {path}");
+                        return;                       // deliberately do NOT dispose fs
                     }
-                    int slen = (int)br.ReadUInt32();
-                    var samples = new sbyte[slen];
-                    var bytes = br.ReadBytes(slen);
-                    Buffer.BlockCopy(bytes, 0, samples, 0, slen);
-                    data[(eox, eoz)] = new BakeZone {
-                        extLo = extLo, bh = bh, bw = ebw, step = step, nsx = nsx, nsy = nsy, nsz = nsz,
-                        colYLo = colYLo, colYLen = colYLen, colOff = colOff,
-                        colBelow = colBelow, colAbove = colAbove, samples = samples
-                    };
-                    if (step > maxStep) maxStep = step;
+                    fs.Seek(0, SeekOrigin.Begin);     // not v4 → fall through to v3 raw load-all
                 }
-                _bakeData = data;
-                _bakeFileStep = maxStep;   // per-zone now; keep the max for the "is-current" heuristic
-                Log.LogInfo($"[ProceduralTerrain] Bake loaded: {count} zones (v3 sparse) from {path}");
+
+                // v3: whole file into RAM (gzip-wrapped or raw).
+                using (var inStream = isGzip ? (Stream)new GZipStream(fs, CompressionMode.Decompress) : fs)
+                using (var br = new BinaryReader(inStream))
+                {
+                    if (br.ReadUInt32() != 0x564F5846u) { Log.LogWarning("[ProceduralTerrain] bake: invalid magic."); return; }
+                    ushort ver = br.ReadUInt16();
+                    if (ver != 3) { Log.LogWarning($"[ProceduralTerrain] bake: unsupported version {ver} (need v3/v4 — rebake)."); return; }
+                    if (br.ReadUInt64() != (ulong)(uint)seed || br.ReadUInt32() != cfgHash)
+                        { Log.LogWarning("[ProceduralTerrain] bake: seed/cfg mismatch."); return; }
+                    int count = (int)br.ReadUInt32();
+                    var data = new Dictionary<(int, int), BakeZone>(count);
+                    int maxStep = 1;
+                    for (int i = 0; i < count; i++)
+                    {
+                        var z = ReadZoneBody(br, out int eox, out int eoz);
+                        data[(eox, eoz)] = z;
+                        if (z.step > maxStep) maxStep = z.step;
+                    }
+                    _bakeData = data;
+                    _bakeFileStep = maxStep;
+                    Log.LogInfo($"[ProceduralTerrain] Bake loaded: {count} zones (v3 sparse, RAM) from {path}");
+                }
             }
-            catch (Exception ex) { Log.LogWarning($"[ProceduralTerrain] bake: load failed: {ex.GetType().Name}: {ex.Message}\n{ex.StackTrace}"); _bakeData = null; }
+            catch (Exception ex) { Log.LogWarning($"[ProceduralTerrain] bake: load failed: {ex.GetType().Name}: {ex.Message}\n{ex.StackTrace}"); _bakeData = null; CloseBakeStream(); }
+        }
+
+        // Shared per-zone (de)serialization — used by v3 load-all and v4 streamed blocks.
+        static BakeZone ReadZoneBody(BinaryReader br, out int eox, out int eoz)
+        {
+            eox = br.ReadInt32(); eoz = br.ReadInt32();
+            int extLo = br.ReadInt32();
+            int bh = br.ReadUInt16(), ebw = br.ReadUInt16(), step = br.ReadUInt16();
+            int nsx = br.ReadInt32(), nsy = br.ReadInt32(), nsz = br.ReadInt32();
+            int ncol = nsx * nsz;
+            var colYLo = new int[ncol]; var colYLen = new int[ncol];
+            var colBelow = new sbyte[ncol]; var colAbove = new sbyte[ncol]; var colOff = new int[ncol];
+            int off = 0;
+            for (int c = 0; c < ncol; c++)
+            {
+                colYLo[c]  = br.ReadUInt16();
+                colYLen[c] = br.ReadUInt16();
+                colBelow[c] = br.ReadSByte();
+                colAbove[c] = br.ReadSByte();
+                colOff[c] = off; off += colYLen[c];
+            }
+            int slen = (int)br.ReadUInt32();
+            var samples = new sbyte[slen];
+            var bytes = br.ReadBytes(slen);
+            Buffer.BlockCopy(bytes, 0, samples, 0, slen);
+            return new BakeZone {
+                extLo = extLo, bh = bh, bw = ebw, step = step, nsx = nsx, nsy = nsy, nsz = nsz,
+                colYLo = colYLo, colYLen = colYLen, colOff = colOff,
+                colBelow = colBelow, colAbove = colAbove, samples = samples
+            };
+        }
+
+        static void WriteZoneBody(BinaryWriter bw2, int eox, int eoz, BakeZone z)
+        {
+            bw2.Write(eox); bw2.Write(eoz); bw2.Write(z.extLo);
+            bw2.Write((ushort)z.bh); bw2.Write((ushort)z.bw); bw2.Write((ushort)z.step);
+            bw2.Write(z.nsx); bw2.Write(z.nsy); bw2.Write(z.nsz);
+            int ncol = z.nsx * z.nsz;
+            for (int c = 0; c < ncol; c++)
+            {
+                bw2.Write((ushort)z.colYLo[c]);
+                bw2.Write((ushort)z.colYLen[c]);
+                bw2.Write(z.colBelow[c]);
+                bw2.Write(z.colAbove[c]);
+            }
+            bw2.Write((uint)z.samples.Length);
+            var bytes = new byte[z.samples.Length];
+            Buffer.BlockCopy(z.samples, 0, bytes, 0, z.samples.Length);
+            bw2.Write(bytes);
+        }
+
+        // v4 streamed read: seek to the zone's block, gunzip it, deserialize. Decoded zones are cached (FIFO)
+        // so the double-call (Carve's bw check + PopulateSparseFromBake) and nearby re-gens don't re-read.
+        internal static bool TryGetBakeZone(int ox, int oz, out BakeZone z)
+        {
+            if (_bakeData != null) return _bakeData.TryGetValue((ox, oz), out z);
+            z = null;
+            if (_bakeIndex == null || _bakeStream == null) return false;
+            lock (_bakeStreamLock)
+            {
+                if (_bakeZoneCache.TryGetValue((ox, oz), out z)) return true;
+                if (!_bakeIndex.TryGetValue((ox, oz), out var loc)) return false;
+                try
+                {
+                    // Reuse a scratch buffer for the transient compressed block so it doesn't churn the LOH
+                    // every zone (the retained samples array still allocates, but the block no longer does).
+                    if (_bakeBlkScratch == null || _bakeBlkScratch.Length < loc.len) _bakeBlkScratch = new byte[loc.len];
+                    var blk = _bakeBlkScratch;
+                    _bakeStream.Seek(loc.off, SeekOrigin.Begin);
+                    int read = 0;
+                    while (read < loc.len) { int r = _bakeStream.Read(blk, read, loc.len - read); if (r <= 0) break; read += r; }
+                    using var ms = new MemoryStream(blk, 0, loc.len);
+                    using var gz = new GZipStream(ms, CompressionMode.Decompress);
+                    using var zbr = new BinaryReader(gz);
+                    z = ReadZoneBody(zbr, out _, out _);
+                }
+                catch (Exception ex) { Log.LogWarning($"[ProceduralTerrain] bake stream read ({ox},{oz}) failed: {ex.Message}"); z = null; return false; }
+                _bakeZoneCache[(ox, oz)] = z;
+                _bakeCacheOrder.Enqueue((ox, oz));
+                while (_bakeCacheOrder.Count > _bakeCacheCap)
+                {
+                    var old = _bakeCacheOrder.Dequeue();
+                    _bakeZoneCache.Remove(old);
+                }
+                return true;
+            }
+        }
+
+        internal static void CloseBakeStream()
+        {
+            lock (_bakeStreamLock)
+            {
+                try { _bakeStream?.Dispose(); } catch { }
+                _bakeStream = null; _bakeIndex = null;
+                _bakeZoneCache.Clear(); _bakeCacheOrder.Clear();
+            }
         }
 
         // Load the bake file once (idempotent) — lets the live generator test IsZoneBaked before carving.
@@ -98,7 +212,9 @@ namespace ProceduralTerrain
         }
 
         // True when this zone is present in the loaded bake file (its baseline is fully baked).
-        internal static bool IsZoneBaked(int ox, int oz) => _bakeData != null && _bakeData.ContainsKey((ox, oz));
+        internal static bool IsZoneBaked(int ox, int oz) =>
+            (_bakeData != null && _bakeData.ContainsKey((ox, oz))) ||
+            (_bakeIndex != null && _bakeIndex.ContainsKey((ox, oz)));
 
         static float CatmullRom(float p0, float p1, float p2, float p3, float t)
         {
@@ -113,8 +229,7 @@ namespace ProceduralTerrain
         // Returns false (→ caller falls back to the dense path) on any bake mismatch.
         static bool PopulateSparseFromBake(int ox, int oz, int bw, int bh, int extLo, float s, int voxelFloorY, int overlap)
         {
-            if (_bakeData == null) return false;
-            if (!_bakeData.TryGetValue((ox, oz), out var e)) return false;
+            if (!TryGetBakeZone(ox, oz, out var e)) return false;
             if (e.bw != bw) return false;
             int owned = bw - 2 * overlap;
             int fY    = voxelFloorY;
@@ -394,7 +509,7 @@ namespace ProceduralTerrain
                 int oz = doz * zoneW + gridOffset;
                 float wx = ox * s, wz = oz * s;
                 if (radius > 0f && wx * wx + wz * wz > radius * radius) continue;
-                if (_bakeData != null && _bakeFileStep == _bakeStep && _bakeData.ContainsKey((ox, oz))) continue;
+                if (_bakeFileStep == _bakeStep && IsZoneBaked(ox, oz)) continue;
                 toCarve.Add((ox, oz));
             }
             // The bake is PURELY PROCEDURAL — location groundwork is NOT frozen in. It's applied as a live
@@ -448,46 +563,62 @@ namespace ProceduralTerrain
             }
             finally { _parallelBakeActive = false; }
 
-            // Merge staged + existing bake data (staged takes priority).
+            // Merge staged + existing bake data (staged takes priority). Existing zones NOT re-carved are
+            // preserved — read on demand from the current store (RAM for v3, streamed for v4).
             var toWrite = new Dictionary<(int, int), BakeZone>();
-            if (_bakeData != null)
-                foreach (var kv in _bakeData) toWrite[kv.Key] = kv.Value;
+            var existingKeys = new List<(int, int)>();
+            if (_bakeData != null) existingKeys.AddRange(_bakeData.Keys);
+            else if (_bakeIndex != null) existingKeys.AddRange(_bakeIndex.Keys);
+            foreach (var key in existingKeys)
+                if (!_bakePending.ContainsKey(key) && TryGetBakeZone(key.Item1, key.Item2, out var zz))
+                    toWrite[key] = zz;
             foreach (var kv in _bakePending)
                 toWrite[kv.Key] = kv.Value;
 
             string path = BakeFilePath(seed, cfgHash);
             Directory.CreateDirectory(PTConfigDir);
-            using var fs  = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None);
-            Stream outStream = _compressBake ? new GZipStream(fs, System.IO.Compression.CompressionLevel.Optimal) : fs;
-            using var bw2 = new BinaryWriter(outStream);
-            bw2.Write(0x564F5846u);          // magic
-            bw2.Write((ushort)3);            // version 3 = sparse per-column, per-zone step
-            bw2.Write((ulong)(uint)seed);
-            bw2.Write(cfgHash);
-            bw2.Write((uint)toWrite.Count);
-            foreach (var (key, z) in toWrite)
+            CloseBakeStream();   // release any open read handle before overwriting the file
+
+            // v4 STREAMED format: header, then each zone as its own gzip block (seekable), then an offset
+            // index, then a footer long pointing at the index. Keeps size ~same but allows load-on-demand.
+            var index = new List<(int ox, int oz, long off, int len)>(toWrite.Count);
+            using (var fs = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None, 1 << 20))
+            using (var bw2 = new BinaryWriter(fs))
             {
-                var (eox, eoz) = key;
-                bw2.Write(eox); bw2.Write(eoz); bw2.Write(z.extLo);
-                bw2.Write((ushort)z.bh); bw2.Write((ushort)z.bw); bw2.Write((ushort)z.step);
-                bw2.Write(z.nsx); bw2.Write(z.nsy); bw2.Write(z.nsz);
-                int ncol = z.nsx * z.nsz;
-                for (int c = 0; c < ncol; c++)
+                bw2.Write(0x564F5846u);          // magic
+                bw2.Write((ushort)4);            // version 4 = streamed (per-zone gzip blocks + offset index)
+                bw2.Write((ulong)(uint)seed);
+                bw2.Write(cfgHash);
+                bw2.Write((uint)toWrite.Count);
+                foreach (var (key, z) in toWrite)
                 {
-                    bw2.Write((ushort)z.colYLo[c]);
-                    bw2.Write((ushort)z.colYLen[c]);
-                    bw2.Write(z.colBelow[c]);
-                    bw2.Write(z.colAbove[c]);
+                    long off = fs.Position;
+                    using (var ms = new MemoryStream())
+                    {
+                        using (var gz = new GZipStream(ms, System.IO.Compression.CompressionLevel.Optimal, leaveOpen: true))
+                        using (var zbw = new BinaryWriter(gz))
+                            WriteZoneBody(zbw, key.Item1, key.Item2, z);
+                        var blk = ms.ToArray();
+                        bw2.Write(blk, 0, blk.Length);
+                        index.Add((key.Item1, key.Item2, off, blk.Length));
+                    }
                 }
-                bw2.Write((uint)z.samples.Length);
-                var bytes = new byte[z.samples.Length];
-                Buffer.BlockCopy(z.samples, 0, bytes, 0, z.samples.Length);
-                bw2.Write(bytes);
+                bw2.Flush();
+                long indexOff = fs.Position;
+                foreach (var e in index) { bw2.Write(e.ox); bw2.Write(e.oz); bw2.Write(e.off); bw2.Write(e.len); }
+                bw2.Write(indexOff);             // footer: where the index begins
+                bw2.Flush();
             }
-            _bakeData = toWrite;
+
+            // Switch straight to streaming from the file we just wrote — frees the multi-GB toWrite from RAM.
+            _bakeData = null;
+            var idx2 = new Dictionary<(int, int), (long, int)>(index.Count);
+            foreach (var e in index) idx2[(e.ox, e.oz)] = (e.off, e.len);
+            _bakeIndex  = idx2;
+            _bakeStream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
             _bakeFileStep = _bakeStep;
             _bakePending.Clear();
-            Log.LogInfo($"[ProceduralTerrain] Bake written: {toWrite.Count} zones, radius={radius:F0}m, step={_bakeStep} → {path}");
+            Log.LogInfo($"[ProceduralTerrain] Bake written (v4 streamed): {toWrite.Count} zones, radius={radius:F0}m → {path}");
         }
 
         // ── Hot-reload: re-run the full voxel pipeline on every loaded zone ───────
@@ -496,6 +627,7 @@ namespace ProceduralTerrain
             LoadBiomeConfig();
             _bakePending.Clear();
             _bakeData = null;
+            CloseBakeStream();
             _bakeLoadAttempted = false;
             _sdfCache.Clear();
             _groundworkedZones.Clear();   // keyed by zone index — must not leak across worlds

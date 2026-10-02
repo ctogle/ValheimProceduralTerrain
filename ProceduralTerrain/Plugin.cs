@@ -724,7 +724,14 @@ namespace ProceduralTerrain
         // Staged: sparse SDF written by Carve() when within bakeRadius.
         static readonly System.Collections.Concurrent.ConcurrentDictionary<(int, int), BakeZone> _bakePending = new();
         // Loaded from disk: populated at world load; null if no valid file exists.
+        // v3 = whole file loaded into _bakeData (RAM-resident). v4 = STREAMED: only the offset index is held
+        // (_bakeIndex), the file stays open (_bakeStream), and each zone is read+gunzipped on demand (cached).
         internal static Dictionary<(int, int), BakeZone>? _bakeData;
+        internal static Dictionary<(int, int), (long off, int len)>? _bakeIndex;  // v4 stream: zone → file location
+        internal static System.IO.FileStream? _bakeStream;                        // v4 stream: kept open for seeks
+        static readonly Dictionary<(int, int), BakeZone> _bakeZoneCache = new();  // v4: small decoded-zone LRU
+        static readonly Queue<(int, int)> _bakeCacheOrder = new();
+        const int _bakeCacheCap = 256;
         static int _bakeFileStep = 8;
         static bool _bakeLoadAttempted = false;
 
@@ -1055,6 +1062,7 @@ namespace ProceduralTerrain
                     }
                     if (File.Exists(path))
                     {
+                        CloseBakeStream();   // release any open read handle so delete can't be blocked
                         File.Delete(path);
                         // Reset in-memory cache if we just deleted the active file.
                         if (System.IO.Path.GetFullPath(path) == System.IO.Path.GetFullPath(BakeFilePath((int)(ZNet.instance?.GetWorldUID() ?? 0L), ComputeCfgHash())))
