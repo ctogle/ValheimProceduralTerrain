@@ -66,63 +66,34 @@ namespace ProceduralTerrain
         // ── Groundwork overlay ────────────────────────────────────────────────────
         // Patches the pad columns of a procedural (baked or live) zone with the groundworked surface. The
         // footprint is where the groundworked height differs from PURE vanilla (location protection guarantees
-        // those columns are vanilla-clean in the bake, so overwriting them loses no procedural detail). The
-        // patch is EIKONAL-REDISTANCED (reusing Carve's RedistanceEikonal over the pad bbox + margin) so a
-        // voxel's nearest surface point can lie in a neighbour column — true distance/normals on the sloped
-        // rim, matching Carve's post-mod eikonal, instead of an aliased per-column vertical field.
+        // those columns are vanilla-clean in the bake, so overwriting them loses no procedural detail). Per-column
+        // heightfield SDF — cheap (no dense eikonal, no stutter). Cached per zone (built once from the cached gw).
         internal sealed class GroundworkOverlay
         {
-            readonly int _w, _x0, _z0, _nz, _extLo, _bh;
+            readonly int _w;
             readonly float _scale;
             readonly bool[] _ovr;
-            readonly float[] _f;     // redistanced signed SDF over the pad sub-region [(x*_nz+z)*_bh + y]
-            internal GroundworkOverlay(int w, int x0, int z0, int nz, int extLo, int bh, float scale, bool[] ovr, float[] f)
-            { _w = w; _x0 = x0; _z0 = z0; _nz = nz; _extLo = extLo; _bh = bh; _scale = scale; _ovr = ovr; _f = f; }
+            readonly float[] _h;     // groundworked height per owned column
+            internal GroundworkOverlay(int w, float scale, bool[] ovr, float[] h)
+            { _w = w; _scale = scale; _ovr = ovr; _h = h; }
             public bool IsOverride(int ci, int ri) => _ovr[ci * _w + ri];
             public sbyte Sample(int ci, int ri, int wy)
-            {
-                int i = (((ci - _x0) * _nz) + (ri - _z0)) * _bh + (wy - _extLo);
-                return ToSDFByte(_f[i], _scale);
-            }
+                => ToSDFByte((wy - _h[ci * _w + ri]) * _scale, _scale);
         }
 
         internal static GroundworkOverlay BuildGroundworkOverlay(
             Voxheim.Core.HeightGrid gw, Voxheim.Core.HeightGrid van, int width, float scale, int extLo, int bh)
         {
-            // Footprint mask + bounding box.
             var ovr = new bool[width * width];
-            int minX = width, maxX = -1, minZ = width, maxZ = -1;
+            var h   = new float[width * width];
             for (int ci = 0; ci < width; ci++)
             for (int ri = 0; ri < width; ri++)
-                if (Math.Abs(gw[ci, ri] - van[ci, ri]) > 0.05f)
-                {
-                    ovr[ci * width + ri] = true;
-                    if (ci < minX) minX = ci; if (ci > maxX) maxX = ci;
-                    if (ri < minZ) minZ = ri; if (ri > maxZ) maxZ = ri;
-                }
-            if (maxX < 0) return new GroundworkOverlay(width, 0, 0, 1, extLo, bh, scale, ovr, Array.Empty<float>());
-
-            // Sub-region = footprint bbox + margin, so the eikonal has boundary neighbours past the pad rim.
-            const int M = 4;
-            int x0 = Math.Max(0, minX - M), x1 = Math.Min(width - 1, maxX + M);
-            int z0 = Math.Max(0, minZ - M), z1 = Math.Min(width - 1, maxZ + M);
-            int nx = x1 - x0 + 1, nz = z1 - z0 + 1;
-            int n  = nx * nz * bh;
-            var f = _gwOverlayScratch;
-            if (f == null || f.Length < n) { f = new float[n]; _gwOverlayScratch = f; }
-
-            // Heightfield init over the sub-region (gw == vanilla outside the footprint → correct protected
-            // surface at the rim). sdf = worldY_meters − surface_meters = (wy − gw[..])·scale.
-            for (int x = 0; x < nx; x++)
-            for (int z = 0; z < nz; z++)
             {
-                float hgw = gw[x0 + x, z0 + z];
-                int baseI = (x * nz + z) * bh;
-                for (int y = 0; y < bh; y++)
-                    f[baseI + y] = ((extLo + y) - hgw) * scale;
+                int idx = ci * width + ri;
+                h[idx] = gw[ci, ri];
+                ovr[idx] = Math.Abs(gw[ci, ri] - van[ci, ri]) > 0.05f;
             }
-            RedistanceEikonal(f, nx, nz, bh, scale, scale, scale, 2);
-            return new GroundworkOverlay(width, x0, z0, nz, extLo, bh, scale, ovr, f);
+            return new GroundworkOverlay(width, scale, ovr, h);
         }
     }
 

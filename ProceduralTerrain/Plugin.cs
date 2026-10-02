@@ -792,7 +792,6 @@ namespace ProceduralTerrain
         [ThreadStatic] static CaveProfile[]? _blendedProfs;
         [ThreadStatic] static float[]?       _runSDF;   // Path B: running coarse SDF (cellCount*bh, world units) modes compose into sequentially
         [ThreadStatic] static float[]?       _eikScratch;   // Path B: unsigned-distance scratch for the eikonal redistance pass
-        internal static float[]?             _gwOverlayScratch;   // groundwork overlay: pad-region signed SDF (main thread, build-then-consume)
         // Path B increment 3: composed-surface inputs a surface-anchored mode reads (per coarse cell)
         // while it bakes during sequential compose — derived from the running field of PRIOR modes.
         [ThreadStatic] internal static float[]? _composeInH;    // composed-surface elevation (zero-crossing of runSDF)
