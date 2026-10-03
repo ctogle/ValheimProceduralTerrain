@@ -393,6 +393,19 @@ namespace ProceduralTerrain
             ("amplitude", 3f),    // MAX ball radius (world units); also the on/off gate
             ("frequency", 0.05f), // lattice density (lump scale)
             ("minradius", 0f),    // if >0, each ball's radius is rolled uniformly in [minradius, amplitude]
+            ("stretchn",  1f),    // scale along the surface normal: >1 spikes/towers, <1 flat scales/shields
+            ("taper",     0f),    // 0 = sphere, 1 = cone to a point toward the normal tip (stalagmites/crystals)
+            ("pnorm",     2f),    // shape exponent: 2 round, →∞ boxy boulders, <2 octahedral/crystalline
+            // ── Distribution (Tier 2): bias WHICH lattice points become stamps ──
+            ("coverage",    1f),  // probabilistic keep per stamp (1 = all, 0.3 = ~30% → sparse scatter)
+            ("bias",        0f),  // 0 = uniform, 1 = contour (periodic Y bands → rings)
+            ("biasspacing", 20f), // contour: ring spacing in world Y
+            ("biaswidth",   0.2f),// contour: band half-width as a fraction of spacing (0..0.5)
+            ("biasphase",   0f),  // contour: ring offset
+            // ── Brush anisotropy (Tier 1): independent scale on the surface frame {N, G, T} ──
+            ("stretchg",    1f),  // scale along G = downslope (gradient): >1 drips/blades running downhill
+            ("stretcht",    1f),  // scale along T = cross-slope (N×G): >1 ridges/scales along the contour
+            ("taperpow",    1f),  // taper curve along +N: 1 linear cone, >1 ogive/bullet, <1 trumpet
         };
         protected override (string name, float def)[] ParamSpec => _spec;
         public override void BakeColumn(ref CarveBuffers cb, in BakeCellArgs args)
@@ -675,6 +688,8 @@ namespace ProceduralTerrain
         internal static bool  _flatPlaneLocations  = true;
         internal static bool  _islandRemoval       = true;
         internal static bool  _pocketRemoval       = true;
+        internal static bool  _hideLodMeshes       = false;  // DEBUG: hide Valheim's distant TerrainLod meshes (clear view of voxel features)
+        internal static int   _overlap             = 4;      // running-field margin (voxels) shared with neighbour zones; caps seam-free feature reach
         internal static float _biomeBlendRadius    = 192f;
         internal static bool  _biomeBlendSmooth    = true;   // false=linear, true=smoothstep
         internal static int   _transitionBlurPasses = 3;     // min blur passes for any active zone

@@ -144,6 +144,26 @@ namespace ProceduralTerrain
 
     // ── Harmony patches ───────────────────────────────────────────────────────────
 
+    // DEBUG: hide Valheim's distant TerrainLod heightmap meshes. They render a low-detail terrain surface
+    // at the vanilla height out to ~2400m, which cuts through the view when inspecting voxel caves/features
+    // from under/inside the terrain. When _hideLodMeshes is set, skip Update (no rebuild) and SetActive(false)
+    // the existing lod heightmaps. Toggle off + relaunch to restore.
+    [HarmonyPatch(typeof(TerrainLod), "Update")]
+    static class TerrainLodHidePatch
+    {
+        static bool Prefix(TerrainLod __instance)
+        {
+            if (!Plugin._hideLodMeshes) return true;
+            if (Traverse.Create(__instance).Field("m_heightmaps").GetValue() is System.Collections.IList hms)
+                foreach (var o in hms)
+                {
+                    var hm = Traverse.Create(o).Field("m_heightmap").GetValue<Heightmap>();
+                    if (hm != null && hm.gameObject.activeSelf) hm.gameObject.SetActive(false);
+                }
+            return false;   // skip the normal update so meshes aren't rebuilt/re-shown
+        }
+    }
+
     [HarmonyPatch]
     static class VoxelZoneDestroyPatch
     {

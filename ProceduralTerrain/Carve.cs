@@ -74,7 +74,7 @@ namespace ProceduralTerrain
 
             string zoneKey = $"{ox},{oz}";
 
-            const int overlap = 4;
+            int overlap = _overlap;
             int bwEarly = width + 2 * overlap;
 
             // A: baked zones need NONE of the live machinery (BakeBlendedProfiles, margins, BakeSdfSetup,
@@ -629,7 +629,7 @@ namespace ProceduralTerrain
 
         static (int yLo, int yHi) ComputeYBounds(int ox, int oz, int w, float s, WorldGenerator wg)
         {
-            const int overlap = 4;
+            int overlap = _overlap;
             float minH = float.MaxValue, maxH = float.MinValue;
             for (int gx = -overlap; gx <= w + overlap; gx++)
             for (int gz = -overlap; gz <= w + overlap; gz++)
@@ -709,7 +709,7 @@ namespace ProceduralTerrain
 
         static void ComputeZoneFaceCache(int ox, int oz, int w, int yLo, int yHi)
         {
-            const int overlap = 4;
+            int overlap = _overlap;
             float s  = _scale ?? 1f;
             var   wg = WorldGenerator.instance;
 
@@ -971,7 +971,7 @@ namespace ProceduralTerrain
             float s = _scale is { } v && v > 0f ? v
                     : _scaleField != null && _scaleField.GetValue(null) is float sf && sf > 0f ? sf
                     : 1f;
-            const int overlap = 4, width = 64;
+            int overlap = _overlap; const int width = 64;
             int gx = Mathf.RoundToInt(worldX / s);
             int gz = Mathf.RoundToInt(worldZ / s);
             int ox = gx - ((gx % width + width) % width);
@@ -1160,11 +1160,26 @@ namespace ProceduralTerrain
                         if (maxR <= 0f) { continue; }
                         float minR = _cb.bkModeParams![mi][2][cc];           // minradius (0 ⇒ fixed radius)
                         if (minR < 0f) minR = 0f; if (minR > maxR) minR = maxR;
+                        // Stamp shape: oriented along the (composed) surface normal stored per blob.
+                        float stretchN = _cb.bkModeParams![mi][3][cc]; if (stretchN <= 0f) stretchN = 1f;  // scale along N
+                        float taper    = _cb.bkModeParams![mi][4][cc]; if (taper < 0f) taper = 0f; if (taper > 1f) taper = 1f;
+                        float pnorm    = _cb.bkModeParams![mi][5][cc]; if (pnorm < 1f) pnorm = 2f;          // cross-section exponent
+                        float stretchG = _cb.bkModeParams![mi][11][cc]; if (stretchG <= 0f) stretchG = 1f; // scale along G (downslope)
+                        float stretchT = _cb.bkModeParams![mi][12][cc]; if (stretchT <= 0f) stretchT = 1f; // scale along T (cross-slope)
+                        float taperPow = _cb.bkModeParams![mi][13][cc]; if (taperPow <= 0f) taperPow = 1f; // taper curve
+                        // Distribution (Tier 2): acceptance bias on which lattice points become stamps.
+                        float coverage    = _cb.bkModeParams![mi][6][cc];
+                        int   bias        = Mathf.RoundToInt(_cb.bkModeParams![mi][7][cc]);
+                        float biasSpacing = Mathf.Max(_cb.bkModeParams![mi][8][cc], 0.001f);
+                        float biasWidth   = Mathf.Clamp(_cb.bkModeParams![mi][9][cc], 0f, 0.5f);
+                        float biasPhase   = _cb.bkModeParams![mi][10][cc];
                         float freq = _cb.bkModeParams![mi][1][cc];
                         float L = freq > 1e-4f ? 1f / freq : 20f;              // lattice spacing (world units)
-                        // (3) Enforce L >= 2*maxR: spheres closer than a diameter apart merge into a
-                        // blanket ("mush") instead of reading as discrete blobs on the surface.
-                        L = Mathf.Max(L, 2f * maxR);
+                        // Reach grows with the largest axis stretch (blob extends maxR*max(stretch) from center).
+                        float reach = maxR * Mathf.Max(1f, Mathf.Max(stretchN, Mathf.Max(stretchG, stretchT)));
+                        // (3) Enforce L >= 2*reach: stamps closer than a diameter apart merge into a
+                        // blanket ("mush") instead of reading as discrete features on the surface.
+                        L = Mathf.Max(L, 2f * reach);
                         float ox0 = (ox - overlap), oz0 = (oz - overlap);
 
                         // trilinear sample of the running field at a world position
@@ -1202,7 +1217,7 @@ namespace ProceduralTerrain
                         // (2) Pad the lattice range by the blob reach so a sphere straddling this zone's
                         // boundary is enumerated (and drawn) by every zone it touches — its center may sit
                         // outside the owned region but within reach. Points beyond coverage get InField-skipped.
-                        int latPad = Mathf.CeilToInt(maxR / L) + 1;
+                        int latPad = Mathf.CeilToInt(reach / L) + 1;
                         int li0 = Mathf.FloorToInt(wxLo/L)-latPad, li1 = Mathf.FloorToInt(wxHi/L)+latPad;
                         int lj0 = Mathf.FloorToInt(wzLo/L)-latPad, lj1 = Mathf.FloorToInt(wzHi/L)+latPad;
                         int lk0 = Mathf.FloorToInt(wyLo/L)-latPad, lk1 = Mathf.FloorToInt(wyHi/L)+latPad;
@@ -1211,6 +1226,9 @@ namespace ProceduralTerrain
                         // index so a blob straddling a zone border gets the same radius in both zones — no seam).
                         var centers = new List<Vector3>(256);
                         var radii   = new List<float>(256);
+                        var normals = new List<Vector3>(256);   // N: composed-surface normal (stamp axis)
+                        var tangG   = new List<Vector3>(256);   // G: downslope tangent
+                        var tangT   = new List<Vector3>(256);   // T = N×G: cross-slope tangent
                         float h = 1.5f;   // gradient sample step
                         for (int li = li0; li <= li1; li++)
                         for (int lj = lj0; lj <= lj1; lj++)
@@ -1226,7 +1244,28 @@ namespace ProceduralTerrain
                             float ny = SampleD(px,py+h,pz) - SampleD(px,py-h,pz);
                             float nz = SampleD(px,py,pz+h) - SampleD(px,py,pz-h);
                             float nl = Mathf.Sqrt(nx*nx+ny*ny+nz*nz); if (nl < 1e-4f) continue; nx/=nl; ny/=nl; nz/=nl;
-                            centers.Add(new Vector3(px - Dp*nx, py - Dp*ny, pz - Dp*nz));  // snap to surface
+                            var ctr = new Vector3(px - Dp*nx, py - Dp*ny, pz - Dp*nz);     // snap to surface
+                            // Distribution bias: thin by coverage, then (bias==1) keep only stamps whose
+                            // surface elevation lands in a periodic Y band → contour rings around the hill.
+                            if (coverage < 1f && Hash(li+401, lj+211, lk+307) > coverage) continue;
+                            if (bias == 1)
+                            {
+                                float rr = ctr.y / biasSpacing + biasPhase; rr -= Mathf.Floor(rr);
+                                if (Mathf.Min(rr, 1f - rr) > biasWidth) continue;
+                            }
+                            centers.Add(ctr);
+                            // Build the surface frame {N, G, T}: N = normal, G = downslope in the tangent
+                            // plane, T = N×G cross-slope. Flat ground → G falls back to world-X.
+                            var N = new Vector3(nx, ny, nz);
+                            var gh = new Vector3(nx, 0f, nz);
+                            if (gh.sqrMagnitude < 1e-6f) gh = new Vector3(1f, 0f, 0f);
+                            float gdn = gh.x*nx + gh.y*ny + gh.z*nz;
+                            var G = new Vector3(gh.x - gdn*nx, gh.y - gdn*ny, gh.z - gdn*nz);
+                            float gl = G.magnitude;
+                            if (gl < 1e-5f) { var f2 = new Vector3(1f,0f,0f); float d2 = f2.x*nx+f2.y*ny+f2.z*nz; G = new Vector3(f2.x-d2*nx, f2.y-d2*ny, f2.z-d2*nz); gl = G.magnitude; }
+                            G /= gl;
+                            var T = Vector3.Cross(N, G);
+                            normals.Add(N); tangG.Add(G); tangT.Add(T);
                             // uniform radius roll in [minR, maxR] from the lattice index (decorrelated hash seeds)
                             radii.Add(minR > 0f ? minR + (maxR - minR) * Hash(li*2+1, lj*2+1, lk*2+1) : maxR);
                         }
@@ -1246,16 +1285,31 @@ namespace ProceduralTerrain
                                 float best = 1e9f;
                                 for (int ci = 0; ci < centers.Count; ci++)
                                 {
-                                    var c = centers[ci];
+                                    var c = centers[ci]; var N = normals[ci]; var G = tangG[ci]; var T = tangT[ci];
+                                    float rr = radii[ci];
                                     float dx = wx-c.x, dy = wy-c.y, dz = wz-c.z;
-                                    float dd = Mathf.Sqrt(dx*dx+dy*dy+dz*dz) - radii[ci];
+                                    // Project into the surface frame {N, G, T}, scale each axis independently,
+                                    // taper the tangential radii toward the +N tip. Reduces EXACTLY to |d|-r at
+                                    // defaults (all stretch=1, taper=0, p=2); eikonal re-normalizes the metric after.
+                                    float dN = dx*N.x + dy*N.y + dz*N.z;
+                                    float dG = dx*G.x + dy*G.y + dz*G.z;
+                                    float dT = dx*T.x + dy*T.y + dz*T.z;
+                                    float RN = rr*stretchN, RG = rr*stretchG, RT = rr*stretchT;
+                                    float tn = dN > 0f ? dN / RN : 0f; if (tn > 1f) tn = 1f;    // 0 at base → 1 at tip
+                                    float shrink = taper * (taperPow == 1f ? tn : Mathf.Pow(tn, taperPow));
+                                    float tf = 1f - shrink; if (tf < 0.02f) tf = 0.02f;         // tangential taper factor
+                                    float uN = dN / RN, uG = dG / (RG*tf), uT = dT / (RT*tf);
+                                    float comb;
+                                    if (pnorm == 2f) comb = Mathf.Sqrt(uN*uN + uG*uG + uT*uT);
+                                    else comb = Mathf.Pow(Mathf.Pow(Mathf.Abs(uN),pnorm) + Mathf.Pow(Mathf.Abs(uG),pnorm) + Mathf.Pow(Mathf.Abs(uT),pnorm), 1f/pnorm);
+                                    float dd = (comb - 1f) * rr;
                                     if (dd < best) best = dd;
                                 }
                                 ref float r = ref _runSDF![cbaseC + cyc];
                                 if (best < r) { r = best; dbgHit++; }
                             }
                         }
-                        Log.LogInfo($"[PT-blobs] centers={centers.Count} L={L:F0} rad=[{minR:F1},{maxR:F1}] solidVoxels={dbgHit}");
+                        Log.LogInfo($"[PT-blobs] centers={centers.Count} L={L:F0} rad=[{minR:F1},{maxR:F1}] stretchN={stretchN:F1} taper={taper:F2} pnorm={pnorm:F1} solidVoxels={dbgHit}");
                         if (_eikonal) RedistanceEikonal(_runSDF!, cw4, cw4, ch, xzStep, xzStep, yStep, 2);
                         continue;
                     }
