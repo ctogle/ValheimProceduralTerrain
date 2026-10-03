@@ -1136,6 +1136,18 @@ namespace ProceduralTerrain
                     int mi = mode.PipelineIndex;
                     if (mi < 0) continue;
 
+                    // Skip modes with NO active cell in this zone (all params zero). Otherwise EVERY mode —
+                    // including the slow Lua ones — runs its full per-cell bake on every zone even where no
+                    // nearby biome uses it (the "gabor/contour logs far away" bug + a big share of live cost).
+                    // Biome blending is preserved: cells near a biome border get non-zero params from the
+                    // neighbour profile, so the mode still runs where it actually contributes.
+                    {
+                        var p0a = _cb.bkModeParams?[mi]?[0];
+                        bool active = false;
+                        if (p0a != null) for (int pi = 0; pi < p0a.Length; pi++) if (p0a[pi] > 0f) { active = true; break; }
+                        if (!active) continue;
+                    }
+
                     // SurfaceBlobs: SDF→SDF operator — union noise-modulated balls onto EVERY surface
                     // (floors + ceilings) via |D| − rEff, reading the running distance field in place.
                     // Needs eikonal=true for metric |D|. Skips the normal bake/compose path.
@@ -1144,13 +1156,15 @@ namespace ProceduralTerrain
                         // Discrete spheres CENTERED ON the surface → clear hemispheres. Snap a jittered
                         // 3D lattice to the surface (c = p − D·∇D), then union min(runSDF, |x−c| − r).
                         int cc = (cw4 / 2) * cw4 + (cw4 / 2);
-                        float rad = _cb.bkModeParams![mi][0][cc];
-                        if (rad <= 0f) { continue; }
+                        float maxR = _cb.bkModeParams![mi][0][cc];           // amplitude = MAX radius / gate
+                        if (maxR <= 0f) { continue; }
+                        float minR = _cb.bkModeParams![mi][2][cc];           // minradius (0 ⇒ fixed radius)
+                        if (minR < 0f) minR = 0f; if (minR > maxR) minR = maxR;
                         float freq = _cb.bkModeParams![mi][1][cc];
                         float L = freq > 1e-4f ? 1f / freq : 20f;              // lattice spacing (world units)
-                        // (3) Enforce L >= 2*rad: spheres closer than a diameter apart merge into a
+                        // (3) Enforce L >= 2*maxR: spheres closer than a diameter apart merge into a
                         // blanket ("mush") instead of reading as discrete blobs on the surface.
-                        L = Mathf.Max(L, 2f * rad);
+                        L = Mathf.Max(L, 2f * maxR);
                         float ox0 = (ox - overlap), oz0 = (oz - overlap);
 
                         // trilinear sample of the running field at a world position
@@ -1188,13 +1202,15 @@ namespace ProceduralTerrain
                         // (2) Pad the lattice range by the blob reach so a sphere straddling this zone's
                         // boundary is enumerated (and drawn) by every zone it touches — its center may sit
                         // outside the owned region but within reach. Points beyond coverage get InField-skipped.
-                        int latPad = Mathf.CeilToInt(rad / L) + 1;
+                        int latPad = Mathf.CeilToInt(maxR / L) + 1;
                         int li0 = Mathf.FloorToInt(wxLo/L)-latPad, li1 = Mathf.FloorToInt(wxHi/L)+latPad;
                         int lj0 = Mathf.FloorToInt(wzLo/L)-latPad, lj1 = Mathf.FloorToInt(wzHi/L)+latPad;
                         int lk0 = Mathf.FloorToInt(wyLo/L)-latPad, lk1 = Mathf.FloorToInt(wyHi/L)+latPad;
 
-                        // precompute surface-snapped centers
+                        // precompute surface-snapped centers (+ per-blob radius, rolled from the GLOBAL lattice
+                        // index so a blob straddling a zone border gets the same radius in both zones — no seam).
                         var centers = new List<Vector3>(256);
+                        var radii   = new List<float>(256);
                         float h = 1.5f;   // gradient sample step
                         for (int li = li0; li <= li1; li++)
                         for (int lj = lj0; lj <= lj1; lj++)
@@ -1211,6 +1227,8 @@ namespace ProceduralTerrain
                             float nz = SampleD(px,py,pz+h) - SampleD(px,py,pz-h);
                             float nl = Mathf.Sqrt(nx*nx+ny*ny+nz*nz); if (nl < 1e-4f) continue; nx/=nl; ny/=nl; nz/=nl;
                             centers.Add(new Vector3(px - Dp*nx, py - Dp*ny, pz - Dp*nz));  // snap to surface
+                            // uniform radius roll in [minR, maxR] from the lattice index (decorrelated hash seeds)
+                            radii.Add(minR > 0f ? minR + (maxR - minR) * Hash(li*2+1, lj*2+1, lk*2+1) : maxR);
                         }
 
                         // union spheres into the running field
@@ -1230,14 +1248,14 @@ namespace ProceduralTerrain
                                 {
                                     var c = centers[ci];
                                     float dx = wx-c.x, dy = wy-c.y, dz = wz-c.z;
-                                    float dd = Mathf.Sqrt(dx*dx+dy*dy+dz*dz) - rad;
+                                    float dd = Mathf.Sqrt(dx*dx+dy*dy+dz*dz) - radii[ci];
                                     if (dd < best) best = dd;
                                 }
                                 ref float r = ref _runSDF![cbaseC + cyc];
                                 if (best < r) { r = best; dbgHit++; }
                             }
                         }
-                        Log.LogInfo($"[PT-blobs] centers={centers.Count} L={L:F0} rad={rad:F1} solidVoxels={dbgHit}");
+                        Log.LogInfo($"[PT-blobs] centers={centers.Count} L={L:F0} rad=[{minR:F1},{maxR:F1}] solidVoxels={dbgHit}");
                         if (_eikonal) RedistanceEikonal(_runSDF!, cw4, cw4, ch, xzStep, xzStep, yStep, 2);
                         continue;
                     }

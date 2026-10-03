@@ -390,9 +390,9 @@ namespace ProceduralTerrain
     internal sealed class SurfaceBlobs : NativeModeDef
     {
         static readonly (string, float)[] _spec = {
-            ("amplitude", 3f),    // ball radius r (world units); also the on/off gate
-            ("frequency", 0.05f), // 3D-noise frequency (lump scale)
-            ("noiseamp",  3f),    // radius modulation → pinches the shell into discrete balls
+            ("amplitude", 3f),    // MAX ball radius (world units); also the on/off gate
+            ("frequency", 0.05f), // lattice density (lump scale)
+            ("minradius", 0f),    // if >0, each ball's radius is rolled uniformly in [minradius, amplitude]
         };
         protected override (string name, float def)[] ParamSpec => _spec;
         public override void BakeColumn(ref CarveBuffers cb, in BakeCellArgs args)
