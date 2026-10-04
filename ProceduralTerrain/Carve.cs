@@ -1173,13 +1173,34 @@ namespace ProceduralTerrain
                         float biasSpacing = Mathf.Max(_cb.bkModeParams![mi][8][cc], 0.001f);
                         float biasWidth   = Mathf.Clamp(_cb.bkModeParams![mi][9][cc], 0f, 0.5f);
                         float biasPhase   = _cb.bkModeParams![mi][10][cc];
+                        float slopeLo     = _cb.bkModeParams![mi][14][cc];
+                        float slopeHi     = _cb.bkModeParams![mi][15][cc];
+                        float altLo       = _cb.bkModeParams![mi][16][cc];
+                        float altHi       = _cb.bkModeParams![mi][17][cc];
+                        float clusterFreq = _cb.bkModeParams![mi][18][cc];
+                        float clusterThr  = _cb.bkModeParams![mi][19][cc];
+                        float aspectLo    = _cb.bkModeParams![mi][20][cc];
+                        float aspectHi    = _cb.bkModeParams![mi][21][cc];
+                        float curvLo      = _cb.bkModeParams![mi][22][cc];
+                        float curvHi      = _cb.bkModeParams![mi][23][cc];
+                        bool  carve       = _cb.bkModeParams![mi][24][cc] > 0.5f;
+                        float fuse        = Mathf.Max(0f, _cb.bkModeParams![mi][25][cc]);
+                        int   chainN      = Mathf.Max(0, Mathf.RoundToInt(_cb.bkModeParams![mi][26][cc]));
+                        float chainStep   = _cb.bkModeParams![mi][27][cc];
+                        float chainWander = _cb.bkModeParams![mi][28][cc];
+                        float chainInward = Mathf.Clamp01(_cb.bkModeParams![mi][29][cc]);
+                        float ridgeRatio  = _cb.bkModeParams![mi][30][cc];
                         float freq = _cb.bkModeParams![mi][1][cc];
                         float L = freq > 1e-4f ? 1f / freq : 20f;              // lattice spacing (world units)
-                        // Reach grows with the largest axis stretch (blob extends maxR*max(stretch) from center).
+                        // Stamp reach grows with the largest axis stretch; sets the no-merge spacing.
                         float reach = maxR * Mathf.Max(1f, Mathf.Max(stretchN, Mathf.Max(stretchG, stretchT)));
-                        // (3) Enforce L >= 2*reach: stamps closer than a diameter apart merge into a
-                        // blanket ("mush") instead of reading as discrete features on the surface.
-                        L = Mathf.Max(L, 2f * reach);
+                        // (3) Enforce L >= 2*reach only for HARD ADD, so discrete bumps don't merge into mush.
+                        // Carve (tunnels) or fused add (continuous spines/coral) WANT merging → frequency sets
+                        // density directly. Merge-intent decouples seed spacing from stamp size.
+                        if (!carve && fuse <= 0f) L = Mathf.Max(L, 2f * reach);
+                        // Total reach includes the chain walk, so seeds near a border whose chain enters this
+                        // zone are still enumerated (lattice padding only; chains still truncate across zones).
+                        float totalReach = reach + chainN * Mathf.Abs(chainStep);
                         float ox0 = (ox - overlap), oz0 = (oz - overlap);
 
                         // trilinear sample of the running field at a world position
@@ -1217,7 +1238,10 @@ namespace ProceduralTerrain
                         // (2) Pad the lattice range by the blob reach so a sphere straddling this zone's
                         // boundary is enumerated (and drawn) by every zone it touches — its center may sit
                         // outside the owned region but within reach. Points beyond coverage get InField-skipped.
-                        int latPad = Mathf.CeilToInt(reach / L) + 1;
+                        // latPad spans the FULL chain reach so every zone a chain passes through enumerates
+                        // the (global, deterministic) seed and regenerates the identical walk → chains TILE
+                        // seam-free across zones. Cost grows with chain length (more seeds enumerated per zone).
+                        int latPad = Mathf.CeilToInt(totalReach / L) + 1;
                         int li0 = Mathf.FloorToInt(wxLo/L)-latPad, li1 = Mathf.FloorToInt(wxHi/L)+latPad;
                         int lj0 = Mathf.FloorToInt(wzLo/L)-latPad, lj1 = Mathf.FloorToInt(wzHi/L)+latPad;
                         int lk0 = Mathf.FloorToInt(wyLo/L)-latPad, lk1 = Mathf.FloorToInt(wyHi/L)+latPad;
@@ -1230,6 +1254,7 @@ namespace ProceduralTerrain
                         var tangG   = new List<Vector3>(256);   // G: downslope tangent
                         var tangT   = new List<Vector3>(256);   // T = N×G: cross-slope tangent
                         float h = 1.5f;   // gradient sample step
+                        float curvMin = 9999f, curvMax = -9999f, curvSum = 0f; int curvCnt = 0;   // curvature-range diag
                         for (int li = li0; li <= li1; li++)
                         for (int lj = lj0; lj <= lj1; lj++)
                         for (int lk = lk0; lk <= lk1; lk++)
@@ -1245,17 +1270,16 @@ namespace ProceduralTerrain
                             float nz = SampleD(px,py,pz+h) - SampleD(px,py,pz-h);
                             float nl = Mathf.Sqrt(nx*nx+ny*ny+nz*nz); if (nl < 1e-4f) continue; nx/=nl; ny/=nl; nz/=nl;
                             var ctr = new Vector3(px - Dp*nx, py - Dp*ny, pz - Dp*nz);     // snap to surface
-                            // Distribution bias: thin by coverage, then (bias==1) keep only stamps whose
-                            // surface elevation lands in a periodic Y band → contour rings around the hill.
-                            if (coverage < 1f && Hash(li+401, lj+211, lk+307) > coverage) continue;
-                            if (bias == 1)
-                            {
-                                float rr = ctr.y / biasSpacing + biasPhase; rr -= Mathf.Floor(rr);
-                                if (Mathf.Min(rr, 1f - rr) > biasWidth) continue;
-                            }
-                            centers.Add(ctr);
-                            // Build the surface frame {N, G, T}: N = normal, G = downslope in the tangent
-                            // plane, T = N×G cross-slope. Flat ground → G falls back to world-X.
+                            // Per-stamp biome amplitude: read at THIS stamp's cell, not the single zone-center cc,
+                            // so features are full-size where the biome is present and skipped where it isn't
+                            // (fixes blended-down sub-meter stamps in border zones).
+                            int scx = Mathf.Clamp((int)((ctr.x/s - ox0)/cvXZ + 0.5f), 0, cw4-1);
+                            int scz = Mathf.Clamp((int)((ctr.z/s - oz0)/cvXZ + 0.5f), 0, cw4-1);
+                            int scell = scx*cw4 + scz;
+                            float smaxR = _cb.bkModeParams![mi][0][scell];
+                            if (smaxR <= 0f) continue;
+                            float sminR = _cb.bkModeParams![mi][2][scell]; if (sminR < 0f) sminR = 0f; if (sminR > smaxR) sminR = smaxR;
+                            // Surface frame {N, G, T} up front (gates below use T for the ridge detector).
                             var N = new Vector3(nx, ny, nz);
                             var gh = new Vector3(nx, 0f, nz);
                             if (gh.sqrMagnitude < 1e-6f) gh = new Vector3(1f, 0f, 0f);
@@ -1265,9 +1289,127 @@ namespace ProceduralTerrain
                             if (gl < 1e-5f) { var f2 = new Vector3(1f,0f,0f); float d2 = f2.x*nx+f2.y*ny+f2.z*nz; G = new Vector3(f2.x-d2*nx, f2.y-d2*ny, f2.z-d2*nz); gl = G.magnitude; }
                             G /= gl;
                             var T = Vector3.Cross(N, G);
+
+                            // Principal-curvature RIDGE detector (orientation-agnostic). Build the 2×2 tangent
+                            // Hessian in the (G,T) plane at a broad scale, eigendecompose → fast curvature k1
+                            // (across) and slow k2 (along). A ridge = k1 strongly > |k2|. Keep only those, and
+                            // realign the frame so G runs along the slow axis (the ridgeline) → stretchg elongates
+                            // the stamp down the crest. Flat/dome/valley points fail the ratio and are skipped.
+                            if (ridgeRatio > 0f)
+                            {
+                                const float hR = 8f;
+                                float d0 = SampleD(ctr.x, ctr.y, ctr.z);
+                                var gp = G * hR; var tp = T * hR;
+                                float Dgg = SampleD(ctr.x+gp.x, ctr.y+gp.y, ctr.z+gp.z) + SampleD(ctr.x-gp.x, ctr.y-gp.y, ctr.z-gp.z) - 2f*d0;
+                                float Dtt = SampleD(ctr.x+tp.x, ctr.y+tp.y, ctr.z+tp.z) + SampleD(ctr.x-tp.x, ctr.y-tp.y, ctr.z-tp.z) - 2f*d0;
+                                float Dgt = (SampleD(ctr.x+gp.x+tp.x, ctr.y+gp.y+tp.y, ctr.z+gp.z+tp.z)
+                                           + SampleD(ctr.x-gp.x-tp.x, ctr.y-gp.y-tp.y, ctr.z-gp.z-tp.z)
+                                           - SampleD(ctr.x+gp.x-tp.x, ctr.y+gp.y-tp.y, ctr.z+gp.z-tp.z)
+                                           - SampleD(ctr.x-gp.x+tp.x, ctr.y-gp.y+tp.y, ctr.z-gp.z+tp.z)) * 0.25f;
+                                float tr = Dgg + Dtt;
+                                float disc = Mathf.Sqrt(Mathf.Max(0f, (Dgg - Dtt)*(Dgg - Dtt)*0.25f + Dgt*Dgt));
+                                float k1 = tr*0.5f + disc, k2 = tr*0.5f - disc;    // k1 = fast/across, k2 = slow/along
+                                float ratio = k1 / Mathf.Max(Mathf.Abs(k2), 0.05f);
+                                if (ratio < curvMin) curvMin = ratio; if (ratio > curvMax) curvMax = ratio; curvSum += ratio; curvCnt++;
+                                if (!(k1 > 0.3f && k1 >= ridgeRatio * Mathf.Abs(k2))) continue;   // not an anisotropic convex ridge
+                                // eigenvector of the MAX curvature (fast/across) in the (G,T) basis:
+                                float theta = 0.5f * Mathf.Atan2(2f*Dgt, Dgg - Dtt);
+                                float cs = Mathf.Cos(theta), sn = Mathf.Sin(theta);
+                                var fastDir = cs*G + sn*T;      // across the ridge
+                                var slowDir = -sn*G + cs*T;     // along the ridge (ridgeline)
+                                G = slowDir.normalized; T = fastDir.normalized;   // stretchg now elongates along the crest
+                            }
+                            // Distribution gates (Tier 2): keep the stamp only if it passes every active gate.
+                            if (coverage < 1f && Hash(li+401, lj+211, lk+307) > coverage) continue;  // thin
+                            if (slopeLo > 0f || slopeHi < 180f)                                       // slope/orientation (0 floor → 90 wall → 180 ceiling)
+                            {
+                                float slopeDeg = Mathf.Acos(Mathf.Clamp(ny, -1f, 1f)) * Mathf.Rad2Deg;
+                                if (slopeDeg < slopeLo || slopeDeg > slopeHi) continue;
+                            }
+                            if (ctr.y < altLo || ctr.y > altHi) continue;                            // altitude band
+                            if (clusterFreq > 0f &&                                                   // global noise mask → patches
+                                Plugin._noisePool![15].GetNoise(ctr.x * clusterFreq, ctr.z * clusterFreq, 0f) < clusterThr) continue;
+                            if (aspectLo > 0f || aspectHi < 360f)                                     // aspect: compass direction the slope faces
+                            {
+                                float asp = Mathf.Atan2(nz, nx) * Mathf.Rad2Deg; if (asp < 0f) asp += 360f;
+                                if (asp < aspectLo || asp > aspectHi) continue;
+                            }
+                            if (curvLo > -9000f || curvHi < 9000f)                                    // simple cross-slope curvature gate (superseded by ridgeratio when set)
+                            {
+                                const float hR = 8f;
+                                float d0 = SampleD(ctr.x, ctr.y, ctr.z);
+                                float cT = SampleD(ctr.x + hR*T.x, ctr.y + hR*T.y, ctr.z + hR*T.z)
+                                         + SampleD(ctr.x - hR*T.x, ctr.y - hR*T.y, ctr.z - hR*T.z) - 2f*d0;
+                                if (cT < curvLo || cT > curvHi) continue;
+                            }
+                            if (bias == 1)                                                            // contour: periodic elevation → rings
+                            {
+                                float rr = ctr.y / biasSpacing + biasPhase; rr -= Mathf.Floor(rr);
+                                if (Mathf.Min(rr, 1f - rr) > biasWidth) continue;
+                            }
+                            else if (bias == 2)                                                       // ridge: periodic aspect → radial ribs down-slope
+                            {
+                                float asp = Mathf.Atan2(nz, nx) * Mathf.Rad2Deg; if (asp < 0f) asp += 360f;
+                                float rr = asp / biasSpacing + biasPhase; rr -= Mathf.Floor(rr);
+                                if (Mathf.Min(rr, 1f - rr) > biasWidth) continue;
+                            }
+                            centers.Add(ctr);
                             normals.Add(N); tangG.Add(G); tangT.Add(T);
                             // uniform radius roll in [minR, maxR] from the lattice index (decorrelated hash seeds)
-                            radii.Add(minR > 0f ? minR + (maxR - minR) * Hash(li*2+1, lj*2+1, lk*2+1) : maxR);
+                            float seedR = sminR > 0f ? sminR + (smaxR - sminR) * Hash(li*2+1, lj*2+1, lk*2+1) : smaxR;
+                            radii.Add(seedR);
+
+                            // Tier 4 — chain propagation: walk child stamps from this seed. The walk is derived
+                            // ONLY from the global lattice index (li,lj,lk), so every zone within totalReach of
+                            // the seed regenerates the IDENTICAL chain → tunnels tile seam-free across zones.
+                            if (chainN > 0 && chainStep != 0f)
+                            {
+                                var pos = ctr;
+                                var dir = new Vector3(Hash(li+71, lj+131, lk+191) * 2f - 1f,
+                                                     (Hash(li+211, lj+17, lk+99) * 2f - 1f) * 0.35f,   // horizontal-biased
+                                                      Hash(li+37, lj+223, lk+53) * 2f - 1f);
+                                if (dir.sqrMagnitude < 1e-6f) dir = new Vector3(1f, 0f, 0f);
+                                dir = dir.normalized;
+                                // Aim the walk into the mountainside along the HORIZONTAL part of −N (the compass
+                                // direction into the slope), so tunnels bore in level/traversable rather than
+                                // plunging. Flat ground (vertical N) → fall back to −N. Then it wanders freely.
+                                if (chainInward > 0f)
+                                {
+                                    var inwardH = new Vector3(-N.x, 0f, -N.z);
+                                    var aim = inwardH.sqrMagnitude > 1e-4f ? inwardH.normalized : -N;
+                                    dir = Vector3.Lerp(dir, aim, chainInward);
+                                    if (dir.sqrMagnitude < 1e-6f) dir = aim;
+                                    dir = dir.normalized;
+                                }
+                                for (int cs = 1; cs <= chainN; cs++)
+                                {
+                                    if (chainWander > 0f)
+                                    {
+                                        dir += chainWander * new Vector3(Hash(li + cs*13 + 1, lj + cs*7 + 3,  lk + cs*5 + 9)  * 2f - 1f,
+                                                                        (Hash(li + cs*17 + 5, lj + cs*11 + 2, lk + cs*3 + 8)  * 2f - 1f) * 0.35f,
+                                                                         Hash(li + cs*19 + 7, lj + cs*23 + 4, lk + cs*29 + 6) * 2f - 1f);
+                                        if (dir.sqrMagnitude < 1e-6f) dir = new Vector3(1f, 0f, 0f);
+                                        dir = dir.normalized;
+                                    }
+                                    pos += dir * chainStep;
+                                    // Per-link radius roll → chunky tunnel: pinch points + wide chambers.
+                                    float cr = sminR > 0f ? sminR + (smaxR - sminR) * Hash(li + cs*41 + 2, lj + cs*37 + 5, lk + cs*43 + 9) : smaxR;
+                                    centers.Add(pos); normals.Add(N); tangG.Add(G); tangT.Add(T); radii.Add(cr);
+                                }
+                            }
+                        }
+
+                        // Spatial buckets (cell = reach) so each voxel tests only stamps in its 27 neighbour
+                        // buckets, not all N. Turns the union from O(voxels*centers) into O(voxels*localCenters).
+                        float bsz = Mathf.Max(reach, 1f);
+                        var buckets = new Dictionary<long, List<int>>(centers.Count + 1);
+                        long BKey(int bx, int by, int bz) => ((long)(bx + 100000) * 200003L + (by + 100000)) * 200003L + (bz + 100000);
+                        for (int ci = 0; ci < centers.Count; ci++)
+                        {
+                            var cc2 = centers[ci];
+                            long key = BKey(Mathf.FloorToInt(cc2.x/bsz), Mathf.FloorToInt(cc2.y/bsz), Mathf.FloorToInt(cc2.z/bsz));
+                            if (!buckets.TryGetValue(key, out var lst)) { lst = new List<int>(); buckets[key] = lst; }
+                            lst.Add(ci);
                         }
 
                         // union spheres into the running field
@@ -1283,8 +1425,15 @@ namespace ProceduralTerrain
                             {
                                 float wy = extLoS2 + cyc * yStep;
                                 float best = 1e9f;
-                                for (int ci = 0; ci < centers.Count; ci++)
+                                int vbx = Mathf.FloorToInt(wx/bsz), vby = Mathf.FloorToInt(wy/bsz), vbz = Mathf.FloorToInt(wz/bsz);
+                                for (int dbx = -1; dbx <= 1; dbx++)
+                                for (int dby = -1; dby <= 1; dby++)
+                                for (int dbz = -1; dbz <= 1; dbz++)
                                 {
+                                    if (!buckets.TryGetValue(BKey(vbx+dbx, vby+dby, vbz+dbz), out var blist)) continue;
+                                    for (int bi = 0; bi < blist.Count; bi++)
+                                    {
+                                    int ci = blist[bi];
                                     var c = centers[ci]; var N = normals[ci]; var G = tangG[ci]; var T = tangT[ci];
                                     float rr = radii[ci];
                                     float dx = wx-c.x, dy = wy-c.y, dz = wz-c.z;
@@ -1304,12 +1453,17 @@ namespace ProceduralTerrain
                                     else comb = Mathf.Pow(Mathf.Pow(Mathf.Abs(uN),pnorm) + Mathf.Pow(Mathf.Abs(uG),pnorm) + Mathf.Pow(Mathf.Abs(uT),pnorm), 1f/pnorm);
                                     float dd = (comb - 1f) * rr;
                                     if (dd < best) best = dd;
+                                    }
                                 }
                                 ref float r = ref _runSDF![cbaseC + cyc];
-                                if (best < r) { r = best; dbgHit++; }
+                                // Operator: add (union=min) or carve (subtract=max(r,-stamp)); fuse = smooth blend.
+                                float nr = carve
+                                    ? (fuse > 0f ? -Smin(-r, best, fuse) : Mathf.Max(r, -best))
+                                    : (fuse > 0f ?  Smin(r, best, fuse)  : Mathf.Min(r, best));
+                                if (nr != r) { r = nr; dbgHit++; }
                             }
                         }
-                        Log.LogInfo($"[PT-blobs] centers={centers.Count} L={L:F0} rad=[{minR:F1},{maxR:F1}] stretchN={stretchN:F1} taper={taper:F2} pnorm={pnorm:F1} solidVoxels={dbgHit}");
+                        Log.LogInfo($"[PT-blobs] centers={centers.Count} L={L:F0} rad=[{minR:F1},{maxR:F1}] stretchN={stretchN:F1} taper={taper:F2} pnorm={pnorm:F1} solidVoxels={dbgHit} curv=[{curvMin:F3},{curvMax:F3}] mean={(curvCnt>0?curvSum/curvCnt:0f):F3}");
                         if (_eikonal) RedistanceEikonal(_runSDF!, cw4, cw4, ch, xzStep, xzStep, yStep, 2);
                         continue;
                     }
@@ -1415,6 +1569,15 @@ namespace ProceduralTerrain
         // Bilinear over the 4 XZ corner values (v00=base, v10=+x, v01=+z, v11=+xz).
         static float Bilerp(float v00, float v10, float v01, float v11, float fx, float fz)
             => (v00 * (1f - fx) + v10 * fx) * (1f - fz) + (v01 * (1f - fx) + v11 * fx) * fz;
+
+        // Polynomial smooth-min: blends two SDFs with a rounded seam of radius k (k=0 → hard min).
+        // Smooth-max (for carve) is -Smin(-a,-b,k); we call Smin(-r, best, fuse) and negate.
+        static float Smin(float a, float b, float k)
+        {
+            if (k <= 0f) return Mathf.Min(a, b);
+            float h = Mathf.Clamp01(0.5f + 0.5f * (b - a) / k);
+            return Mathf.Lerp(b, a, h) - k * h * (1f - h);
+        }
 
         // Anisotropic 3-D eikonal redistance (fast sweeping) in place: rewrites |value| to true world
         // distance from the zero-crossing (|grad|=1) while preserving sign and the surface. Grid nx*nz

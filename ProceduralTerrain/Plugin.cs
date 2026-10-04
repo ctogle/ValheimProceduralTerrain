@@ -406,6 +406,28 @@ namespace ProceduralTerrain
             ("stretchg",    1f),  // scale along G = downslope (gradient): >1 drips/blades running downhill
             ("stretcht",    1f),  // scale along T = cross-slope (N×G): >1 ridges/scales along the contour
             ("taperpow",    1f),  // taper curve along +N: 1 linear cone, >1 ogive/bullet, <1 trumpet
+            // ── Distribution gates (Tier 2): keep a stamp only if it passes all (defaults pass everything) ──
+            ("slopelo",     0f),  // keep where steepness (deg) >= slopelo. 0=floor/ground, 90=wall, 180=ceiling
+            ("slopehi",   180f),  // ... and <= slopehi. 30..90=cliffs, 0..15=flats, 100..180=overhangs/ceilings
+            ("altlo",  -10000f),  // keep only where stamp world-Y >= altlo (snowline/shore bands)
+            ("althi",   10000f),  // ... and <= althi
+            ("clusterfreq", 0f),  // >0 enables a global 2D noise mask (patchy fields); 0 = uniform
+            ("clusterthresh",0f), // keep where cluster noise >= clusterthresh (−1..1); higher = sparser patches
+            ("aspectlo",    0f),  // keep where slope faces azimuth in [aspectlo, aspecthi] deg (0=+X/E, 90=+Z/N)
+            ("aspecthi",  360f),  // ... compass-facing gate (south-facing only, lee side, etc.)
+            ("curvlo", -9999f),   // keep where surface curvature >= curvlo (>0 convex ridge, <0 concave hollow)
+            ("curvhi",  9999f),   // ... convex-only (spurs) vs concave-only (hollows)
+            // bias: 0=none, 1=contour (periodic elevation → rings), 2=ridge (periodic aspect → radial ribs)
+            // ── Operator (Tier 3): how stamps combine into the field ──
+            ("carve",       0f),  // 0 = add (union, bumps), 1 = carve (subtract, pits/caves)
+            ("fuse",        0f),  // smooth-blend radius: 0 = hard crease, >0 = metaball melt between stamps
+            // ── Propagation (Tier 4): each seed walks a chain of child stamps (carve+chain = lumpy tunnels) ──
+            ("chain",       0f),  // # child stamps walked from each seed (0 = off). Tiles across zones.
+            ("chainstep",   4f),  // world distance between chain links
+            ("chainwander", 0.3f),// 0 = straight chain, higher = winding
+            ("chaininward", 0f),  // 0 = random walk; 1 = walk straight into the surface (−N) → caves growing inward
+            ("ridgeratio",  0f),  // >0: place only where fast principal curvature >= ratio*|slow| (ridge, any orientation),
+                                  //     and ALIGN the stamp so stretchg runs along the slow axis (the ridgeline)
         };
         protected override (string name, float def)[] ParamSpec => _spec;
         public override void BakeColumn(ref CarveBuffers cb, in BakeCellArgs args)
