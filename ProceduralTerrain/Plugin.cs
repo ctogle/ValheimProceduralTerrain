@@ -428,6 +428,22 @@ namespace ProceduralTerrain
             ("chaininward", 0f),  // 0 = random walk; 1 = walk straight into the surface (−N) → caves growing inward
             ("ridgeratio",  0f),  // >0: place only where fast principal curvature >= ratio*|slow| (ridge, any orientation),
                                   //     and ALIGN the stamp so stretchg runs along the slow axis (the ridgeline)
+            // ── Chain branching (Tier 4+): forks the walk into a network/dendrite ──
+            ("branchprob",  0f),  // per-step probability a chain spawns a branch (0 = linear worm)
+            ("branchangle",40f),  // branch turn angle (deg) off the parent direction
+            ("branchdepth", 2f),  // max branch recursion depth
+            // ── Field steering: walk follows a coherent flow field instead of pure random wander ──
+            ("flowsteer",   0f),  // 0 = off; how strongly the walk aligns to the flow field
+            ("flowfreq",  0.02f), // flow-field noise frequency (lower = broader, smoother flow)
+            ("hubseek",     0f),  // 0 = off; steer toward the nearest hub point → tunnels converge on a central chamber
+            ("hubspacing",300f),  // spacing of the deterministic hub lattice (≈ one hub per mountain)
+            ("keepdepth",   0f),  // >0: keep the walk this far below the surface (bend back into rock if it surfaces) → tunnels stay buried & carve their full length
+            ("chainlevel",  0f),  // 0 = free 3D walk; 1 = fully horizontal (damp dir.y each step) → level tunnels that bore into the mountainside, run long, and meet
+            ("chaintile",   0f),  // >0: generate the whole chain from the GLOBAL ground surface (not this zone's field) so tunnels TILE across zones = run their full length; Y follows ground − keepdepth
+            ("chainslope",  0f),  // target downward drift the walk levels toward (0 = flatten to horizontal; 0.1 = gentle descent into the mountain)
+            ("biomemajority",0f), // >0: only seed where THIS mode's biome is the dominant biome at the point (global GetBiome gate) AND use a CONSTANT radius (no biome-blend fade) → features stay full-size inside their biome and cut off at the edge
+            ("skyopen",     1f),  // 1 = only seed on sky-exposed OUTER surfaces (default); 0 = allow INTERNAL surfaces (cave ceilings/walls) → stalactites etc.
+            ("concaveratio",0f),  // >0: place only on anisotropic CONCAVE surfaces (|min curvature| >= ratio*|max|, concave) — the inverse of ridgeratio; for stalactites on tube/cave undersides
         };
         protected override (string name, float def)[] ParamSpec => _spec;
         public override void BakeColumn(ref CarveBuffers cb, in BakeCellArgs args)
@@ -711,7 +727,9 @@ namespace ProceduralTerrain
         internal static bool  _islandRemoval       = true;
         internal static bool  _pocketRemoval       = true;
         internal static bool  _hideLodMeshes       = false;  // DEBUG: hide Valheim's distant TerrainLod meshes (clear view of voxel features)
+        internal static bool  _debugViz            = false;  // DEBUG: draw see-through overlay lines for brush seeds/paths (tunnels now, spines later)
         internal static int   _overlap             = 4;      // running-field margin (voxels) shared with neighbour zones; caps seam-free feature reach
+        internal static float _fieldDepthLo        = 0f;     // min world-metres the carvable field extends BELOW terrain min (0=default). Raise so deep tunnels stay in-field
         internal static float _biomeBlendRadius    = 192f;
         internal static bool  _biomeBlendSmooth    = true;   // false=linear, true=smoothstep
         internal static int   _transitionBlurPasses = 3;     // min blur passes for any active zone
@@ -945,6 +963,14 @@ namespace ProceduralTerrain
             harmony.PatchAll();
 
             RegisterVoxheimGenerator();
+            var vizGo = new GameObject("PTDebugVizRenderer");
+            DontDestroyOnLoad(vizGo);
+            vizGo.AddComponent<DebugVizRenderer>();
+            new Terminal.ConsoleCommand("pt_viz_clear", "pt_viz_clear — clear the debug brush overlay (seed/path lines)", _ =>
+            {
+                DebugViz.ClearAll();
+                Log.LogInfo("[ProceduralTerrain] debug viz cleared");
+            });
             new Terminal.ConsoleCommand("pt_dump", "pt_dump — dump SDF + biome blend data for the next 9 zones processed to BepInEx/config/voxcaves_dump_*.json", _ =>
             {
                 _dumpZonesRemaining = 9;

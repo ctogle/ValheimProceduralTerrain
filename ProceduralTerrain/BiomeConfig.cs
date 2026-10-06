@@ -261,8 +261,14 @@ namespace ProceduralTerrain
                             _pocketRemoval = !(v == "0" || v == "false");
                         if (k == "hidelodmeshes")
                             _hideLodMeshes = (v == "1" || v == "true");
+                        if (k == "debugviz")
+                            DebugViz.Enabled = _debugViz = (v == "1" || v == "true");
+                        if (k == "debugvizocclude")
+                            DebugViz.Occlude = (v == "1" || v == "true");
                         if (k == "overlap" && int.TryParse(v, out int ov))
                             _overlap = Mathf.Clamp(ov, 2, 16);
+                        if (k == "fielddepthlo" && float.TryParse(v, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float fdl))
+                            _fieldDepthLo = Mathf.Max(0f, fdl);
                         if (k == "biomeblendradius" && float.TryParse(v, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float bbr))
                             _biomeBlendRadius = Mathf.Max(1f, bbr);
                         if (k == "biomeblendsmooth")

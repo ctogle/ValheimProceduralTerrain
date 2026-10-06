@@ -133,6 +133,7 @@ namespace ProceduralTerrain
                 }
                 if (maxExtM  > 0f) hiMargin = Mathf.Max(24, (int)Mathf.Ceil(maxExtM  / s) + 8);
                 if (maxFloor > 0f) loMargin = Mathf.Max(24, (int)Mathf.Ceil(maxFloor / s) + 4);
+                if (_fieldDepthLo > 0f) loMargin = Mathf.Max(loMargin, (int)Mathf.Ceil(_fieldDepthLo / s));   // deepen field for deep tunnels
             }
 
             int extLo   = yLo - loMargin, extHi = yHi + hiMargin;
@@ -729,6 +730,7 @@ namespace ProceduralTerrain
                 }
                 if (maxExtM  > 0f) hiMargin = Mathf.Max(24, (int)Mathf.Ceil(maxExtM  / s) + 8);
                 if (maxFloor > 0f) loMargin = Mathf.Max(24, (int)Mathf.Ceil(maxFloor / s) + 4);
+                if (_fieldDepthLo > 0f) loMargin = Mathf.Max(loMargin, (int)Mathf.Ceil(_fieldDepthLo / s));   // deepen field for deep tunnels
             }
 
             int extLo  = yLo - loMargin;
@@ -1190,6 +1192,29 @@ namespace ProceduralTerrain
                         float chainWander = _cb.bkModeParams![mi][28][cc];
                         float chainInward = Mathf.Clamp01(_cb.bkModeParams![mi][29][cc]);
                         float ridgeRatio  = _cb.bkModeParams![mi][30][cc];
+                        float branchProb  = _cb.bkModeParams![mi][31][cc];
+                        float branchAngle = _cb.bkModeParams![mi][32][cc];
+                        int   branchDepth = Mathf.Max(0, Mathf.RoundToInt(_cb.bkModeParams![mi][33][cc]));
+                        float flowSteer   = _cb.bkModeParams![mi][34][cc];
+                        float flowFreq    = _cb.bkModeParams![mi][35][cc];
+                        float hubSeek     = _cb.bkModeParams![mi][36][cc];
+                        float hubSpacing  = _cb.bkModeParams![mi][37][cc];
+                        float keepDepth   = _cb.bkModeParams![mi][38][cc];
+                        float chainLevel  = Mathf.Clamp01(_cb.bkModeParams![mi][39][cc]);
+                        bool  tile        = _cb.bkModeParams![mi][40][cc] > 0.5f && wg != null;
+                        float chainSlope  = _cb.bkModeParams![mi][41][cc];
+                        float biomeMajority = _cb.bkModeParams![mi][42][cc];
+                        float skyOpen     = _cb.bkModeParams![mi][43][cc];
+                        float concaveRatio = _cb.bkModeParams![mi][44][cc];
+                        // Peak (un-blended) radius across all biomes that use this mode → the CONSTANT radius to use when
+                        // biomemajority gates in (so the tube doesn't shrink with the biome blend near the edge).
+                        float peakMaxR = maxR, peakMinR = minR;
+                        foreach (var kv in _biomeParams)
+                        {
+                            var bp = kv.Value;
+                            if (bp != null && mi < bp.Length && bp[mi] != null && bp[mi].Length > 2)
+                            { if (bp[mi][0] > peakMaxR) peakMaxR = bp[mi][0]; if (bp[mi][2] > peakMinR) peakMinR = bp[mi][2]; }
+                        }
                         float freq = _cb.bkModeParams![mi][1][cc];
                         float L = freq > 1e-4f ? 1f / freq : 20f;              // lattice spacing (world units)
                         // Stamp reach grows with the largest axis stretch; sets the no-merge spacing.
@@ -1218,6 +1243,11 @@ namespace ProceduralTerrain
                         }
                         // deterministic hash jitter in [0,1)
                         float Hash(int a, int b, int c2) { float n = Mathf.Sin(a*127.1f + b*311.7f + c2*74.7f) * 43758.5453f; return n - Mathf.Floor(n); }
+                        // GLOBAL composed surface (base ground + formation relief, from the shared noise) — a pure
+                        // function of x,z, identical in every zone. Snapping the seed/walk to this (tile mode) makes
+                        // the whole chain a pure global function → every zone regenerates it identically and carves
+                        // its slice → full-length cross-zone tunnels, following the REAL surface (no vanilla bias).
+                        float GH(float wx, float wz) => ComposedSurfaceHeight(wx, wz, wg);
 
                         // (1) In-field test: is a world point (plus the gradient stencil ±h) fully inside
                         // the input field this zone actually covers? SampleD clamps out-of-range reads,
@@ -1255,21 +1285,73 @@ namespace ProceduralTerrain
                         var tangT   = new List<Vector3>(256);   // T = N×G: cross-slope tangent
                         float h = 1.5f;   // gradient sample step
                         float curvMin = 9999f, curvMax = -9999f, curvSum = 0f; int curvCnt = 0;   // curvature-range diag
+                        var work = new List<(Vector3 pos, Vector3 dir, int left, int depth, int seg)>(64);   // chain-branch worklist (reused)
+                        int branchEvents = 0;   // diag: how many times a chain forked
+                        float maxChainReach = 0f;   // diag: farthest any stamp gets from its seed (proves chain length)
+                        // Debug overlay (Tier viz). Only the live/main-thread path captures (not parallel bake), and
+                        // only seeds OWNED by this zone draw — so a chain tiled into N zones is drawn once, by its
+                        // owner. TODO: multi SurfaceBlobs modes/zone will clobber (BeginZone clears); fine for 1 mode.
+                        bool viz = DebugViz.Enabled && !_parallelBakeActive;
+                        if (viz) DebugViz.BeginZone(ox, oz);
+                        int ownW = bw - 2 * overlap;
+                        float ownXLo = ox * s, ownXHi = (ox + ownW) * s, ownZLo = oz * s, ownZHi = (oz + ownW) * s;
+                        var colSeed = new Color(0.7f, 0.2f, 1f);   // purple = accepted seed (drawn along the surface normal)
+                        var colPath = new Color(1f, 0.15f, 0.1f);  // red = tunnel chain
+                        var colCand = new Color(0.45f, 0.45f, 0.45f); // grey = near-surface lattice candidate (rejected by a gate if no purple on it)
                         for (int li = li0; li <= li1; li++)
                         for (int lj = lj0; lj <= lj1; lj++)
                         for (int lk = lk0; lk <= lk1; lk++)
                         {
-                            float px = (li + Hash(li, lj, lk)) * L, pz = (lj + Hash(lj+7, li-3, lk)) * L, py = (lk + Hash(lk+13, li+5, lj-2)) * L;
-                            // Skip points whose snap stencil isn't covered by this zone's input field —
-                            // the owning zone snaps them identically (no clamp divergence → no seams).
-                            if (!InField(px-h, py-h, pz-h) || !InField(px+h, py+h, pz+h)) continue;
-                            float Dp = SampleD(px, py, pz);
-                            if (Mathf.Abs(Dp) > L) continue;                   // lattice point not near a surface
-                            float nx = SampleD(px+h,py,pz) - SampleD(px-h,py,pz);
-                            float ny = SampleD(px,py+h,pz) - SampleD(px,py-h,pz);
-                            float nz = SampleD(px,py,pz+h) - SampleD(px,py,pz-h);
-                            float nl = Mathf.Sqrt(nx*nx+ny*ny+nz*nz); if (nl < 1e-4f) continue; nx/=nl; ny/=nl; nz/=nl;
-                            var ctr = new Vector3(px - Dp*nx, py - Dp*ny, pz - Dp*nz);     // snap to surface
+                            float px = (li + Hash(li, lj, tile ? 0 : lk)) * L, pz = (lj + Hash(lj+7, li-3, tile ? 0 : lk)) * L, py = (lk + Hash(lk+13, li+5, lj-2)) * L;
+                            float nx, ny, nz; Vector3 ctr;
+                            if (tile)
+                            {
+                                // GLOBAL surface snap → every zone computes the SAME seed (= cross-zone propagation).
+                                // 2D lattice (one per li,lj, elevation-independent) snapped to the global composed surface;
+                                // N from its gradient. Accuracy is VERIFIED via the occlusion overlay (purple must poke
+                                // out of the terrain). ComposedSurfaceHeight returns the OUTER surface, so no openAbove needed.
+                                if (lk != lk0) continue;
+                                float ghc = ComposedSurfaceHeight(px, pz, wg);
+                                float ggx = (ComposedSurfaceHeight(px+h,pz,wg) - ComposedSurfaceHeight(px-h,pz,wg)) / (2f*h);
+                                float ggz = (ComposedSurfaceHeight(px,pz+h,wg) - ComposedSurfaceHeight(px,pz-h,wg)) / (2f*h);
+                                nx = -ggx; ny = 1f; nz = -ggz;
+                                float nl = Mathf.Sqrt(nx*nx+ny*ny+nz*nz); if (nl < 1e-4f) continue; nx/=nl; ny/=nl; nz/=nl;
+                                ctr = new Vector3(px, ghc, pz);
+                            }
+                            else
+                            {
+                                // Reliable per-zone field snap (reference): read the ACTUAL composed field, keep points
+                                // near a surface, snap c = p − D·∇D. Accurate but zone-local (can't tile).
+                                if (!InField(px-h, py-h, pz-h) || !InField(px+h, py+h, pz+h)) continue;
+                                float Dp = SampleD(px, py, pz);
+                                if (Mathf.Abs(Dp) > L) continue;                   // lattice point not near a surface
+                                nx = SampleD(px+h,py,pz) - SampleD(px-h,py,pz);
+                                ny = SampleD(px,py+h,pz) - SampleD(px,py-h,pz);
+                                nz = SampleD(px,py,pz+h) - SampleD(px,py,pz-h);
+                                float nl = Mathf.Sqrt(nx*nx+ny*ny+nz*nz); if (nl < 1e-4f) continue; nx/=nl; ny/=nl; nz/=nl;
+                                ctr = new Vector3(px - Dp*nx, py - Dp*ny, pz - Dp*nz);     // snap to surface
+                            }
+                            // LATTICE VIZ: every near-surface candidate (passed |Dp|<L) gets a small grey tick, drawn
+                            // BEFORE the gates. Accepted seeds later draw a purple normal on top → lone grey = a lattice
+                            // point rejected by a gate (sky-open/slope/coverage/etc.); shows the seeding field + culling.
+                            bool capCand = viz && ctr.x >= ownXLo && ctr.x < ownXHi && ctr.z >= ownZLo && ctr.z < ownZHi;
+                            if (capCand) DebugViz.Line(new[] { ctr - new Vector3(0f, 1.5f, 0f), ctr + new Vector3(0f, 1.5f, 0f) }, colCand, 0.3f);
+                            // OUTER-surface only: reject internal surfaces (overhang undersides, formation pockets,
+                            // tube walls) whose normals point every which way. If going straight UP from the seed hits
+                            // solid within 40m, it's enclosed → skip. Keeps seeds on the open mountainside (N outward,
+                            // −N into the rock) so tunnels are predictable.
+                            if (!tile && skyOpen > 0.5f)   // field-based sky-open test; skyopen=0 lets internal surfaces (cave ceilings) seed
+                            {
+                                bool openAbove = true;
+                                float upTop = Mathf.Min(wyHi, ctr.y + 40f);
+                                for (float uy = ctr.y + 2f; uy <= upTop; uy += 4f)
+                                    if (SampleD(ctr.x, uy, ctr.z) < 0f) { openAbove = false; break; }
+                                if (!openAbove) continue;
+                            }
+                            // Tile seeds are 2D (one per li,lj, processed at this zone's lk0 which VARIES per zone),
+                            // so any hash keyed on lk would differ between zones → the same seed gets accepted/sized
+                            // differently → chains fail to tile (flat cut at the boundary). Fix all tile hashes to lk=0.
+                            int hk = tile ? 0 : lk;
                             // Per-stamp biome amplitude: read at THIS stamp's cell, not the single zone-center cc,
                             // so features are full-size where the biome is present and skipped where it isn't
                             // (fixes blended-down sub-meter stamps in border zones).
@@ -1279,6 +1361,16 @@ namespace ProceduralTerrain
                             float smaxR = _cb.bkModeParams![mi][0][scell];
                             if (smaxR <= 0f) continue;
                             float sminR = _cb.bkModeParams![mi][2][scell]; if (sminR < 0f) sminR = 0f; if (sminR > smaxR) sminR = smaxR;
+                            // Biome-MAJORITY gate (global, so it tiles): only keep the seed where THIS mode's biome is the
+                            // dominant one at the point, and then use the CONSTANT peak radius (no blend fade → full-size
+                            // features that cut off cleanly at the biome edge instead of trailing off into neighbours).
+                            if (biomeMajority > 0f && wg != null)
+                            {
+                                var domB = wg.GetBiome(ctr.x, ctr.z);
+                                bool usesMode = _biomeParams.TryGetValue(domB, out var bpd) && mi < bpd.Length && bpd[mi] != null && bpd[mi].Length > 0 && bpd[mi][0] > 0f;
+                                if (!usesMode) continue;
+                                smaxR = peakMaxR; sminR = peakMinR;
+                            }
                             // Surface frame {N, G, T} up front (gates below use T for the ridge detector).
                             var N = new Vector3(nx, ny, nz);
                             var gh = new Vector3(nx, 0f, nz);
@@ -1319,8 +1411,33 @@ namespace ProceduralTerrain
                                 var slowDir = -sn*G + cs*T;     // along the ridge (ridgeline)
                                 G = slowDir.normalized; T = fastDir.normalized;   // stretchg now elongates along the crest
                             }
+                            // CONCAVE gate (inverse of ridgeratio): keep only anisotropic concave surfaces — the fast
+                            // (largest-|curvature|) axis bends AWAY (into air), like a tube ceiling or dome underside.
+                            // For stalactites decorating cave/tunnel undersides. Realign G along the trough (low-curv axis).
+                            if (concaveRatio > 0f)
+                            {
+                                const float hR = 8f;
+                                float d0 = SampleD(ctr.x, ctr.y, ctr.z);
+                                var gp = G * hR; var tp = T * hR;
+                                float Dgg = SampleD(ctr.x+gp.x, ctr.y+gp.y, ctr.z+gp.z) + SampleD(ctr.x-gp.x, ctr.y-gp.y, ctr.z-gp.z) - 2f*d0;
+                                float Dtt = SampleD(ctr.x+tp.x, ctr.y+tp.y, ctr.z+tp.z) + SampleD(ctr.x-tp.x, ctr.y-tp.y, ctr.z-tp.z) - 2f*d0;
+                                float Dgt = (SampleD(ctr.x+gp.x+tp.x, ctr.y+gp.y+tp.y, ctr.z+gp.z+tp.z)
+                                           + SampleD(ctr.x-gp.x-tp.x, ctr.y-gp.y-tp.y, ctr.z-gp.z-tp.z)
+                                           - SampleD(ctr.x+gp.x-tp.x, ctr.y+gp.y-tp.y, ctr.z+gp.z-tp.z)
+                                           - SampleD(ctr.x-gp.x+tp.x, ctr.y-gp.y+tp.y, ctr.z-gp.z+tp.z)) * 0.25f;
+                                float tr = Dgg + Dtt;
+                                float disc = Mathf.Sqrt(Mathf.Max(0f, (Dgg - Dtt)*(Dgg - Dtt)*0.25f + Dgt*Dgt));
+                                float k1 = tr*0.5f + disc, k2 = tr*0.5f - disc;    // k2 = most concave (min curvature)
+                                if (!(k2 < -0.3f && -k2 >= concaveRatio * Mathf.Abs(k1))) continue;   // not an anisotropic concave underside
+                                // align G along the trough (the LOW-curvature slow axis = k1's eigenvector):
+                                float theta = 0.5f * Mathf.Atan2(2f*Dgt, Dgg - Dtt);
+                                float cs = Mathf.Cos(theta), sn = Mathf.Sin(theta);
+                                var k1Dir = cs*G + sn*T;        // along the trough (low curvature)
+                                var k2Dir = -sn*G + cs*T;       // across (concave)
+                                G = k1Dir.normalized; T = k2Dir.normalized;
+                            }
                             // Distribution gates (Tier 2): keep the stamp only if it passes every active gate.
-                            if (coverage < 1f && Hash(li+401, lj+211, lk+307) > coverage) continue;  // thin
+                            if (coverage < 1f && Hash(li+401, lj+211, hk+307) > coverage) continue;  // thin
                             if (slopeLo > 0f || slopeHi < 180f)                                       // slope/orientation (0 floor → 90 wall → 180 ceiling)
                             {
                                 float slopeDeg = Mathf.Acos(Mathf.Clamp(ny, -1f, 1f)) * Mathf.Rad2Deg;
@@ -1356,48 +1473,151 @@ namespace ProceduralTerrain
                             centers.Add(ctr);
                             normals.Add(N); tangG.Add(G); tangT.Add(T);
                             // uniform radius roll in [minR, maxR] from the lattice index (decorrelated hash seeds)
-                            float seedR = sminR > 0f ? sminR + (smaxR - sminR) * Hash(li*2+1, lj*2+1, lk*2+1) : smaxR;
+                            float seedR = sminR > 0f ? sminR + (smaxR - sminR) * Hash(li*2+1, lj*2+1, hk*2+1) : smaxR;
                             radii.Add(seedR);
+
+                            bool capSeed = viz && ctr.x >= ownXLo && ctr.x < ownXHi && ctr.z >= ownZLo && ctr.z < ownZHi;
+                            // Seed marker drawn ALONG the surface normal N (from under the surface to above it) so we can
+                            // confirm the snap landed ON the composed surface and see its orientation. Generalizes to any
+                            // tier: spines will use the same call with their own color at their accept site.
+                            if (capSeed) DebugViz.Line(new[] { ctr - N * 2f, ctr + N * 6f }, colSeed, 0.7f);
 
                             // Tier 4 — chain propagation: walk child stamps from this seed. The walk is derived
                             // ONLY from the global lattice index (li,lj,lk), so every zone within totalReach of
                             // the seed regenerates the IDENTICAL chain → tunnels tile seam-free across zones.
                             if (chainN > 0 && chainStep != 0f)
                             {
-                                var pos = ctr;
-                                var dir = new Vector3(Hash(li+71, lj+131, lk+191) * 2f - 1f,
-                                                     (Hash(li+211, lj+17, lk+99) * 2f - 1f) * 0.35f,   // horizontal-biased
-                                                      Hash(li+37, lj+223, lk+53) * 2f - 1f);
-                                if (dir.sqrMagnitude < 1e-6f) dir = new Vector3(1f, 0f, 0f);
-                                dir = dir.normalized;
-                                // Aim the walk into the mountainside along the HORIZONTAL part of −N (the compass
-                                // direction into the slope), so tunnels bore in level/traversable rather than
-                                // plunging. Flat ground (vertical N) → fall back to −N. Then it wanders freely.
-                                if (chainInward > 0f)
+                                Vector3 dir0;
+                                if (tile)
                                 {
-                                    var inwardH = new Vector3(-N.x, 0f, -N.z);
-                                    var aim = inwardH.sqrMagnitude > 1e-4f ? inwardH.normalized : -N;
-                                    dir = Vector3.Lerp(dir, aim, chainInward);
-                                    if (dir.sqrMagnitude < 1e-6f) dir = aim;
-                                    dir = dir.normalized;
+                                    dir0 = (-N).normalized;   // straight tube inward along the surface normal (into the mountainside)
                                 }
-                                for (int cs = 1; cs <= chainN; cs++)
+                                else
                                 {
-                                    if (chainWander > 0f)
+                                    dir0 = new Vector3(Hash(li+71, lj+131, lk+191) * 2f - 1f,
+                                                      (Hash(li+211, lj+17, lk+99) * 2f - 1f) * 0.35f,   // horizontal-biased
+                                                       Hash(li+37, lj+223, lk+53) * 2f - 1f);
+                                    if (dir0.sqrMagnitude < 1e-6f) dir0 = new Vector3(1f, 0f, 0f);
+                                    dir0 = dir0.normalized;
+                                    if (chainInward > 0f)                                             // aim into the mountainside (horizontal −N)
                                     {
-                                        dir += chainWander * new Vector3(Hash(li + cs*13 + 1, lj + cs*7 + 3,  lk + cs*5 + 9)  * 2f - 1f,
-                                                                        (Hash(li + cs*17 + 5, lj + cs*11 + 2, lk + cs*3 + 8)  * 2f - 1f) * 0.35f,
-                                                                         Hash(li + cs*19 + 7, lj + cs*23 + 4, lk + cs*29 + 6) * 2f - 1f);
+                                        var inwardH = new Vector3(-N.x, 0f, -N.z);
+                                        var aim = inwardH.sqrMagnitude > 1e-4f ? inwardH.normalized : -N;
+                                        dir0 = Vector3.Lerp(dir0, aim, chainInward);
+                                        if (dir0.sqrMagnitude < 1e-6f) dir0 = aim;
+                                        dir0 = dir0.normalized;
+                                    }
+                                }
+                                // Per-tunnel variety (hashed from the seed → constant for this chain, consistent across
+                                // zones): width class (some narrow tunnels) and slope class (some shallow, some descending).
+                                float tScale = 0.5f + 0.5f * Hash(li*7+3, lj*7+9, hk*7+1);               // overall width multiplier
+                                float tSlope = chainSlope * (0.1f + 1.8f * Hash(li*13+2, lj*13+8, hk*13+4)); // this tunnel's descent
+                                // Branching walk via a worklist (pos,dir,stepsLeft,depth,segId). Every decision is
+                                // hashed from (li,lj,lk, seg, step) → the whole tree is a pure function of the seed,
+                                // so it tiles across zones. Capped at maxEmit stamps / branchDepth to bound cost.
+                                work.Clear();
+                                work.Add((ctr, dir0, chainN, 0, 0));
+                                int segCounter = 0, emitted = 0, maxEmit = chainN * 4;
+                                while (work.Count > 0 && emitted < maxEmit)
+                                {
+                                    var sgd = work[work.Count - 1]; work.RemoveAt(work.Count - 1);
+                                    var pos = sgd.pos; var dir = sgd.dir; int left = sgd.left, dep = sgd.depth, seg = sgd.seg;
+                                    List<Vector3>? runPts = capSeed ? new List<Vector3> { pos } : null;
+                                    for (int cs = 1; cs <= left && emitted < maxEmit; cs++)
+                                    {
+                                        // wander applies to BOTH (hk-keyed, so it's identical across zones → still tiles);
+                                        // flow/hub/keepdepth/level are the non-tile free-walk path only.
+                                        if (chainWander > 0f)
+                                            dir += chainWander * new Vector3(Hash(li+seg*701 + cs*13 + 1, lj+seg*307 + cs*7 + 3,  hk+seg*509 + cs*5 + 9) * 2f - 1f,
+                                                                            (Hash(li+seg*701 + cs*17 + 5, lj+seg*307 + cs*11 + 2, hk+seg*509 + cs*3 + 8) * 2f - 1f) * 0.35f,
+                                                                             Hash(li+seg*701 + cs*19 + 7, lj+seg*307 + cs*23 + 4, hk+seg*509 + cs*29 + 6) * 2f - 1f);
+                                        if (!tile)
+                                        {
+                                            if (flowSteer > 0f)                                           // steer toward a coherent flow field
+                                            {
+                                                float fx = pos.x*flowFreq, fy = pos.y*flowFreq, fz = pos.z*flowFreq;
+                                                var flow = new Vector3(Plugin._noisePool![8].GetNoise(fx, fy, fz),
+                                                                       Plugin._noisePool![9].GetNoise(fx+13.1f, fy+7.7f, fz+3.3f),
+                                                                       Plugin._noisePool![10].GetNoise(fx-5.5f, fy-9.9f, fz+11.1f));
+                                                if (flow.sqrMagnitude > 1e-6f) dir += flowSteer * flow.normalized;
+                                            }
+                                            if (hubSeek > 0f && hubSpacing > 1f)                          // steer toward the nearest deterministic hub
+                                            {
+                                                int hx = Mathf.FloorToInt(pos.x / hubSpacing), hz = Mathf.FloorToInt(pos.z / hubSpacing);
+                                                float jx = (Hash(hx*131+5, hz*197+9, 7) - 0.5f) * hubSpacing * 0.4f;
+                                                float jz = (Hash(hx*233+3, hz*97+11, 13) - 0.5f) * hubSpacing * 0.4f;
+                                                float hubX = (hx + 0.5f) * hubSpacing + jx, hubZ = (hz + 0.5f) * hubSpacing + jz;
+                                                var toHub = new Vector3(hubX - pos.x, 0f, hubZ - pos.z);
+                                                if (toHub.sqrMagnitude > 1f) dir = Vector3.Lerp(dir, toHub.normalized, hubSeek);
+                                            }
+                                            if (keepDepth > 0f)   // bend back into rock if it would surface (needs the per-zone field)
+                                            {
+                                                var nextp = pos + dir * chainStep;
+                                                float dsurf = SampleD(nextp.x, nextp.y, nextp.z);
+                                                if (dsurf > -keepDepth)
+                                                {
+                                                    var grad = new Vector3(SampleD(pos.x+h,pos.y,pos.z) - SampleD(pos.x-h,pos.y,pos.z),
+                                                                           SampleD(pos.x,pos.y+h,pos.z) - SampleD(pos.x,pos.y-h,pos.z),
+                                                                           SampleD(pos.x,pos.y,pos.z+h) - SampleD(pos.x,pos.y,pos.z-h));
+                                                    if (grad.sqrMagnitude > 1e-6f) { dir = Vector3.Lerp(dir, -grad.normalized, 0.8f); dir = dir.normalized; }
+                                                }
+                                            }
+                                        }
+                                        // level-out: relax dir.y toward the target slope each step so the inward −N
+                                        // launch flattens as it extends. chainslope=0 → horizontal; >0 → gentle descent.
+                                        // Pure per-step → tiles. (both paths)
+                                        if (chainLevel > 0f) dir.y = Mathf.Lerp(dir.y, -tSlope, chainLevel);
                                         if (dir.sqrMagnitude < 1e-6f) dir = new Vector3(1f, 0f, 0f);
                                         dir = dir.normalized;
+                                        pos += dir * chainStep;
+                                        runPts?.Add(pos);
+                                        float dr = (pos - ctr).magnitude; if (dr > maxChainReach) maxChainReach = dr;   // reach from seed
+                                        // Organic width: smooth pinch/swell ALONG the tube (low-freq noise at pos) scaled by
+                                        // the per-tunnel width class → coherent swells, not per-stamp noise; some tunnels narrow.
+                                        float swell = 0.5f + 0.5f * Plugin._noisePool![11].GetNoise(pos.x*0.07f, pos.y*0.07f, pos.z*0.07f);
+                                        float cr = (sminR + (smaxR - sminR) * Mathf.Clamp01(swell)) * tScale;
+                                        // Orient the stamp to the PATH: G = travel direction (so stretchg elongates ALONG
+                                        // the tube → smooth capsule, not beads), N = vertical-ish perp, T = cross. stretchn/
+                                        // stretcht set the cross-section dims; pnorm its shape (round→square).
+                                        var pG = dir;
+                                        var pN = Vector3.up - Vector3.Dot(Vector3.up, pG) * pG;
+                                        if (pN.sqrMagnitude < 1e-5f) pN = Vector3.Cross(pG, Vector3.right);
+                                        pN = pN.normalized;
+                                        var pT = Vector3.Cross(pN, pG).normalized;
+                                        centers.Add(pos); normals.Add(pN); tangG.Add(pG); tangT.Add(pT); radii.Add(cr); emitted++;
+                                        if (branchProb > 0f && dep < branchDepth && left - cs > 1
+                                            && Hash(li+seg*131 + cs*53 + 11, lj+seg*197 + cs*29 + 7, lk+seg*233 + cs*61 + 3) < branchProb)
+                                        {
+                                            var rnd = new Vector3(Hash(li+seg*51+cs, lj+seg*91+cs, lk+seg*71+cs) * 2f - 1f,
+                                                                  Hash(li+seg*53+cs, lj+seg*97+cs, lk+seg*73+cs) * 2f - 1f,
+                                                                  Hash(li+seg*59+cs, lj+seg*101+cs, lk+seg*79+cs) * 2f - 1f);
+                                            var axis = Vector3.Cross(dir, rnd);
+                                            if (axis.sqrMagnitude < 1e-6f) axis = Vector3.Cross(dir, Vector3.up);
+                                            axis = axis.normalized;
+                                            float sgn = Hash(li+seg*7+cs, lj+seg*11+cs, lk+seg*13+cs) < 0.5f ? -1f : 1f;
+                                            var bdir = (Quaternion.AngleAxis(sgn * branchAngle, axis) * dir).normalized;
+                                            segCounter++; branchEvents++;
+                                            work.Add((pos, bdir, left - cs, dep + 1, segCounter));
+                                        }
                                     }
-                                    pos += dir * chainStep;
-                                    // Per-link radius roll → chunky tunnel: pinch points + wide chambers.
-                                    float cr = sminR > 0f ? sminR + (smaxR - sminR) * Hash(li + cs*41 + 2, lj + cs*37 + 5, lk + cs*43 + 9) : smaxR;
-                                    centers.Add(pos); normals.Add(N); tangG.Add(G); tangT.Add(T); radii.Add(cr);
+                                    if (runPts != null && runPts.Count >= 2) DebugViz.Line(runPts, colPath, 0.8f);
                                 }
                             }
                         }
+
+                        // DIAG: field Y window vs how deep/far the stamps go, + how many stamps fall OUTSIDE this
+                        // zone's field (Y below floor / above top, or XZ outside) → can't be carved here.
+                        float fieldYlo = extLoS2, fieldYhi = extLoS2 + (ch - 1) * yStep;
+                        float minCY = 1e9f, maxCY = -1e9f; int belowField = 0, aboveField = 0, outsideXZ = 0;
+                        for (int ci = 0; ci < centers.Count; ci++)
+                        {
+                            var c = centers[ci];
+                            if (c.y < minCY) minCY = c.y; if (c.y > maxCY) maxCY = c.y;
+                            if (c.y < fieldYlo) belowField++;
+                            else if (c.y > fieldYhi) aboveField++;
+                            if (c.x < wxLo || c.x > wxHi || c.z < wzLo || c.z > wzHi) outsideXZ++;
+                        }
+                        Log.LogInfo($"[PT-blobs-diag] ({ox},{oz}) fieldY=[{fieldYlo:F0},{fieldYhi:F0}] stampY=[{minCY:F0},{maxCY:F0}] centers={centers.Count} belowField={belowField} aboveField={aboveField} outsideXZ={outsideXZ}");
 
                         // Spatial buckets (cell = reach) so each voxel tests only stamps in its 27 neighbour
                         // buckets, not all N. Turns the union from O(voxels*centers) into O(voxels*localCenters).
@@ -1463,7 +1683,7 @@ namespace ProceduralTerrain
                                 if (nr != r) { r = nr; dbgHit++; }
                             }
                         }
-                        Log.LogInfo($"[PT-blobs] centers={centers.Count} L={L:F0} rad=[{minR:F1},{maxR:F1}] stretchN={stretchN:F1} taper={taper:F2} pnorm={pnorm:F1} solidVoxels={dbgHit} curv=[{curvMin:F3},{curvMax:F3}] mean={(curvCnt>0?curvSum/curvCnt:0f):F3}");
+                        Log.LogInfo($"[PT-blobs] centers={centers.Count} L={L:F0} rad=[{minR:F1},{maxR:F1}] stretchN={stretchN:F1} carve={carve} branches={branchEvents} branchprob={branchProb:F2} flow={flowSteer:F2} hub={hubSeek:F2} maxreach={maxChainReach:F0}m ridgeratio={ridgeRatio:F1} solidVoxels={dbgHit} curv=[{curvMin:F3},{curvMax:F3}]");
                         if (_eikonal) RedistanceEikonal(_runSDF!, cw4, cw4, ch, xzStep, xzStep, yStep, 2);
                         continue;
                     }
@@ -1933,6 +2153,73 @@ namespace ProceduralTerrain
         {
             if (wg == null) return 0f;
             return _vanillaHeight ? VanillaHeight.Sample(wx, wz, wg) : wg.GetHeight(wx, wz);
+        }
+
+        // GLOBAL composed ground surface = base ground + the formation mode's relief, evaluated straight from
+        // the shared noise pool — a pure function of (x,z), identical in every zone. This is the surface the
+        // per-zone running field produces at its zero-crossing, but computable ANYWHERE, so a neighbour zone can
+        // snap a tunnel seed to the exact same point the owner did → chains tile across zones. Uses the DOMINANT
+        // biome's formation params (GetBiome is a cheap global function every zone agrees on); biome param-blending
+        // is skipped (the surface is ~continuous and the seed only needs a few-metre-accurate, CONSISTENT point).
+        internal static float ComposedSurfaceHeight(float wx, float wz, WorldGenerator? wg)
+        {
+            if (wg == null) return 0f;
+            float h = GroundHeight(wx, wz, wg);
+            var pool = _noisePool;
+            if (pool == null || pool.Length < 8) return h;
+            if (!_biomeParams.TryGetValue(wg.GetBiome(wx, wz), out var bp)) return h;
+            var pipe = _pipeline;
+            for (int k = 0; k < pipe.Length; k++)
+            {
+                if (!(pipe[k] is IsotropicFormation)) continue;
+                int mi = pipe[k].PipelineIndex;
+                if (mi < 0 || mi >= bp.Length) continue;
+                var P = bp[mi];
+                if (P == null || P.Length < 16) continue;
+                float amp = P[0]; if (amp <= 0f) continue;
+                float freq = P[1], warpAmp = P[2], warpFreq = P[3], vscale = P[4], threshold = P[5],
+                      twist = P[6], twistVary = P[7], twistFq = P[8], ampVary = P[9], ampFreq = P[10],
+                      flare = P[11], yoffset = P[12], smoothR = P[13], yanchor = P[15];
+                float warpx = pool[3].GetNoise(wx * warpFreq, wz * warpFreq, 0f) * warpAmp;
+                float warpz = pool[4].GetNoise(wx * warpFreq, wz * warpFreq, 0f) * warpAmp;
+                float addh;
+                if (yanchor != 0f) addh = yanchor;
+                else if (smoothR > 0f)
+                {
+                    float s9 = 0f;
+                    for (int dx = -1; dx <= 1; dx++) for (int dz = -1; dz <= 1; dz++) s9 += GroundHeight(wx + dx * smoothR + warpx, wz + dz * smoothR + warpz, wg);
+                    addh = s9 / 9f;
+                }
+                else addh = GroundHeight(wx + warpx, wz + warpz, wg);
+                addh -= yoffset;
+                float lamp = Mathf.Max(amp * (1f + ampVary * pool[5].GetNoise(wx * ampFreq, wz * ampFreq, 0f)), 0.001f);
+                float ts   = 1f + twistVary * pool[6].GetNoise(wx * twistFq, wz * twistFq, 0f);
+                // Column SDF at rely=d: d - (n(d) - efft(d))*lamp. Surface = root. Scan a ±1.5·lamp window for a
+                // sign change (the formation displacement is bounded by ~lamp), then bisect. Mirrors BakeColumn.
+                float F(float d)
+                {
+                    float wy = addh + d, sy = d * vscale, ang = wy * twist * ts;
+                    float c = Mathf.Cos(ang), ss = Mathf.Sin(ang);
+                    float n = pool[7].GetNoise((wx * c - wz * ss) * freq, sy * freq, (wx * ss + wz * c) * freq);
+                    float ft = Mathf.Clamp01(d / lamp);
+                    float efft = threshold - flare * (4f * ft * (1f - ft));
+                    return d - (n - efft) * lamp;
+                }
+                float lo = -1.5f * lamp, hi = 1.5f * lamp, prev = F(lo), pd = lo, droot = 0f; bool found = false;
+                for (int i = 1; i <= 12; i++)
+                {
+                    float d = lo + (hi - lo) * i / 12f, fd = F(d);
+                    if ((prev <= 0f) != (fd <= 0f))
+                    {
+                        float a = pd, b = d;
+                        for (int j = 0; j < 14; j++) { float m = (a + b) * 0.5f; if ((F(a) <= 0f) == (F(m) <= 0f)) a = m; else b = m; }
+                        droot = (a + b) * 0.5f; found = true; break;
+                    }
+                    prev = fd; pd = d;
+                }
+                h = addh + (found ? droot : 0f);
+            }
+            return h;
         }
 
         static void FillPhase1(float[] buf, int bw, int bh, int extLo, float s,
