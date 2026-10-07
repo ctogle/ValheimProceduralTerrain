@@ -1,14 +1,13 @@
 # ProceduralTerrain
 
-> **Work in progress.** Expect rough edges, breaking config changes, and incomplete documentation.
+> **Work in progress — 0.0.1 preview.** Ships novel default terrain for the first four biomes only; the rest stay near-vanilla for now. Expect breaking config and bake-format changes between versions (retune and rebake). Feedback welcome.
 
-Procedural terrain system for Valheim built on top of Voxheim. Carves caves, overhangs, arches, and raised stone formations into the voxel world using configurable noise-based profiles per biome.
+Procedural terrain system for Valheim built on top of [Voxheim](https://thunderstore.io/c/valheim/p/Voxheim/Voxheim/). Carves caves, overhangs, arches, and raised stone formations into the voxel world using configurable noise-based profiles per biome.
 
 ## Features
 
 - **Hot-reload config** — edit and save `procedural_terrain_biomes.cfg` while in-game; terrain remeshes live without restarting
-- **Per-biome noise profiles** — define named profiles of terrain parameters and map each biome to one; biome boundaries blend smoothly
-- **Three independent terrain modes** — tunnels (A), surface bands (B), raised density terrain (C) — combinable per profile
+- **Per-biome noise profiles** — combine named terrain modes into profiles and map each biome to one; biome boundaries blend smoothly
 - **SDF bake system** — pre-compute terrain for a radius and save to disk, eliminating zone-load hitching for baked areas
 - **Multiplayer bake distribution** — clients connecting to a server with a bake file download it automatically on join; the game is fully playable while the bake generates on the server and while clients download it
 
@@ -42,7 +41,7 @@ pt_clearbake                 — delete the local bake file
 pt_clearbake server          — delete the bake file on the server (admin only)
 ```
 
-**Multiplayer:** run `voxcaves_bake` once on the server (or as an admin while connected). The server bakes in the background — players can continue playing. When done, new clients connecting will automatically download the bake file with a progress indicator. Live calculation is used as fallback during download.
+**Multiplayer:** run `pt_bake` once on the server (or as an admin while connected). The server bakes in the background — players can continue playing. When done, new clients connecting will automatically download the bake file with a progress indicator. Live calculation is used as fallback during download.
 
 ---
 

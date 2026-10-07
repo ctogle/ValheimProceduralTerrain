@@ -4,7 +4,7 @@ schemaVersion = "0.0.1"
 [package]
 namespace = "ctogle"
 name = "ProceduralTerrain"
-versionNumber = "0.1.0"
+versionNumber = "0.0.1"
 description = "Procedural terrain system for the voxel inclined."
 websiteUrl = "https://github.com/ctogle/ValheimProceduralTerrain"
 containsNsfwContent = false

@@ -686,7 +686,7 @@ namespace ProceduralTerrain
         };
     }
 
-    [BepInPlugin("com.ctogle.procedural_terrain", "ProceduralTerrain", "0.1.0")]
+    [BepInPlugin("com.ctogle.procedural_terrain", "ProceduralTerrain", "0.0.1")]
     [BepInDependency("com.bogey.voxheim", BepInDependency.DependencyFlags.SoftDependency)]
     public partial class Plugin : BaseUnityPlugin
     {
