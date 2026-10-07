@@ -33,6 +33,22 @@ namespace ProceduralTerrain
         static readonly object _bakeStreamLock = new();
         static byte[] _bakeBlkScratch;   // reused compressed-block buffer (guarded by _bakeStreamLock)
 
+        // Streaming-write context: when a bake is in progress these are non-null, and StageBakeEntry
+        // appends each carved zone straight to the output file (bounded RAM) instead of accumulating in
+        // _bakePending. Guarded by _bakeStreamLock. Set up / torn down in WriteBakeFile.
+        static Stream _bakeWriteStream;
+        static List<(int ox, int oz, long off, int len)> _bakeWriteIndex;
+
+        // Serialize + gzip one zone into a self-contained block (same layout as the inline v4 writer).
+        static byte[] SerializeZoneBlock(int ox, int oz, BakeZone z)
+        {
+            using var ms = new MemoryStream();
+            using (var gz = new GZipStream(ms, System.IO.Compression.CompressionLevel.Optimal, leaveOpen: true))
+            using (var zbw = new BinaryWriter(gz))
+                WriteZoneBody(zbw, ox, oz, z);
+            return ms.ToArray();
+        }
+
         static void LoadBakeFile()
         {
             var wg = WorldGenerator.instance;
@@ -235,19 +251,24 @@ namespace ProceduralTerrain
             int fY    = voxelFloorY;
 
             // ── step==1 FAST path: band samples are already full-res → map straight into the sparse
-            // cache, no rehydrate and no tricubic. This is the "is full-res load faster?" test. ──
+            // cache, no rehydrate and no tricubic. The bake stores ONLY the owned WxW grid (no skirt), so we
+            // loop owned columns directly — ~43% fewer columns than the old full-grid loop. ──
             if (e.step == 1)
             {
+                if (e.nsx != owned || e.nsz != owned) return false;   // stale full-grid bake → fall through to live carve (rebake)
+                // surfH stays full-grid-indexed (FindCarvedSurfaceY indexes with the overlap offset); only the
+                // owned sub-block is filled, the skirt ring stays NaN (never read for an owned-point lookup).
                 var surfH1 = new float[bw * bw];
+                for (int i = 0; i < surfH1.Length; i++) surfH1[i] = float.NaN;
                 if (_colVScratch   == null || _colVScratch.Length   < bh) _colVScratch = new sbyte[bh];
                 if (_sparseScratch == null || _sparseScratch.Length < owned * bh * owned) _sparseScratch = new sbyte[owned * bh * owned];
                 var colV1 = _colVScratch; var scratch1 = _sparseScratch;
                 var cStart = new int[owned * owned]; var cLen = new int[owned * owned]; var cOff = new int[owned * owned];
                 int tot = 0;
-                for (int cx = 0; cx < bw; cx++)
-                for (int cz = 0; cz < bw; cz++)
+                for (int ix = 0; ix < owned; ix++)
+                for (int iz = 0; iz < owned; iz++)
                 {
-                    int col = cx * e.nsz + cz;
+                    int col = ix * e.nsz + iz;
                     int yLo = e.colYLo[col], yLen = e.colYLen[col], off = e.colOff[col];
                     sbyte below = e.colBelow[col], above = e.colAbove[col];
                     float sh = float.NaN;
@@ -261,21 +282,18 @@ namespace ProceduralTerrain
                         colV1[cy] = v;
                         if (v < 0) sh = (extLo + cy) * s;
                     }
-                    surfH1[cx * bw + cz] = sh;
-                    if (cx >= overlap && cx < overlap + owned && cz >= overlap && cz < overlap + owned)
+                    surfH1[(ix + overlap) * bw + (iz + overlap)] = sh;
+                    int oc = ix * owned + iz;
+                    int first = -1, last = -1;
+                    for (int cy = 0; cy < bh; cy++)
                     {
-                        int oc = (cx - overlap) * owned + (cz - overlap);
-                        int first = -1, last = -1;
-                        for (int cy = 0; cy < bh; cy++)
-                        {
-                            int wy = extLo + cy; sbyte v = colV1[cy];
-                            bool isDefault = (wy < fY) ? (v == -127) : (v == 127);
-                            if (!isDefault) { if (first < 0) first = cy; last = cy; }
-                        }
-                        cOff[oc] = tot;
-                        if (first < 0) { cStart[oc] = -1; cLen[oc] = 0; }
-                        else { cStart[oc] = first; int len = last - first + 1; cLen[oc] = len; Array.Copy(colV1, first, scratch1, tot, len); tot += len; }
+                        int wy = extLo + cy; sbyte v = colV1[cy];
+                        bool isDefault = (wy < fY) ? (v == -127) : (v == 127);
+                        if (!isDefault) { if (first < 0) first = cy; last = cy; }
                     }
+                    cOff[oc] = tot;
+                    if (first < 0) { cStart[oc] = -1; cLen[oc] = 0; }
+                    else { cStart[oc] = first; int len = last - first + 1; cLen[oc] = len; Array.Copy(colV1, first, scratch1, tot, len); tot += len; }
                 }
                 var band1 = new sbyte[tot]; Array.Copy(scratch1, 0, band1, 0, tot);
                 _sdfCache[$"{ox},{oz}"] = new ZoneField { extLo = extLo, bh = bh, width = owned, colStart = cStart, colLen = cLen, colOff = cOff, band = band1 };
@@ -422,9 +440,17 @@ namespace ProceduralTerrain
         static void StageBakeEntry(int ox, int oz, int bw, int bh, int extLo, float s, float[] buf)
         {
             int step = _bakeStep;
-            int nsx  = (bw + step - 1) / step;
+            int overlap = _overlap;
+            // step==1: store ONLY the owned WxW footprint — the overlap skirt is a live-carve device (blob
+            // fidelity across seams), consumed in-RAM during the carve and never served from a step==1 bake
+            // (every world point is owned by exactly one zone that holds its full SDF). Dropping it cuts ~43% of
+            // columns from both the file and the per-zone load loop. step>1 keeps the full grid — its tricubic
+            // load interpolation needs the skirt as the owned-border halo.
+            bool dropSkirt = step == 1;
+            int gOrig = dropSkirt ? overlap : 0;                       // first stored column, in voxel coords
+            int nsx  = dropSkirt ? (bw - 2 * overlap) : (bw + step - 1) / step;
+            int nsz  = dropSkirt ? (bw - 2 * overlap) : (bw + step - 1) / step;
             int nsy  = (bh + step - 1) / step;
-            int nsz  = (bw + step - 1) / step;
             int ncol = nsx * nsz;
             var colYLo   = new int[ncol];
             var colYLen  = new int[ncol];
@@ -437,8 +463,8 @@ namespace ProceduralTerrain
             for (int xs = 0; xs < nsx; xs++)
             for (int zs = 0; zs < nsz; zs++)
             {
-                int cx = Math.Min(xs * step, bw - 1);
-                int cz = Math.Min(zs * step, bw - 1);
+                int cx = dropSkirt ? (gOrig + xs) : Math.Min(xs * step, bw - 1);
+                int cz = dropSkirt ? (gOrig + zs) : Math.Min(zs * step, bw - 1);
                 for (int ys = 0; ys < nsy; ys++)
                 {
                     int cy = Math.Min(ys * step, bh - 1);
@@ -453,9 +479,9 @@ namespace ProceduralTerrain
                     if (active) { if (ys < minA) minA = ys; if (ys > maxA) maxA = ys; }
                 }
                 int col = xs * nsz + zs;
+                colOff[col] = packed.Count;
                 colBelow[col] = colV[0];
                 colAbove[col] = colV[nsy - 1];
-                colOff[col]   = packed.Count;
                 if (minA == int.MaxValue) { colYLo[col] = 0; colYLen[col] = 0; }
                 else
                 {
@@ -465,11 +491,26 @@ namespace ProceduralTerrain
                 }
             }
 
-            _bakePending[(ox, oz)] = new BakeZone {
+            // bw stays the FULL field width (serve-eligibility check + owned math on load); nsx/nsz record the
+            // actually-stored grid (owned for step==1, full for step>1).
+            var z = new BakeZone {
                 extLo = extLo, bh = bh, bw = bw, step = step, nsx = nsx, nsy = nsy, nsz = nsz,
                 colYLo = colYLo, colYLen = colYLen, colOff = colOff,
                 colBelow = colBelow, colAbove = colAbove, samples = packed.ToArray()
             };
+            // Bake in progress: compress (off-lock, parallel) and append straight to disk → RAM stays flat
+            // regardless of bake radius. Otherwise (live carve) keep the in-RAM staging dict.
+            if (_bakeWriteStream != null)
+            {
+                var blk = SerializeZoneBlock(ox, oz, z);
+                lock (_bakeStreamLock)
+                {
+                    long off = _bakeWriteStream.Position;
+                    _bakeWriteStream.Write(blk, 0, blk.Length);
+                    _bakeWriteIndex.Add((ox, oz, off, blk.Length));
+                }
+            }
+            else _bakePending[(ox, oz)] = z;
         }
 
         static void WriteBakeFile(float radius)
@@ -526,91 +567,95 @@ namespace ProceduralTerrain
             foreach (var mode in Plugin._pipeline.OfType<LuaModeDef>())
                 mode.WarmPool(threads);
 
-            _parallelBakeActive = true;
-            try
+            // Gather preserved existing zones (incremental bakes) as compressed blocks BEFORE truncating the
+            // output file — un-recarved zones get block-copied into the new file so they survive. Zero for a
+            // full / cfg-changed bake. Held compressed in RAM (small), not as the multi-GB decompressed set.
+            var preserved = new List<(int ox, int oz, byte[] blk)>();
             {
-                System.Threading.Tasks.Parallel.ForEach(toCarve,
-                    new System.Threading.Tasks.ParallelOptions { MaxDegreeOfParallelism = threads },
-                    zone =>
-                    {
-                        var (zox, zoz) = zone;
-                        var (yLo, yHi) = ComputeYBounds(zox, zoz, zoneW, s, wg);
-                        // Per-zone guard: a throw on a bake worker otherwise surfaces as an AggregateException
-                        // to the bake caller and (if unhandled) silently kills the process — no [PT] Carve,
-                        // since that catch only covers the live main-thread path. Log the zone + full stack so
-                        // a managed failure (e.g. an indexing bug at fine coarseXZ) is diagnosable, not fatal.
-                        try
-                        {
-                            // Purely procedural carve — groundwork is a live overlay applied at load, not baked.
-                            Carve(null, zox, zoz, zoneW, yLo, yHi);
-                        }
-                        catch (Exception ce)
-                        {
-                            Log.LogError($"[ProceduralTerrain] bake Carve threw at zone ({zox},{zoz}) coarseXZ={Plugin._coarseXZ} coarseY={Plugin._coarseY}: {ce.GetType().Name}: {ce.Message}\n{ce.StackTrace}");
-                        }
-                        int n = System.Threading.Interlocked.Increment(ref doneCount);
-                        Plugin._bakeProgressDone = n;
-                        if (n % 50 == 0 || n == toCarve.Count)
-                        {
-                            float elapsed = bakeSw.ElapsedMilliseconds / 1000f;
-                            float eta = elapsed > 0f ? (toCarve.Count - n) / (n / elapsed) : 0f;
-                            Log.LogInfo($"[ProceduralTerrain] bake: {n}/{toCarve.Count} zones — {eta:F0}s remaining");
-                            var prog = new ZPackage();
-                            prog.Write(n); prog.Write(toCarve.Count);
-                            ZRoutedRpc.instance.InvokeRoutedRPC(ZRoutedRpc.Everybody, "PTBakeProgress", prog);
-                        }
-                    });
+                var carveSet = new HashSet<(int, int)>(toCarve);
+                var existingKeys = new List<(int, int)>();
+                if (_bakeData != null) existingKeys.AddRange(_bakeData.Keys);
+                else if (_bakeIndex != null) existingKeys.AddRange(_bakeIndex.Keys);
+                foreach (var key in existingKeys)
+                    if (!carveSet.Contains(key) && TryGetBakeZone(key.Item1, key.Item2, out var zz))
+                        preserved.Add((key.Item1, key.Item2, SerializeZoneBlock(key.Item1, key.Item2, zz)));
             }
-            finally { _parallelBakeActive = false; }
-
-            // Merge staged + existing bake data (staged takes priority). Existing zones NOT re-carved are
-            // preserved — read on demand from the current store (RAM for v3, streamed for v4).
-            var toWrite = new Dictionary<(int, int), BakeZone>();
-            var existingKeys = new List<(int, int)>();
-            if (_bakeData != null) existingKeys.AddRange(_bakeData.Keys);
-            else if (_bakeIndex != null) existingKeys.AddRange(_bakeIndex.Keys);
-            foreach (var key in existingKeys)
-                if (!_bakePending.ContainsKey(key) && TryGetBakeZone(key.Item1, key.Item2, out var zz))
-                    toWrite[key] = zz;
-            foreach (var kv in _bakePending)
-                toWrite[kv.Key] = kv.Value;
 
             string path = BakeFilePath(seed, cfgHash);
             Directory.CreateDirectory(PTConfigDir);
-            CloseBakeStream();   // release any open read handle before overwriting the file
+            CloseBakeStream();   // release the old read handle before overwriting the file
 
-            // v4 STREAMED format: header, then each zone as its own gzip block (seekable), then an offset
-            // index, then a footer long pointing at the index. Keeps size ~same but allows load-on-demand.
-            var index = new List<(int ox, int oz, long off, int len)>(toWrite.Count);
-            using (var fs = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None, 1 << 20))
+            // v4 STREAMED format written INCREMENTALLY: header, preserved blocks, then each freshly-carved zone
+            // appended straight from its bake worker (StageBakeEntry → _bakeWriteStream) so peak RAM stays flat
+            // regardless of radius; finally the offset index + footer. The zone count isn't known up front
+            // (streamed), so it's written as a placeholder and patched in after the carve.
+            var index = new List<(int ox, int oz, long off, int len)>(toCarve.Count + preserved.Count);
+            using (var fs = new FileStream(path, FileMode.Create, FileAccess.ReadWrite, FileShare.None, 1 << 20))
             using (var bw2 = new BinaryWriter(fs))
             {
                 bw2.Write(0x564F5846u);          // magic
                 bw2.Write((ushort)4);            // version 4 = streamed (per-zone gzip blocks + offset index)
                 bw2.Write((ulong)(uint)seed);
                 bw2.Write(cfgHash);
-                bw2.Write((uint)toWrite.Count);
-                foreach (var (key, z) in toWrite)
+                long countPos = fs.Position;
+                bw2.Write((uint)0);              // zone count placeholder — patched after the carve
+
+                foreach (var (pox, poz, blk) in preserved)
+                { long off = fs.Position; bw2.Write(blk, 0, blk.Length); index.Add((pox, poz, off, blk.Length)); }
+                bw2.Flush();
+
+                // Freshly-carved zones stream into fs via StageBakeEntry during the parallel carve below.
+                _bakeWriteStream = fs;
+                _bakeWriteIndex  = index;
+                _parallelBakeActive = true;
+                try
                 {
-                    long off = fs.Position;
-                    using (var ms = new MemoryStream())
-                    {
-                        using (var gz = new GZipStream(ms, System.IO.Compression.CompressionLevel.Optimal, leaveOpen: true))
-                        using (var zbw = new BinaryWriter(gz))
-                            WriteZoneBody(zbw, key.Item1, key.Item2, z);
-                        var blk = ms.ToArray();
-                        bw2.Write(blk, 0, blk.Length);
-                        index.Add((key.Item1, key.Item2, off, blk.Length));
-                    }
+                    System.Threading.Tasks.Parallel.ForEach(toCarve,
+                        new System.Threading.Tasks.ParallelOptions { MaxDegreeOfParallelism = threads },
+                        zone =>
+                        {
+                            var (zox, zoz) = zone;
+                            var (yLo, yHi) = ComputeYBounds(zox, zoz, zoneW, s, wg);
+                            // Per-zone guard: a throw on a bake worker otherwise surfaces as an AggregateException
+                            // to the bake caller and (if unhandled) silently kills the process — no [PT] Carve,
+                            // since that catch only covers the live main-thread path. Log the zone + full stack so
+                            // a managed failure (e.g. an indexing bug at fine coarseXZ) is diagnosable, not fatal.
+                            try
+                            {
+                                // Purely procedural carve — groundwork is a live overlay applied at load, not baked.
+                                Carve(null, zox, zoz, zoneW, yLo, yHi);
+                            }
+                            catch (Exception ce)
+                            {
+                                Log.LogError($"[ProceduralTerrain] bake Carve threw at zone ({zox},{zoz}) coarseXZ={Plugin._coarseXZ} coarseY={Plugin._coarseY}: {ce.GetType().Name}: {ce.Message}\n{ce.StackTrace}");
+                            }
+                            int n = System.Threading.Interlocked.Increment(ref doneCount);
+                            Plugin._bakeProgressDone = n;
+                            if (n % 50 == 0 || n == toCarve.Count)
+                            {
+                                float elapsed = bakeSw.ElapsedMilliseconds / 1000f;
+                                float eta = elapsed > 0f ? (toCarve.Count - n) / (n / elapsed) : 0f;
+                                Log.LogInfo($"[ProceduralTerrain] bake: {n}/{toCarve.Count} zones — {eta:F0}s remaining");
+                                var prog = new ZPackage();
+                                prog.Write(n); prog.Write(toCarve.Count);
+                                ZRoutedRpc.instance.InvokeRoutedRPC(ZRoutedRpc.Everybody, "PTBakeProgress", prog);
+                            }
+                        });
                 }
+                finally { _parallelBakeActive = false; _bakeWriteStream = null; _bakeWriteIndex = null; }
+
                 bw2.Flush();
                 long indexOff = fs.Position;
                 foreach (var e in index) { bw2.Write(e.ox); bw2.Write(e.oz); bw2.Write(e.off); bw2.Write(e.len); }
                 bw2.Write(indexOff);             // footer: where the index begins
                 bw2.Flush();
+                fs.Seek(countPos, SeekOrigin.Begin);
+                bw2.Write((uint)index.Count);    // patch the real zone count
+                bw2.Flush();
             }
 
-            // Switch straight to streaming from the file we just wrote — frees the multi-GB toWrite from RAM.
+            // Switch straight to streaming from the file we just wrote (it was written incrementally, never
+            // held whole in RAM) — reopen read-only and index by offset.
             _bakeData = null;
             var idx2 = new Dictionary<(int, int), (long, int)>(index.Count);
             foreach (var e in index) idx2[(e.ox, e.oz)] = (e.off, e.len);
@@ -618,7 +663,7 @@ namespace ProceduralTerrain
             _bakeStream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
             _bakeFileStep = _bakeStep;
             _bakePending.Clear();
-            Log.LogInfo($"[ProceduralTerrain] Bake written (v4 streamed): {toWrite.Count} zones, radius={radius:F0}m → {path}");
+            Log.LogInfo($"[ProceduralTerrain] Bake written (v4 streamed): {index.Count} zones, radius={radius:F0}m → {path}");
         }
 
         // ── Hot-reload: re-run the full voxel pipeline on every loaded zone ───────
