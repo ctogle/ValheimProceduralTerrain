@@ -151,16 +151,23 @@ namespace ProceduralTerrain
             // means the zone is unbaked → live carve.
             bool fromBake = false;
 
+            // Full end-to-end phase timing (hoisted so the tail — stage/surfH/sparse — which runs outside the
+            // !fromBake block is covered too; every segment timed directly, no subtraction).
+            long _ph0 = System.Diagnostics.Stopwatch.GetTimestamp();
+            long _phSetup = _ph0, _phFill = _ph0, _phBlur = _ph0, _phIsland = _ph0, _phPocket = _ph0,
+                 _phStage = _ph0, _phSurf = _ph0, _phSparse = _ph0;
             if (!fromBake)
             {
             InitNoise();
 
             int   cw4     = cw4Early;
             BakeSdfSetup(ox, oz, overlap, s, extLo, bh, bw, cw4, wg, nearbyLocs, heightGrid);
+            _phSetup = System.Diagnostics.Stopwatch.GetTimestamp();
 
             bool anyPipelineActive = _pipeline.Length > 0 && _cb.bkModeParams != null &&
                 _pipeline.Any(m => _cb.bkModeParams![m.PipelineIndex][0].Any(v => v > 0f));
             FillPhase1(buf, bw, bh, extLo, s, ox, oz, overlap, wg, cw4, nearbyLocs, heightGrid);
+            _phFill = System.Diagnostics.Stopwatch.GetTimestamp();
 
             CaveProfile blurProf = centerProf;
             if (_blendedProfs != null)
@@ -247,6 +254,7 @@ namespace ProceduralTerrain
                 Array.Copy(buf, orig, pbSz);
                 TaubinStep(taubinMu);
             }
+            _phBlur = System.Diagnostics.Stopwatch.GetTimestamp();
 
             if (_islandRemoval) {
                 int islandBufSize = bw * bh * bw;
@@ -389,7 +397,7 @@ namespace ProceduralTerrain
                         ac.negZ[fIdx] = _cb.visitedBuf[cx * stride_x + cy * bw + terNegZ25];
                         ac.posZ[fIdx] = _cb.visitedBuf[cx * stride_x + cy * bw + terPosZ25];
                     }
-                    _zoneFaceCache[(ox, oz)] = ac;
+                    PutZoneFace((ox, oz), ac);
                 }
 
                 int removed = 0;
@@ -398,6 +406,7 @@ namespace ProceduralTerrain
 
                 Log.LogDebug($"[ProceduralTerrain] island-fill zone ({ox},{oz}): pre={!needsFullPass} seeds={qTail} removed={removed}");
             }
+            _phIsland = System.Diagnostics.Stopwatch.GetTimestamp();
 
             if (_pocketRemoval) {
                 Array.Clear(_cb.visitedBuf!, 0, bw * bh * bw);
@@ -449,11 +458,13 @@ namespace ProceduralTerrain
 
                 Log.LogDebug($"[ProceduralTerrain] pocket-fill zone ({ox},{oz}): filled={filled}");
             }
+            _phPocket = System.Diagnostics.Stopwatch.GetTimestamp();
 
             } // end if (!fromBake)
 
             if (!fromBake)
                 StageBakeEntry(ox, oz, bw, bh, extLo, s, buf);
+            _phStage = System.Diagnostics.Stopwatch.GetTimestamp();
 
             {
                 var surfH = new float[bw * bw];
@@ -474,6 +485,7 @@ namespace ProceduralTerrain
                 if (!_parallelBakeActive)
                     lock (_surfHCache) _surfHCache[(ox, oz)] = (bw, extLo, s, surfH);
             }
+            _phSurf = System.Diagnostics.Stopwatch.GetTimestamp();
 
             // Bake threads skip sdfCache (they stage the dense file via StageBakeEntry from buf). Only the
             // main-thread live/load path builds the sparse per-column cache PTGenerator consumes.
@@ -540,6 +552,10 @@ namespace ProceduralTerrain
                 colStart = colStart, colLen = colLen, colOff = colOff, band = band
             };
             }
+            _phSparse = System.Diagnostics.Stopwatch.GetTimestamp();
+            double _pms(long a, long b) => (b - a) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+            if (_pms(_ph0, _phSparse) > 5.0)
+                Log.LogInfo($"[PT-phases] ({ox},{oz}) setup={_pms(_ph0,_phSetup):F1} fill={_pms(_phSetup,_phFill):F1} blur={_pms(_phFill,_phBlur):F1} island={_pms(_phBlur,_phIsland):F1} pocket={_pms(_phIsland,_phPocket):F1} stage={_pms(_phPocket,_phStage):F1} surf={_pms(_phStage,_phSurf):F1} sparse={_pms(_phSurf,_phSparse):F1} total={_pms(_ph0,_phSparse):F1}ms (bh={bh})");
 
             if (_dumpZonesRemaining > 0)
             {
@@ -964,7 +980,7 @@ namespace ProceduralTerrain
             cache.percol      = percol;
             cache.percolValid = true;
 
-            _zoneFaceCache[(ox, oz)] = cache;
+            PutZoneFace((ox, oz), cache);
         }
 
         // ── Placement height ──────────────────────────────────────────────────────────
@@ -1311,9 +1327,9 @@ namespace ProceduralTerrain
                                 // N from its gradient. Accuracy is VERIFIED via the occlusion overlay (purple must poke
                                 // out of the terrain). ComposedSurfaceHeight returns the OUTER surface, so no openAbove needed.
                                 if (lk != lk0) continue;
-                                float ghc = ComposedSurfaceHeight(px, pz, wg);
-                                float ggx = (ComposedSurfaceHeight(px+h,pz,wg) - ComposedSurfaceHeight(px-h,pz,wg)) / (2f*h);
-                                float ggz = (ComposedSurfaceHeight(px,pz+h,wg) - ComposedSurfaceHeight(px,pz-h,wg)) / (2f*h);
+                                float ghc = ComposedSurfaceSample(px, pz, wg);
+                                float ggx = (ComposedSurfaceSample(px+h,pz,wg) - ComposedSurfaceSample(px-h,pz,wg)) / (2f*h);
+                                float ggz = (ComposedSurfaceSample(px,pz+h,wg) - ComposedSurfaceSample(px,pz-h,wg)) / (2f*h);
                                 nx = -ggx; ny = 1f; nz = -ggz;
                                 float nl = Mathf.Sqrt(nx*nx+ny*ny+nz*nz); if (nl < 1e-4f) continue; nx/=nl; ny/=nl; nz/=nl;
                                 ctr = new Vector3(px, ghc, pz);
@@ -2153,6 +2169,45 @@ namespace ProceduralTerrain
         {
             if (wg == null) return 0f;
             return _vanillaHeight ? VanillaHeight.Sample(wx, wz, wg) : wg.GetHeight(wx, wz);
+        }
+
+        // Acceleration for the cave-seed surface query: ComposedSurfaceHeight is a smooth 2D scalar but each exact
+        // call root-finds the formation column (~30 noise evals). Seeds hammer it ~5×/candidate over a wide lattice,
+        // so we memoize it on a FIXED WORLD-ALIGNED grid (same nodes for every zone → seeds stay identical across
+        // zones → tiling preserved) and bilinear-sample. NOT a heightmap of the terrain — the field stays full 3D;
+        // this is a throwaway cache of the surface-elevation function used only to anchor seeds. World-aligned grid
+        // step is coarse because the mountain surface is low-frequency; the interp error is sub-metre.
+        const float SurfGridStep = 8f;
+        const int   SurfCacheCap = 262144;   // ~512², a few MB; FIFO-bounded so it can't grow unbounded over a bake
+        static readonly System.Collections.Concurrent.ConcurrentDictionary<(int, int), float> _composedSurfCache = new();
+        static readonly System.Collections.Concurrent.ConcurrentQueue<(int, int)> _composedSurfOrder = new();
+        internal static void ClearComposedSurfCache() { _composedSurfCache.Clear(); while (_composedSurfOrder.TryDequeue(out _)) { } }
+
+        static float SurfNode(int gx, int gz, WorldGenerator wg)
+        {
+            var key = (gx, gz);
+            if (_composedSurfCache.TryGetValue(key, out var v)) return v;
+            v = ComposedSurfaceHeight(gx * SurfGridStep, gz * SurfGridStep, wg);
+            if (_composedSurfCache.TryAdd(key, v))
+            {
+                _composedSurfOrder.Enqueue(key);
+                while (_composedSurfCache.Count > SurfCacheCap && _composedSurfOrder.TryDequeue(out var old))
+                    if (!old.Equals(key)) _composedSurfCache.TryRemove(old, out _);
+            }
+            return v;
+        }
+
+        // Bilinear sample of the cached composed surface — the cheap replacement for a per-query ComposedSurfaceHeight.
+        internal static float ComposedSurfaceSample(float wx, float wz, WorldGenerator? wg)
+        {
+            if (wg == null) return 0f;
+            float fx = wx / SurfGridStep, fz = wz / SurfGridStep;
+            int gx = Mathf.FloorToInt(fx), gz = Mathf.FloorToInt(fz);
+            float tx = fx - gx, tz = fz - gz;
+            float h00 = SurfNode(gx, gz, wg),     h10 = SurfNode(gx + 1, gz, wg);
+            float h01 = SurfNode(gx, gz + 1, wg), h11 = SurfNode(gx + 1, gz + 1, wg);
+            float a = h00 + (h10 - h00) * tx, b = h01 + (h11 - h01) * tx;
+            return a + (b - a) * tz;
         }
 
         // GLOBAL composed ground surface = base ground + the formation mode's relief, evaluated straight from

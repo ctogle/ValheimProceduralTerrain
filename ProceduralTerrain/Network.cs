@@ -89,6 +89,15 @@ namespace ProceduralTerrain
             {
                 _bakeInProgress = false;
                 BakeProgressUI.HideBake();
+                // Bake just finished server-side. A client that joined mid-bake was told "not available" and is on
+                // live — re-query now so it downloads the completed file. Guard to clients (the server/host already
+                // has the file; self-querying would make it stream its own bake to itself).
+                if (ZNet.instance != null && !ZNet.instance.IsServer())
+                {
+                    var q = new ZPackage(); q.Write(ComputeCfgHash());
+                    ZRoutedRpc.instance.InvokeRoutedRPC(sender, "PTBakeQuery", q);
+                    Log.LogInfo("[ProceduralTerrain] Bake complete — re-querying server to download it.");
+                }
             }
         }
 
@@ -214,7 +223,15 @@ namespace ProceduralTerrain
             uint myCfgHash = ComputeCfgHash();
             string path = BakeFilePath(seed, myCfgHash);
             var info = new ZPackage();
-            if (myCfgHash == clientCfgHash && File.Exists(path))
+            if (_parallelBakeActive)
+            {
+                // A bake is running — the file exists but is INCOMPLETE (no index/footer). Report "not available"
+                // so the client doesn't download a half-written file; it uses live + shows PTBakeProgress, and
+                // re-queries when the bake finishes (RPC_BakeProgress at done>=total).
+                info.Write(0L);
+                Log.LogInfo($"[ProceduralTerrain] Bake query from {sender}: bake in progress, not yet available.");
+            }
+            else if (myCfgHash == clientCfgHash && File.Exists(path))
             {
                 long size = new System.IO.FileInfo(path).Length;
                 info.Write(size);
@@ -234,6 +251,7 @@ namespace ProceduralTerrain
             int  seed = (int)(ZNet.instance?.GetWorldUID() ?? 0L);
             uint cfgHash = ComputeCfgHash();
             string path = BakeFilePath(seed, cfgHash);
+            if (_parallelBakeActive) { Log.LogInfo($"[ProceduralTerrain] Bake request from {sender} refused: bake still running."); return; }
             if (!File.Exists(path)) return;
             byte[] data = File.ReadAllBytes(path);
             int total = (int)Math.Ceiling((double)data.Length / BakeChunkSize);

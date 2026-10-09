@@ -730,6 +730,7 @@ namespace ProceduralTerrain
         internal static bool  _debugViz            = false;  // DEBUG: draw see-through overlay lines for brush seeds/paths (tunnels now, spines later)
         internal static int   _overlap             = 4;      // running-field margin (voxels) shared with neighbour zones; caps seam-free feature reach
         internal static float _fieldDepthLo        = 0f;     // min world-metres the carvable field extends BELOW terrain min (0=default). Raise so deep tunnels stay in-field
+        internal static bool  _bakeTrilinear       = false;  // step>1 rehydration interp: false=Catmull-Rom (C1, smooth), true=trilinear (C0, cheap). A/B on the same bake file
         internal static float _biomeBlendRadius    = 192f;
         internal static bool  _biomeBlendSmooth    = true;   // false=linear, true=smoothstep
         internal static int   _transitionBlurPasses = 3;     // min blur passes for any active zone
@@ -769,6 +770,7 @@ namespace ProceduralTerrain
         internal sealed class BakeZone
         {
             public int extLo, bh, bw, step, nsx, nsy, nsz;
+            public int cOrigin;   // step>1: global coarse-cell index of stored column 0 in X/Z (owned+halo grid; skirt not stored). 0 for step==1.
             public int[]   colYLo   = System.Array.Empty<int>();
             public int[]   colYLen  = System.Array.Empty<int>();
             public int[]   colOff   = System.Array.Empty<int>();   // offset into samples[]
@@ -928,6 +930,18 @@ namespace ProceduralTerrain
             public bool[,] percol;
         }
         internal static readonly System.Collections.Concurrent.ConcurrentDictionary<(int, int), ZoneFaceCache> _zoneFaceCache = new();
+        // FIFO-bounded: island-removal writes a face cache PER ZONE; during a big bake that's tens of thousands of
+        // multi-KB entries → multi-GB heap → GC overhead climbs and the bake ETA creeps up. Cap it — an evicted
+        // neighbour just gets recomputed on demand by EnsureFixpoint (already the miss path), so bounding is safe.
+        static readonly System.Collections.Concurrent.ConcurrentQueue<(int, int)> _zoneFaceOrder = new();
+        const int ZoneFaceCap = 1024;
+        internal static void PutZoneFace((int, int) key, ZoneFaceCache c)
+        {
+            _zoneFaceCache[key] = c;
+            _zoneFaceOrder.Enqueue(key);
+            while (_zoneFaceCache.Count > ZoneFaceCap && _zoneFaceOrder.TryDequeue(out var old))
+                if (!old.Equals(key)) _zoneFaceCache.TryRemove(old, out _);
+        }
 
         // Set true during parallel bake to suppress main-thread-only side effects.
         static volatile bool _parallelBakeActive;
@@ -970,6 +984,14 @@ namespace ProceduralTerrain
             {
                 DebugViz.ClearAll();
                 Log.LogInfo("[ProceduralTerrain] debug viz cleared");
+            });
+            new Terminal.ConsoleCommand("pt_interp", "pt_interp [tricubic|trilinear] — A/B the step>1 bake rehydration interp on the SAME bake (re-serves loaded zones)", args =>
+            {
+                if (args.Length >= 2) _bakeTrilinear = args[1].Trim().Equals("trilinear", StringComparison.OrdinalIgnoreCase);
+                else _bakeTrilinear = !_bakeTrilinear;   // no arg = toggle
+                _hotReloadPending = true;                // RecarveAll next frame → re-serve all loaded zones with the new interp
+                string msg = $"[ProceduralTerrain] bake interp = {(_bakeTrilinear ? "trilinear (C0, cheap)" : "tricubic (Catmull-Rom, smooth)")} — re-serving loaded zones.";
+                Log.LogInfo(msg); Console.instance?.Print(msg);
             });
             new Terminal.ConsoleCommand("pt_dump", "pt_dump — dump SDF + biome blend data for the next 9 zones processed to BepInEx/config/voxcaves_dump_*.json", _ =>
             {

@@ -140,19 +140,29 @@ namespace ProceduralTerrain
                 }
                 switch (k)
                 {
-                    case "include":
-                        if (namedProfiles.TryGetValue(v.Trim(), out var incl))
+                    case "profiles":   // nest/inherit from one or more parent profiles. Parents' modes are
+                    {                  // prepended in listed order; their params applied (later parent wins),
+                                       // then overridable by this profile's own keys below.
+                        var parentModes = new List<string>();
+                        foreach (var parentName in v.Split(','))
                         {
-                            tp.ModeNames.InsertRange(0, incl.ModeNames);
-                            tp.FloorDepth    = incl.FloorDepth;
-                            tp.FloorFade     = incl.FloorFade;
-                            tp.BlurPasses    = incl.BlurPasses;
-                            tp.PeronaK       = incl.PeronaK;
-                            tp.PeronaLambda  = incl.PeronaLambda;
-                            tp.ExtendUp      = incl.ExtendUp;
+                            var pn = parentName.Trim();
+                            if (pn.Length == 0) continue;
+                            if (namedProfiles.TryGetValue(pn, out var incl))
+                            {
+                                parentModes.AddRange(incl.ModeNames);
+                                tp.FloorDepth   = incl.FloorDepth;
+                                tp.FloorFade    = incl.FloorFade;
+                                tp.BlurPasses   = incl.BlurPasses;
+                                tp.PeronaK      = incl.PeronaK;
+                                tp.PeronaLambda = incl.PeronaLambda;
+                                tp.ExtendUp     = incl.ExtendUp;
+                            }
+                            else Log.LogWarning($"[ProceduralTerrain] Profile '{name}': parent profile '{pn}' not found.");
                         }
-                        else Log.LogWarning($"[ProceduralTerrain] Profile '{name}': include '{v.Trim()}' not found.");
+                        tp.ModeNames.InsertRange(0, parentModes);
                         break;
+                    }
                     case "modes":
                         foreach (var modeName in v.Split(','))
                         { var mn = modeName.Trim(); if (!string.IsNullOrEmpty(mn)) tp.ModeNames.Add(mn); }
@@ -225,17 +235,48 @@ namespace ProceduralTerrain
             }
 
             // Pass 2: Profile definitions [Profile:name]
-            // Profiles may only include profiles defined above them.
+            // Order-independent nesting: a profile's `profiles=` parents may appear anywhere in the file. We
+            // resolve in dependency order — repeatedly parse any profile whose parents are all resolved, deferring
+            // the rest, until no progress. Leftovers (missing parent or a cycle) are parsed anyway with a warning.
             var namedProfiles = new Dictionary<string, TerrainProfile>(StringComparer.OrdinalIgnoreCase);
             // profileParamOverrides[profileName][modeName][paramName] = value
             var allProfileParamOverrides = new Dictionary<string, Dictionary<string, Dictionary<string, float>>>(StringComparer.OrdinalIgnoreCase);
+            var pendingProfiles = new List<(string profName, List<(string key, string val)> kvs)>();
             foreach (var (secName, kvs) in sections)
             {
                 if (!secName.StartsWith("Profile:", StringComparison.OrdinalIgnoreCase)) continue;
-                string profName = secName.Substring(8).Trim();
+                pendingProfiles.Add((secName.Substring(8).Trim(), kvs));
+            }
+            void ResolveProfile(string profName, List<(string key, string val)> kvs)
+            {
                 var profOvr = new Dictionary<string, Dictionary<string, float>>(StringComparer.OrdinalIgnoreCase);
                 namedProfiles[profName] = ParseTerrainProfile(profName, kvs, namedProfiles, profOvr);
                 if (profOvr.Count > 0) allProfileParamOverrides[profName] = profOvr;
+            }
+            bool ParentsReady(List<(string key, string val)> kvs)
+            {
+                foreach (var (k, v) in kvs)
+                    if (k.Equals("profiles", StringComparison.OrdinalIgnoreCase))
+                        foreach (var p in v.Split(','))
+                        { var pn = p.Trim(); if (pn.Length > 0 && !namedProfiles.ContainsKey(pn)) return false; }
+                return true;
+            }
+            bool progress = true;
+            while (pendingProfiles.Count > 0 && progress)
+            {
+                progress = false;
+                for (int i = pendingProfiles.Count - 1; i >= 0; i--)
+                {
+                    if (!ParentsReady(pendingProfiles[i].kvs)) continue;
+                    ResolveProfile(pendingProfiles[i].profName, pendingProfiles[i].kvs);
+                    pendingProfiles.RemoveAt(i);
+                    progress = true;
+                }
+            }
+            foreach (var (profName, kvs) in pendingProfiles)   // unresolved parent (missing or cyclic) — parse anyway
+            {
+                Log.LogWarning($"[ProceduralTerrain] Profile '{profName}': unresolved parent in profiles= (missing or cyclic); parsing without it.");
+                ResolveProfile(profName, kvs);
             }
 
             // Pass 3: Debug, Bake, and biome assignments
@@ -269,6 +310,8 @@ namespace ProceduralTerrain
                             _overlap = Mathf.Clamp(ov, 2, 16);
                         if (k == "fielddepthlo" && float.TryParse(v, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float fdl))
                             _fieldDepthLo = Mathf.Max(0f, fdl);
+                        // NOTE: bake interp (tricubic/trilinear) is a load-side choice, deliberately NOT a cfg key —
+                        // it must not affect the bake's cfg-hash. Toggle it at runtime with the pt_interp command.
                         if (k == "biomeblendradius" && float.TryParse(v, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float bbr))
                             _biomeBlendRadius = Mathf.Max(1f, bbr);
                         if (k == "biomeblendsmooth")
@@ -348,6 +391,7 @@ namespace ProceduralTerrain
             _pipeline = pipelineList.ToArray();
             Plugin.ZoneGradCache.Clear();
             Plugin.VanillaHeight.Clear();
+            Plugin.ClearComposedSurfCache();   // formation params may have changed → cached surface nodes are stale
 
             // Build _biomeParams [biome][pipelineIdx][paramIdx]
             var newBiomeParams = new Dictionary<Heightmap.Biome, float[][]>();

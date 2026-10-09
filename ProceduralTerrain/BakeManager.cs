@@ -73,7 +73,7 @@ namespace ProceduralTerrain
                     var pr = new BinaryReader(fs, System.Text.Encoding.UTF8, leaveOpen: true);
                     if (pr.ReadUInt32() != 0x564F5846u) { Log.LogWarning("[ProceduralTerrain] bake: invalid magic."); fs.Dispose(); return; }
                     ushort pver = pr.ReadUInt16();
-                    if (pver == 4)
+                    if (pver == 5)
                     {
                         if (pr.ReadUInt64() != (ulong)(uint)seed || pr.ReadUInt32() != cfgHash)
                             { Log.LogWarning("[ProceduralTerrain] bake: seed/cfg mismatch."); fs.Dispose(); return; }
@@ -91,7 +91,7 @@ namespace ProceduralTerrain
                         _bakeIndex = idx;
                         _bakeStream = fs;             // KEEP OPEN for per-zone seeks
                         _bakeFileStep = _bakeStep;    // v4 treated as current
-                        Log.LogInfo($"[ProceduralTerrain] Bake streamed: {cnt} zones (v4), index-only, from {path}");
+                        Log.LogInfo($"[ProceduralTerrain] Bake streamed: {cnt} zones (v5), index-only, from {path}");
                         return;                       // deliberately do NOT dispose fs
                     }
                     fs.Seek(0, SeekOrigin.Begin);     // not v4 → fall through to v3 raw load-all
@@ -130,6 +130,7 @@ namespace ProceduralTerrain
             int extLo = br.ReadInt32();
             int bh = br.ReadUInt16(), ebw = br.ReadUInt16(), step = br.ReadUInt16();
             int nsx = br.ReadInt32(), nsy = br.ReadInt32(), nsz = br.ReadInt32();
+            int cOrigin = br.ReadInt32();
             int ncol = nsx * nsz;
             var colYLo = new int[ncol]; var colYLen = new int[ncol];
             var colBelow = new sbyte[ncol]; var colAbove = new sbyte[ncol]; var colOff = new int[ncol];
@@ -147,7 +148,7 @@ namespace ProceduralTerrain
             var bytes = br.ReadBytes(slen);
             Buffer.BlockCopy(bytes, 0, samples, 0, slen);
             return new BakeZone {
-                extLo = extLo, bh = bh, bw = ebw, step = step, nsx = nsx, nsy = nsy, nsz = nsz,
+                extLo = extLo, bh = bh, bw = ebw, step = step, nsx = nsx, nsy = nsy, nsz = nsz, cOrigin = cOrigin,
                 colYLo = colYLo, colYLen = colYLen, colOff = colOff,
                 colBelow = colBelow, colAbove = colAbove, samples = samples
             };
@@ -158,6 +159,7 @@ namespace ProceduralTerrain
             bw2.Write(eox); bw2.Write(eoz); bw2.Write(z.extLo);
             bw2.Write((ushort)z.bh); bw2.Write((ushort)z.bw); bw2.Write((ushort)z.step);
             bw2.Write(z.nsx); bw2.Write(z.nsy); bw2.Write(z.nsz);
+            bw2.Write(z.cOrigin);
             int ncol = z.nsx * z.nsz;
             for (int c = 0; c < ncol; c++)
             {
@@ -238,6 +240,13 @@ namespace ProceduralTerrain
             return 0.5f * ((2*p1) + (-p0+p2)*t + (2*p0-5*p1+4*p2-p3)*t2 + (-p0+3*p1-3*p2+p3)*t3);
         }
 
+        // A/B interp for step>1 rehydration: Catmull-Rom (C1, 4-tap, smooth) vs trilinear (C0, 2-tap, cheap).
+        // Same bake file serves both ways — flip _bakeTrilinear to compare quality/serve-cost on identical data.
+        static float InterpTap(float p0, float p1, float p2, float p3, float t)
+            => _bakeTrilinear ? p1 + (p2 - p1) * t : CatmullRom(p0, p1, p2, p3, t);
+
+        static double MsBetween(long a, long b) => (b - a) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+
         // Piece 2 / v3: fused per-column reconstruction straight into the SPARSE cache — no dense buf.
         // Reorders to X → Z (into small reused temps), then reconstructs each column's Y into a tiny reused
         // float column (cache-friendly, unlike a 1.5MB volume write), band-limited (tricubic only near a
@@ -245,7 +254,9 @@ namespace ProceduralTerrain
         // Returns false (→ caller falls back to the dense path) on any bake mismatch.
         static bool PopulateSparseFromBake(int ox, int oz, int bw, int bh, int extLo, float s, int voxelFloorY, int overlap)
         {
+            long _tp0 = System.Diagnostics.Stopwatch.GetTimestamp();
             if (!TryGetBakeZone(ox, oz, out var e)) return false;
+            long _tpDec = System.Diagnostics.Stopwatch.GetTimestamp();
             if (e.bw != bw) return false;
             int owned = bw - 2 * overlap;
             int fY    = voxelFloorY;
@@ -320,6 +331,7 @@ namespace ProceduralTerrain
                 for (int ys = 0; ys < nsy; ys++)
                     raw[(xs * nsy + ys) * nsz + zs] = (ys < yLo) ? below : (ys < yLo + yLen) ? e.samples[off + (ys - yLo)] : above;
             }
+            long _tpRaw = System.Diagnostics.Stopwatch.GetTimestamp();
 
             int t1Len = bw * nsy * nsz, t2Len = bw * nsy * bw;
             if (_crTemp1.Length < t1Len) _crTemp1 = new float[t1Len];
@@ -327,24 +339,36 @@ namespace ProceduralTerrain
             var temp1 = _crTemp1;  // [cx, ys, zs]
             var temp2 = _crTemp2;  // [cx, ys, cz]  (X- and Z-expanded, coarse Y)
 
+            // Only reconstruct the owned footprint + the interp halo the upsampler actually reaches past an owned
+            // edge (2 coarse cells for Catmull-Rom, 1 for trilinear) — NOT the full overlap skirt. The skirt columns
+            // beyond that halo are never consumed (owned-only SDF cache; FindCarvedSurfaceY indexes owned), so
+            // reconstructing them is pure waste. Cuts ~⅓ off all three interp passes. (lattice unchanged: xs = cx/step)
+            int haloV = (_bakeTrilinear ? 1 : 2) * step;
+            int reconLo = Math.Max(0, overlap - haloV);
+            int reconHi = Math.Min(bw, bw - overlap + haloV);
+
             // Pass 1: expand X
             for (int ys = 0; ys < nsy; ys++)
             for (int zs = 0; zs < nsz; zs++)
-            for (int cx = 0; cx < bw; cx++)
+            for (int cx = reconLo; cx < reconHi; cx++)
             {
-                float xf = (float)cx / step; int xs = Math.Min((int)xf, nsx - 2); if (xs < 0) xs = 0; float tx = xf - xs;
+                float xf = (float)cx / step; int xsg = (int)xf; float tx = xf - xsg;
+                int xs = xsg - e.cOrigin; if (xs < 0) xs = 0; else if (xs > nsx - 2) xs = nsx - 2;
                 int xA = Math.Max(xs-1,0), xB=xs, xC=Math.Min(xs+1,nsx-1), xD=Math.Min(xs+2,nsx-1);
-                temp1[(cx*nsy+ys)*nsz+zs] = CatmullRom(raw[(xA*nsy+ys)*nsz+zs], raw[(xB*nsy+ys)*nsz+zs], raw[(xC*nsy+ys)*nsz+zs], raw[(xD*nsy+ys)*nsz+zs], tx);
+                temp1[(cx*nsy+ys)*nsz+zs] = InterpTap(raw[(xA*nsy+ys)*nsz+zs], raw[(xB*nsy+ys)*nsz+zs], raw[(xC*nsy+ys)*nsz+zs], raw[(xD*nsy+ys)*nsz+zs], tx);
             }
+            long _tpX = System.Diagnostics.Stopwatch.GetTimestamp();
             // Pass 2: expand Z (coarse Y retained)
-            for (int cx = 0; cx < bw; cx++)
+            for (int cx = reconLo; cx < reconHi; cx++)
             for (int ys = 0; ys < nsy; ys++)
-            for (int cz = 0; cz < bw; cz++)
+            for (int cz = reconLo; cz < reconHi; cz++)
             {
-                float zf = (float)cz / step; int zs = Math.Min((int)zf, nsz - 2); if (zs < 0) zs = 0; float tz = zf - zs;
+                float zf = (float)cz / step; int zsg = (int)zf; float tz = zf - zsg;
+                int zs = zsg - e.cOrigin; if (zs < 0) zs = 0; else if (zs > nsz - 2) zs = nsz - 2;
                 int zA=Math.Max(zs-1,0), zB=zs, zC=Math.Min(zs+1,nsz-1), zD=Math.Min(zs+2,nsz-1);
-                temp2[(cx*nsy+ys)*bw+cz] = CatmullRom(temp1[(cx*nsy+ys)*nsz+zA], temp1[(cx*nsy+ys)*nsz+zB], temp1[(cx*nsy+ys)*nsz+zC], temp1[(cx*nsy+ys)*nsz+zD], tz);
+                temp2[(cx*nsy+ys)*bw+cz] = InterpTap(temp1[(cx*nsy+ys)*nsz+zA], temp1[(cx*nsy+ys)*nsz+zB], temp1[(cx*nsy+ys)*nsz+zC], temp1[(cx*nsy+ys)*nsz+zD], tz);
             }
+            long _tpZ = System.Diagnostics.Stopwatch.GetTimestamp();
 
             int width = bw - 2 * overlap;
             var surfH = new float[bw * bw];
@@ -356,10 +380,12 @@ namespace ProceduralTerrain
             var colStart = new int[width * width]; var colLen = new int[width * width]; var colOff = new int[width * width];
             int total = 0, floorY = voxelFloorY;
             const float SAT = 120f;
+            long yInterpTicks = 0, encodeTicks = 0;
 
-            for (int cx = 0; cx < bw; cx++)
-            for (int cz = 0; cz < bw; cz++)
+            for (int cx = reconLo; cx < reconHi; cx++)
+            for (int cz = reconLo; cz < reconHi; cz++)
             {
+                long _ya = System.Diagnostics.Stopwatch.GetTimestamp();
                 int cb = cx * nsy;   // temp2 base: (cb+ys)*bw + cz
                 // Active coarse-Y band (near a transition); constant runs outside get nearest-neighbor.
                 int bandLo = int.MaxValue, bandHi = int.MinValue;
@@ -385,7 +411,7 @@ namespace ProceduralTerrain
                         if (ys >= bandLo && ys <= bandHi)
                         {
                             float ty = yf - ys; int yA=Math.Max(ys-1,0), yB=ys, yC=Math.Min(ys+1,nsy-1), yD=Math.Min(ys+2,nsy-1);
-                            outv = CatmullRom(temp2[(cb+yA)*bw+cz], temp2[(cb+yB)*bw+cz], temp2[(cb+yC)*bw+cz], temp2[(cb+yD)*bw+cz], ty);
+                            outv = InterpTap(temp2[(cb+yA)*bw+cz], temp2[(cb+yB)*bw+cz], temp2[(cb+yC)*bw+cz], temp2[(cb+yD)*bw+cz], ty);
                         }
                         else outv = temp2[(cb + Math.Min((int)(yf + 0.5f), nsy - 1)) * bw + cz];
                     }
@@ -394,10 +420,12 @@ namespace ProceduralTerrain
                     if (fv < 0f) sh = (extLo + cy) * s;   // ascending → ends at topmost solid
                 }
                 surfH[cx * bw + cz] = sh;
+                yInterpTicks += System.Diagnostics.Stopwatch.GetTimestamp() - _ya;
 
                 // Owned columns → emit the sparse deviating run (same transition logic as the live fill).
                 if (cx >= overlap && cx < overlap + width && cz >= overlap && cz < overlap + width)
                 {
+                    long _ea = System.Diagnostics.Stopwatch.GetTimestamp();
                     int col = (cx - overlap) * width + (cz - overlap);
                     Array.Clear(transHasOvr, 0, bh);
                     float av = colF[bh - 1];
@@ -425,13 +453,20 @@ namespace ProceduralTerrain
                     colOff[col] = total;
                     if (first < 0) { colStart[col] = -1; colLen[col] = 0; }
                     else { colStart[col] = first; int len = last - first + 1; colLen[col] = len; Array.Copy(colV, first, scratch, total, len); total += len; }
+                    encodeTicks += System.Diagnostics.Stopwatch.GetTimestamp() - _ea;
                 }
             }
+
+            long _tpY = System.Diagnostics.Stopwatch.GetTimestamp();
 
             var band = new sbyte[total]; Array.Copy(scratch, 0, band, 0, total);
             string zoneKey = $"{ox},{oz}";
             _sdfCache[zoneKey] = new ZoneField { extLo = extLo, bh = bh, width = width, colStart = colStart, colLen = colLen, colOff = colOff, band = band };
             lock (_surfHCache) _surfHCache[(ox, oz)] = (bw, extLo, s, surfH);
+            long _tpEnd = System.Diagnostics.Stopwatch.GetTimestamp();
+            double _yi = yInterpTicks * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+            double _enc = encodeTicks * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+            Log.LogInfo($"[PT-serve] ({ox},{oz}) decode={MsBetween(_tp0,_tpDec):F1} raw={MsBetween(_tpDec,_tpRaw):F1} passX={MsBetween(_tpRaw,_tpX):F1} passZ={MsBetween(_tpX,_tpZ):F1} yrecon={MsBetween(_tpZ,_tpY):F1}[yinterp={_yi:F1} encode={_enc:F1}] finalize={MsBetween(_tpY,_tpEnd):F1} total={MsBetween(_tp0,_tpEnd):F1}ms");
             return true;
         }
 
@@ -441,15 +476,27 @@ namespace ProceduralTerrain
         {
             int step = _bakeStep;
             int overlap = _overlap;
-            // step==1: store ONLY the owned WxW footprint — the overlap skirt is a live-carve device (blob
-            // fidelity across seams), consumed in-RAM during the carve and never served from a step==1 bake
-            // (every world point is owned by exactly one zone that holds its full SDF). Dropping it cuts ~43% of
-            // columns from both the file and the per-zone load loop. step>1 keeps the full grid — its tricubic
-            // load interpolation needs the skirt as the owned-border halo.
+            // The overlap skirt is a live-carve device (blob fidelity across seams), consumed in-RAM during the
+            // carve and NEVER served from a bake — every world point is owned by one zone holding its full SDF.
+            // So we store only the owned footprint, plus (step>1 only) a 2-coarse-cell interp halo, which is all the
+            // upsampler reaches past an owned edge. The full skirt is never stored at any step.
             bool dropSkirt = step == 1;
-            int gOrig = dropSkirt ? overlap : 0;                       // first stored column, in voxel coords
-            int nsx  = dropSkirt ? (bw - 2 * overlap) : (bw + step - 1) / step;
-            int nsz  = dropSkirt ? (bw - 2 * overlap) : (bw + step - 1) / step;
+            int width = bw - 2 * overlap;
+            int gOrig, cOrigin, nsx, nsz;
+            if (dropSkirt)
+            {
+                gOrig = overlap; cOrigin = 0; nsx = nsz = width;        // step==1: owned only, no interp halo
+            }
+            else
+            {
+                // owned + 2-coarse-cell halo, aligned to the voxel-0 lattice. cOrigin = global coarse index of
+                // stored column 0, so the load maps a voxel's coarse cell via xs = cx/step - cOrigin.
+                int nsFull = (bw + step - 1) / step;
+                const int haloC = 2;
+                int ownedLoC = overlap / step, ownedHiC = (overlap + width - 1) / step;
+                int cLo = Math.Max(0, ownedLoC - haloC), cHi = Math.Min(nsFull, ownedHiC + 1 + haloC);
+                gOrig = 0; cOrigin = cLo; nsx = nsz = cHi - cLo;
+            }
             int nsy  = (bh + step - 1) / step;
             int ncol = nsx * nsz;
             var colYLo   = new int[ncol];
@@ -463,8 +510,8 @@ namespace ProceduralTerrain
             for (int xs = 0; xs < nsx; xs++)
             for (int zs = 0; zs < nsz; zs++)
             {
-                int cx = dropSkirt ? (gOrig + xs) : Math.Min(xs * step, bw - 1);
-                int cz = dropSkirt ? (gOrig + zs) : Math.Min(zs * step, bw - 1);
+                int cx = dropSkirt ? (gOrig + xs) : Math.Min((cOrigin + xs) * step, bw - 1);
+                int cz = dropSkirt ? (gOrig + zs) : Math.Min((cOrigin + zs) * step, bw - 1);
                 for (int ys = 0; ys < nsy; ys++)
                 {
                     int cy = Math.Min(ys * step, bh - 1);
@@ -494,13 +541,18 @@ namespace ProceduralTerrain
             // bw stays the FULL field width (serve-eligibility check + owned math on load); nsx/nsz record the
             // actually-stored grid (owned for step==1, full for step>1).
             var z = new BakeZone {
-                extLo = extLo, bh = bh, bw = bw, step = step, nsx = nsx, nsy = nsy, nsz = nsz,
+                extLo = extLo, bh = bh, bw = bw, step = step, nsx = nsx, nsy = nsy, nsz = nsz, cOrigin = cOrigin,
                 colYLo = colYLo, colYLen = colYLen, colOff = colOff,
                 colBelow = colBelow, colAbove = colAbove, samples = packed.ToArray()
             };
-            // Bake in progress: compress (off-lock, parallel) and append straight to disk → RAM stays flat
-            // regardless of bake radius. Otherwise (live carve) keep the in-RAM staging dict.
-            if (_bakeWriteStream != null)
+            // Bake in progress: a BAKE WORKER (off the main thread — WriteBakeFile runs under Task.Run) compresses
+            // (off-lock, parallel) and appends straight to disk → RAM stays flat regardless of radius. A MAIN-THREAD
+            // call here is a LIVE carve (a connected player generating a zone while the server bakes in the
+            // background); it must NOT write into the bake file — that races the workers and corrupts the stream —
+            // so it falls to the in-RAM staging dict instead, same as a non-bake live carve.
+            bool bakeWorker = _bakeWriteStream != null
+                && System.Threading.Thread.CurrentThread.ManagedThreadId != _mainThreadId;
+            if (bakeWorker)
             {
                 var blk = SerializeZoneBlock(ox, oz, z);
                 lock (_bakeStreamLock)
@@ -594,7 +646,7 @@ namespace ProceduralTerrain
             using (var bw2 = new BinaryWriter(fs))
             {
                 bw2.Write(0x564F5846u);          // magic
-                bw2.Write((ushort)4);            // version 4 = streamed (per-zone gzip blocks + offset index)
+                bw2.Write((ushort)5);            // version 5 = streamed + owned+halo grid (per-zone cOrigin); skirt never stored
                 bw2.Write((ulong)(uint)seed);
                 bw2.Write(cfgHash);
                 long countPos = fs.Position;
@@ -633,14 +685,27 @@ namespace ProceduralTerrain
                             Plugin._bakeProgressDone = n;
                             if (n % 50 == 0 || n == toCarve.Count)
                             {
-                                float elapsed = bakeSw.ElapsedMilliseconds / 1000f;
-                                float eta = elapsed > 0f ? (toCarve.Count - n) / (n / elapsed) : 0f;
-                                Log.LogInfo($"[ProceduralTerrain] bake: {n}/{toCarve.Count} zones — {eta:F0}s remaining");
-                                var prog = new ZPackage();
-                                prog.Write(n); prog.Write(toCarve.Count);
-                                ZRoutedRpc.instance.InvokeRoutedRPC(ZRoutedRpc.Everybody, "PTBakeProgress", prog);
+                                // Progress is best-effort — a transient RPC/ZPackage hiccup must NOT abort the whole
+                                // bake (that throws out of the ForEach and leaves a half-written file). Guard it.
+                                try
+                                {
+                                    float elapsed = bakeSw.ElapsedMilliseconds / 1000f;
+                                    float eta = elapsed > 0f ? (toCarve.Count - n) / (n / elapsed) : 0f;
+                                    Log.LogInfo($"[ProceduralTerrain] bake: {n}/{toCarve.Count} zones — {eta:F0}s remaining");
+                                    var prog = new ZPackage();
+                                    prog.Write(n); prog.Write(toCarve.Count);
+                                    ZRoutedRpc.instance?.InvokeRoutedRPC(ZRoutedRpc.Everybody, "PTBakeProgress", prog);
+                                }
+                                catch (Exception pe) { Log.LogWarning($"[ProceduralTerrain] bake progress report failed (continuing): {pe.Message}"); }
                             }
                         });
+                }
+                catch (Exception bex)
+                {
+                    // An abort out of the ForEach (not a per-zone throw — those are caught above) must still fall
+                    // through to the index/footer write below, so we finalize a VALID bake of the zones completed
+                    // so far instead of leaving a headers-only file with no footer (unloadable).
+                    Log.LogError($"[ProceduralTerrain] bake aborted mid-run after {index.Count} zones; finalizing partial bake: {bex.GetType().Name}: {bex.Message}\n{bex.StackTrace}");
                 }
                 finally { _parallelBakeActive = false; _bakeWriteStream = null; _bakeWriteIndex = null; }
 
@@ -663,7 +728,7 @@ namespace ProceduralTerrain
             _bakeStream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
             _bakeFileStep = _bakeStep;
             _bakePending.Clear();
-            Log.LogInfo($"[ProceduralTerrain] Bake written (v4 streamed): {index.Count} zones, radius={radius:F0}m → {path}");
+            Log.LogInfo($"[ProceduralTerrain] Bake written (v5 streamed): {index.Count} zones, radius={radius:F0}m → {path}");
         }
 
         // ── Hot-reload: re-run the full voxel pipeline on every loaded zone ───────
@@ -699,6 +764,7 @@ namespace ProceduralTerrain
             _sdfCache.Clear();
             _heightCache.Clear();
             VanillaHeight.Clear();
+            ClearComposedSurfCache();
             lock (_surfHCache) _surfHCache.Clear();
             _zoneFaceCache.Clear();
 
