@@ -71,6 +71,9 @@ namespace ProceduralTerrain
         // replaces the coarse-interpolated baseline with a full-res one (kills coarse faceting/cliffs)
         // by adding BL(addh_coarse) - SampleBaselineFull() per column. Cost: +1 GetHeight per column.
         public virtual bool SurfaceAnchored => false;
+        // True for modes that read the running field as a true DISTANCE field (SDF→SDF ops), so the per-mode
+        // eikonal redistance only runs when a zone actually has such a mode active. Only surface_blobs needs it.
+        public virtual bool NeedsEikonal => false;
         // Recompute this mode's surface baseline (addh, world units) at the full-res column position
         // col.worldX/worldZ, using BL-interpolated cell params. Only called when SurfaceAnchored && toggle on.
         public virtual float SampleBaselineFull(ref CarveBuffers cb, in ColumnCtx col, WorldGenerator? wg) => 0f;
@@ -389,6 +392,7 @@ namespace ProceduralTerrain
     // eikonal=true so |D| is metric (uniform ball size). BakeColumn is a no-op — composed specially.
     internal sealed class SurfaceBlobs : NativeModeDef
     {
+        public override bool NeedsEikonal => true;   // SDF→SDF operator: reads the running field as a distance metric
         static readonly (string, float)[] _spec = {
             ("amplitude", 3f),    // MAX ball radius (world units); also the on/off gate
             ("frequency", 0.05f), // lattice density (lump scale)
@@ -763,6 +767,8 @@ namespace ProceduralTerrain
         // ── SDF bake ─────────────────────────────────────────────────────────────
         static float _bakeRadius = 0f;
         static int   _bakeStep   = 8;
+        internal static bool _bakeVanilla = false;  // false = skip unmodified (no active mode) zones from the bake file; they carve live via VanillaFill (~11ms) and don't inflate the bake. true = bake every zone.
+        internal static System.Collections.Generic.HashSet<Heightmap.Biome> _modifiedBiomes = new System.Collections.Generic.HashSet<Heightmap.Biome>();  // biomes with an active-mode profile; a zone touching none is pure vanilla (skip the blend)
         // Sparse per-zone bake (file v3). Per coarse column (col = xs*nsz + zs) we store only the
         // non-saturated band [colYLo .. colYLo+colYLen) plus the saturated fill below/above it. `step` is
         // PER ZONE: step==1 ⇒ band samples are already full-res (load skips reconstruct); step>1 ⇒ load

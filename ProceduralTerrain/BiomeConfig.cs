@@ -349,6 +349,8 @@ namespace ProceduralTerrain
                             _bakeStep = Mathf.Clamp(bs, 1, 64);
                         if (k == "compressbake")
                             _compressBake = !(v == "0" || v == "false");
+                        if (k == "bakevanilla")
+                            _bakeVanilla = !(v == "0" || v == "false");
                         if (k == "noise_count" && int.TryParse(v, out int nc))
                         {
                             nc = Mathf.Clamp(nc, 10, 256);
@@ -422,6 +424,15 @@ namespace ProceduralTerrain
                 newBiomeParams[biome2] = modeParams;
             }
             _biomeParams = newBiomeParams;
+
+            // Biomes whose assigned profile has at least one mode with a nonzero amplitude gate ([0] param).
+            // A zone touching none of these (center+corners, blend-radius expanded) is pure vanilla and can
+            // skip BakeBlendedProfiles + all mode machinery → straight to VanillaFill.
+            var modified = new HashSet<Heightmap.Biome>();
+            foreach (var (b2, mp) in newBiomeParams)
+                for (int mi = 0; mi < mp.Length; mi++)
+                    if (mp[mi] != null && mp[mi].Length > 0 && mp[mi][0] > 0f) { modified.Add(b2); break; }
+            Plugin._modifiedBiomes = modified;
 
             WarnNyquistFrequencies();
 

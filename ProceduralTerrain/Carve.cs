@@ -98,10 +98,28 @@ namespace ProceduralTerrain
             // (coarseMult>1), stepping vs the neighbor zone. No-op at coarseMult=1 (clamp never triggers).
             int cw4Early = (bwEarly + CellVox - 1) / CellVox + 1;
 
+            // Cheap pre-check: if no modified biome is within blend-reach of this zone, it's pure vanilla —
+            // skip the supersampled blend AND all mode machinery, carve straight from the heightmap (VanillaFill).
+            // Sample center + 4 corners expanded by the blend radius (so border zones still take the full path).
+            bool knownVanilla = false;
+            if (wg != null && _modifiedBiomes.Count > 0)
+            {
+                float m = width * s * 0.5f + _biomeBlendRadius + _coastFade;
+                knownVanilla = !_modifiedBiomes.Contains(wg.GetBiome(zoneX, zoneZ))
+                    && !_modifiedBiomes.Contains(wg.GetBiome(zoneX - m, zoneZ - m))
+                    && !_modifiedBiomes.Contains(wg.GetBiome(zoneX + m, zoneZ - m))
+                    && !_modifiedBiomes.Contains(wg.GetBiome(zoneX - m, zoneZ + m))
+                    && !_modifiedBiomes.Contains(wg.GetBiome(zoneX + m, zoneZ + m));
+            }
+            else if (_modifiedBiomes.Count == 0)
+            {
+                knownVanilla = true;   // no biome has active modes at all (e.g. floor-test config)
+            }
+
             long _tbbp = System.Diagnostics.Stopwatch.GetTimestamp();
-            if (wg != null) BakeBlendedProfiles(cw4Early, ox, oz, overlap, s, wg);
+            if (wg != null && !knownVanilla) BakeBlendedProfiles(cw4Early, ox, oz, overlap, s, wg);
             double bbpMs = (System.Diagnostics.Stopwatch.GetTimestamp() - _tbbp) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
-            if (bbpMs > 3.0) Log.LogInfo($"[PT-load] BakeBlendedProfiles ({ox},{oz}) = {bbpMs:F2}ms cw4Early={cw4Early} (runs for EVERY zone incl. baked)");
+            if (bbpMs > 3.0) Log.LogInfo($"[PT-load] BakeBlendedProfiles ({ox},{oz}) = {bbpMs:F2}ms cw4Early={cw4Early}");
 
             CaveProfile ProfAt(int cx4, int cz4) =>
                 (_blendedProfs != null && cx4 * cw4Early + cz4 < _blendedProfs.Length)
@@ -123,6 +141,7 @@ namespace ProceduralTerrain
             }
 
             int hiMargin = 24, loMargin = 24;
+            if (!knownVanilla)   // vanilla zones: _blendedProfs is stale (blend skipped) → default margins
             {
                 float maxExtM = 0f, maxFloor = 0f;
                 // Floor + extendUp margins from blended profile-level params (per-zone, per-biome)
@@ -156,6 +175,7 @@ namespace ProceduralTerrain
             long _ph0 = System.Diagnostics.Stopwatch.GetTimestamp();
             long _phSetup = _ph0, _phFill = _ph0, _phBlur = _ph0, _phIsland = _ph0, _phPocket = _ph0,
                  _phStage = _ph0, _phSurf = _ph0, _phSparse = _ph0;
+            bool anyPipelineActive = false;   // assigned after BakeSdfSetup populates _cb.bkModeParams
             if (!fromBake)
             {
             InitNoise();
@@ -164,9 +184,12 @@ namespace ProceduralTerrain
             BakeSdfSetup(ox, oz, overlap, s, extLo, bh, bw, cw4, wg, nearbyLocs, heightGrid);
             _phSetup = System.Diagnostics.Stopwatch.GetTimestamp();
 
-            bool anyPipelineActive = _pipeline.Length > 0 && _cb.bkModeParams != null &&
+            anyPipelineActive = !knownVanilla && _pipeline.Length > 0 && _cb.bkModeParams != null &&
                 _pipeline.Any(m => _cb.bkModeParams![m.PipelineIndex][0].Any(v => v > 0f));
-            FillPhase1(buf, bw, bh, extLo, s, ox, oz, overlap, wg, cw4, nearbyLocs, heightGrid);
+            if (anyPipelineActive)
+                FillPhase1(buf, bw, bh, extLo, s, ox, oz, overlap, wg, cw4, nearbyLocs, heightGrid);
+            else
+                VanillaFill(buf, bw, bh, extLo, s, ox, oz, overlap, wg, heightGrid);   // no active modes → emit the base surface directly (skip compose/upsample)
             _phFill = System.Diagnostics.Stopwatch.GetTimestamp();
 
             CaveProfile blurProf = centerProf;
@@ -256,7 +279,7 @@ namespace ProceduralTerrain
             }
             _phBlur = System.Diagnostics.Stopwatch.GetTimestamp();
 
-            if (_islandRemoval) {
+            if (_islandRemoval && anyPipelineActive) {   // vanilla heightfield has no floating solid → skip the flood
                 int islandBufSize = bw * bh * bw;
                 int stride_x      = bh * bw;
                 int terNegX25 = overlap;
@@ -408,7 +431,7 @@ namespace ProceduralTerrain
             }
             _phIsland = System.Diagnostics.Stopwatch.GetTimestamp();
 
-            if (_pocketRemoval) {
+            if (_pocketRemoval && anyPipelineActive) {   // vanilla heightfield has no sealed air pockets → skip the flood
                 Array.Clear(_cb.visitedBuf!, 0, bw * bh * bw);
                 int stride_x = bh * bw;
                 int qHead = 0, qTail = 0;
@@ -462,7 +485,7 @@ namespace ProceduralTerrain
 
             } // end if (!fromBake)
 
-            if (!fromBake)
+            if (!fromBake && _bakeWriteStream != null && (_bakeVanilla || anyPipelineActive))   // stage only during an actual bake; by default skip unmodified zones (carve live, keep them out of the bake file)
                 StageBakeEntry(ox, oz, bw, bh, extLo, s, buf);
             _phStage = System.Diagnostics.Stopwatch.GetTimestamp();
 
@@ -1148,6 +1171,17 @@ namespace ProceduralTerrain
                     for (int cyc = 0; cyc < ch; cyc++) _runSDF![cbaseC + cyc] = (extLoS2 + cyc * yStep) - hCell;
                 }
 
+                // Eikonal redistance is only needed if a mode in THIS zone reads the running field as a distance
+                // metric (surface_blobs). Non-blob zones (meadows/BF/swamp) skip it entirely — big per-zone save.
+                bool needsEikonal = _eikonal;
+                if (needsEikonal)
+                {
+                    needsEikonal = false;
+                    foreach (var m in pipeline)
+                        if (m.NeedsEikonal && m.PipelineIndex >= 0
+                            && _cb.bkModeParams![m.PipelineIndex][0].Any(v => v > 0f)) { needsEikonal = true; break; }
+                }
+
                 // (2) per mode: [derive incoming] -> bake -> compose -> redistance.
                 foreach (var mode in pipeline)
                 {
@@ -1700,7 +1734,7 @@ namespace ProceduralTerrain
                             }
                         }
                         Log.LogInfo($"[PT-blobs] centers={centers.Count} L={L:F0} rad=[{minR:F1},{maxR:F1}] stretchN={stretchN:F1} carve={carve} branches={branchEvents} branchprob={branchProb:F2} flow={flowSteer:F2} hub={hubSeek:F2} maxreach={maxChainReach:F0}m ridgeratio={ridgeRatio:F1} solidVoxels={dbgHit} curv=[{curvMin:F3},{curvMax:F3}]");
-                        if (_eikonal) RedistanceEikonal(_runSDF!, cw4, cw4, ch, xzStep, xzStep, yStep, 2);
+                        if (needsEikonal) RedistanceEikonal(_runSDF!, cw4, cw4, ch, xzStep, xzStep, yStep, 2);
                         continue;
                     }
 
@@ -1780,7 +1814,7 @@ namespace ProceduralTerrain
                     // redistance so the next mode reads a true distance field — only when enabled
                     // (current modes read zero-crossing elevation/normal, which don't need |grad|=1;
                     // this per-mode pass is what makes fine coarseXZ explode, so it's off by default).
-                    if (_eikonal) RedistanceEikonal(_runSDF!, cw4, cw4, ch, xzStep, xzStep, yStep, 2);
+                    if (needsEikonal) RedistanceEikonal(_runSDF!, cw4, cw4, ch, xzStep, xzStep, yStep, 2);
                 }
             }
         }
@@ -2275,6 +2309,28 @@ namespace ProceduralTerrain
                 h = addh + (found ? droot : 0f);
             }
             return h;
+        }
+
+        // Fast path for zones with NO active modes (vanilla / Ocean / any unmodified biome): fill buf with the
+        // base-ground SDF per column directly from Voxheim's heights (groundwork already baked into heightGrid) —
+        // no coarse running field, no trilinear upsample, no mode compose. The surface is a heightfield, so there's
+        // nothing to compose and (with island/pocket also skipped) no flood. ~56ms FillPhase1 → a few ms here.
+        static void VanillaFill(float[] buf, int bw, int bh, int extLo, float s,
+            int ox, int oz, int overlap, WorldGenerator? wg, Voxheim.Core.HeightGrid? heightGrid)
+        {
+            int owned = bw - 2 * overlap;
+            for (int cx = 0; cx < bw; cx++)
+            for (int cz = 0; cz < bw; cz++)
+            {
+                int ix = cx - overlap, iz = cz - overlap;
+                float h;
+                if (heightGrid != null && ix >= 0 && ix < owned && iz >= 0 && iz < owned)
+                    h = heightGrid[ix, iz] * s;                                   // owned: Voxheim heights (groundwork baked in)
+                else
+                    h = wg != null ? GroundHeight((ox - overlap + cx) * s, (oz - overlap + cz) * s, wg) : 0f;  // skirt: vanilla
+                for (int cy = 0; cy < bh; cy++)
+                    buf[(cx * bh + cy) * bw + cz] = (extLo + cy) * s - h;         // SDF: >0 air above the surface, <0 solid below
+            }
         }
 
         static void FillPhase1(float[] buf, int bw, int bh, int extLo, float s,
