@@ -23,6 +23,7 @@ namespace ProceduralTerrain
             "coarsexz", "coarsey", "bakeradius", "debugviz", "debugvizocclude", "hidelodmeshes",
             "disablevegetation", "applygroundwork", "protectlocations", "flatplanelocations",
             "vegetationconform", "vegmaxtilt", "seed",
+            "prefetch", "prefetchradius", "prefetchthreads",
         };
 
         internal static uint ComputeCfgHash()

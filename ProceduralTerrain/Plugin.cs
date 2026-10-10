@@ -701,6 +701,12 @@ namespace ProceduralTerrain
         // World units per voxel — read lazily, Voxheim initialises it after plugin load.
         static FieldInfo? _scaleField;
         internal static float? _scale;
+        internal static float ActiveScale()
+        {
+            if (_scale is { } v && v > 0f) return v;
+            if (_scaleField != null && _scaleField.GetValue(null) is float sf && sf > 0f) return sf;
+            return 1f;
+        }
 
         // ── Debug flags ───────────────────────────────────────────────────────────
         internal static volatile bool _disableVegetation;
@@ -1363,6 +1369,10 @@ namespace ProceduralTerrain
                 _hotReloadPending = false;
                 RecarveAll();
             }
+
+            // Demand-driven carve: the SpawnZone gate (SpawnZonePrefetchGate) requests carves as ZoneSystem
+            // asks for zones and makes it retry until ready — no racing ring. Just keep workers alive.
+            if (ZonePrefetcher.Enabled) ZonePrefetcher.Start();   // idempotent
 
             // Fast-poll while waiting for locations to finish generating (the time-sliced coroutine
             // fills them over several frames); BuildLocationCache no-ops until ZoneSystem reports

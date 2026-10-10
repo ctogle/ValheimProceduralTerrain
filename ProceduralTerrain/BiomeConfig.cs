@@ -296,6 +296,12 @@ namespace ProceduralTerrain
                             _vegMaxTilt = Mathf.Clamp(vmt, 0f, 90f);
                         if (k == "seed")
                             _forcedSeed = string.IsNullOrWhiteSpace(v) ? null : v.Trim();
+                        if (k == "prefetch")
+                            ZonePrefetcher.Enabled = (v == "1" || v == "true");
+                        if (k == "prefetchradius" && int.TryParse(v, out int prr))
+                            ZonePrefetcher.RadiusZones = Mathf.Clamp(prr, 1, 16);
+                        if (k == "prefetchthreads" && int.TryParse(v, out int prt))
+                            ZonePrefetcher.ThreadCount = Mathf.Clamp(prt, 0, 32);
                         if (k == "protectlocations")
                             _protectLocations = !(v == "0" || v == "false");
                         if (k == "applygroundwork")

@@ -1007,16 +1007,25 @@ namespace ProceduralTerrain
         }
 
         // ── Placement height ──────────────────────────────────────────────────────────
+        // Zone-grid origin (voxel coords) for a world point — MUST match how Carve/Voxheim key _sdfCache/_surfHCache
+        // (origins are 64*k + gridOffset, gridOffset = ((-(int)(32/s)) mod 64); e.g. 64k+32 at s=1). The old
+        // `gx - gx%64` form (offset 0) silently missed every lookup → location snapping + veg-conform no-op'd.
+        internal static (int ox, int oz) ZoneOriginFromWorld(float worldX, float worldZ, float s)
+        {
+            const int width = 64;
+            int gridOffset = ((-(int)(32f / s)) % width + width) % width;
+            int ox = (int)Math.Floor((worldX / s - gridOffset) / width) * width + gridOffset;
+            int oz = (int)Math.Floor((worldZ / s - gridOffset) / width) * width + gridOffset;
+            return (ox, oz);
+        }
+
         internal static float FindCarvedSurfaceY(float worldX, float originalY, float worldZ)
         {
-            float s = _scale is { } v && v > 0f ? v
-                    : _scaleField != null && _scaleField.GetValue(null) is float sf && sf > 0f ? sf
-                    : 1f;
-            int overlap = _overlap; const int width = 64;
+            float s = ActiveScale();
+            int overlap = _overlap;
             int gx = Mathf.RoundToInt(worldX / s);
             int gz = Mathf.RoundToInt(worldZ / s);
-            int ox = gx - ((gx % width + width) % width);
-            int oz = gz - ((gz % width + width) % width);
+            var (ox, oz) = ZoneOriginFromWorld(worldX, worldZ, s);
             (int bw, int extLo, float zs, float[] surfH) entry;
             lock (_surfHCache)
                 if (!_surfHCache.TryGetValue((ox, oz), out entry)) return originalY;
@@ -1029,12 +1038,7 @@ namespace ProceduralTerrain
         // Zone key (ox,oz) that TrySampleSurfaceY will look up for a world point — for diagnostics.
         internal static string SurfKeyFor(float worldX, float worldZ)
         {
-            float s = _scale is { } v && v > 0f ? v
-                    : _scaleField != null && _scaleField.GetValue(null) is float sf && sf > 0f ? sf : 1f;
-            const int width = 64;
-            int gx = Mathf.RoundToInt(worldX / s), gz = Mathf.RoundToInt(worldZ / s);
-            int ox = gx - ((gx % width + width) % width);
-            int oz = gz - ((gz % width + width) % width);
+            var (ox, oz) = ZoneOriginFromWorld(worldX, worldZ, ActiveScale());
             string present;
             lock (_surfHCache) { var ks = new List<string>(); foreach (var k in _surfHCache.Keys) { ks.Add($"({k.Item1},{k.Item2})"); if (ks.Count >= 4) break; } present = string.Join(",", ks); }
             return $"({ox},{oz}) present[{present}]";
@@ -1045,13 +1049,11 @@ namespace ProceduralTerrain
         internal static bool TrySampleSurfaceY(float worldX, float worldZ, out float sh)
         {
             sh = 0f;
-            float s = _scale is { } v && v > 0f ? v
-                    : _scaleField != null && _scaleField.GetValue(null) is float sf && sf > 0f ? sf : 1f;
-            int overlap = _overlap; const int width = 64;
+            float s = ActiveScale();
+            int overlap = _overlap;
             int gx = Mathf.RoundToInt(worldX / s);
             int gz = Mathf.RoundToInt(worldZ / s);
-            int ox = gx - ((gx % width + width) % width);
-            int oz = gz - ((gz % width + width) % width);
+            var (ox, oz) = ZoneOriginFromWorld(worldX, worldZ, s);
             (int bw, int extLo, float zs, float[] surfH) entry;
             lock (_surfHCache)
                 if (!_surfHCache.TryGetValue((ox, oz), out entry)) return false;
@@ -2514,6 +2516,47 @@ namespace ProceduralTerrain
                 $"Only affects NEW worlds; existing saves keep their seed. Remove the cfg line to restore normal. ═════════");
             __instance.m_seedName = forced;
             __instance.m_seed     = newSeed;
+        }
+    }
+
+    // Demand-gate: make ZoneSystem.SpawnZone wait for our SDF the same way it already waits for the async
+    // heightmap (IsTerrainReady → return false → retry next tick). First time a Full/Ghost zone is generated,
+    // if our carve isn't cached we kick it off (background) and skip — ZoneSystem retries until it's ready, then
+    // SpawnZone runs with surfH present so PlaceVegetation (and location snapping) conform to the voxel surface.
+    // No racing ring, no worker-count balancing: worker count is pure throughput (ghost-ring fill speed).
+    [HarmonyPatch]
+    static class SpawnZonePrefetchGate
+    {
+        static MethodBase? TargetMethod() =>
+            typeof(ZoneSystem).GetMethod("SpawnZone", BindingFlags.NonPublic | BindingFlags.Instance);
+        static readonly MethodInfo? _isGen =
+            typeof(ZoneSystem).GetMethod("IsZoneGenerated", BindingFlags.NonPublic | BindingFlags.Instance);
+        static readonly Dictionary<(int, int), int> _misses = new();
+        const int MaxMisses = 150;   // ZoneSystem ticks ~10/s → ~15s cap before falling through to vanilla
+
+        static bool Prefix(ZoneSystem __instance, Vector2s zoneID, ZoneSystem.SpawnMode mode,
+                           out GameObject root, ref bool __result)
+        {
+            root = null;
+            if (!ZonePrefetcher.Enabled) return true;                       // feature off → vanilla
+            if (mode != ZoneSystem.SpawnMode.Full && mode != ZoneSystem.SpawnMode.Ghost) return true;
+            if (_isGen != null && (bool)_isGen.Invoke(__instance, new object[] { zoneID })!) return true;  // already generated → don't block revisits
+
+            var (ox, oz) = ZonePrefetcher.ZoneOrigin(zoneID.x, zoneID.y);
+            var key = (zoneID.x, zoneID.y);
+            if (ZonePrefetcher.IsReady(ox, oz)) { _misses.Remove(key); return true; }   // carved → proceed, conform works
+
+            _misses.TryGetValue(key, out int m);
+            if (m >= MaxMisses)                                             // carve stuck/failed → don't wedge the zone
+            {
+                Plugin.Log.LogWarning($"[PT-prefetch] gate giving up on zone ({ox},{oz}) after {m} retries — vanilla placement.");
+                _misses.Remove(key);
+                return true;
+            }
+            _misses[key] = m + 1;
+            ZonePrefetcher.Request(ox, oz);
+            __result = false;                                               // not spawned → ZoneSystem retries next tick
+            return false;
         }
     }
 
