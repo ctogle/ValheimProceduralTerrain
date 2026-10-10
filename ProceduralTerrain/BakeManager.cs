@@ -16,6 +16,15 @@ namespace ProceduralTerrain
     {
         // ── SDF bake helpers ─────────────────────────────────────────────────────
 
+        // Keys excluded from the bake hash: live/render-only, location-overlay (applied live, never baked), and
+        // the seed (captured in the bake filename's seed field). Exact-match so param names can't collide.
+        static readonly HashSet<string> _hashExcludedKeys = new(StringComparer.OrdinalIgnoreCase)
+        {
+            "coarsexz", "coarsey", "bakeradius", "debugviz", "debugvizocclude", "hidelodmeshes",
+            "disablevegetation", "applygroundwork", "protectlocations", "flatplanelocations",
+            "vegetationconform", "vegmaxtilt", "seed",
+        };
+
         internal static uint ComputeCfgHash()
         {
             if (_serverCfgHash.HasValue) return _serverCfgHash.Value;
@@ -27,13 +36,16 @@ namespace ProceduralTerrain
             uint hash = 2166136261u;
             foreach (var rawLine in File.ReadAllLines(path))
             {
-                string t = rawLine.TrimStart().ToLowerInvariant();
-                // Live/render-only knobs + location-overlay knobs (the bake is purely procedural — groundwork/
-                // location protection are applied live at load, never frozen in) → excluded so tuning them doesn't
-                // invalidate a bake. (debugviz covers debugviz + debugvizocclude via prefix.)
-                if (t.StartsWith("coarsexz") || t.StartsWith("coarsey") || t.StartsWith("bakeradius") ||
-                    t.StartsWith("debugviz") || t.StartsWith("hidelodmeshes") || t.StartsWith("disablevegetation") ||
-                    t.StartsWith("applygroundwork") || t.StartsWith("protectlocations") || t.StartsWith("flatplanelocations")) continue;
+                // Exclude live/render-only + location-overlay + seed knobs by EXACT key (not line-prefix, which
+                // collided: seed vs seedFrac/seedR/seeds, coarseXZ vs bakeCoarseXZ). These don't affect baked bytes
+                // (the bake is purely procedural; groundwork/protection/vegetation/seed are applied live or keyed
+                // into the filename separately), so tuning them must not invalidate a bake.
+                int eq = rawLine.IndexOf('=');
+                if (eq > 0)
+                {
+                    string key = rawLine.Substring(0, eq).Trim().ToLowerInvariant();
+                    if (_hashExcludedKeys.Contains(key)) continue;
+                }
                 foreach (char c in rawLine) hash = (hash ^ (byte)c) * 16777619u;
                 hash = (hash ^ (byte)'\n') * 16777619u;
             }
@@ -94,6 +106,10 @@ namespace ProceduralTerrain
                         int cnt = (int)pr.ReadUInt32();
                         fs.Seek(-8, SeekOrigin.End);
                         long indexOff = pr.ReadInt64();
+                        // An interrupted bake leaves cnt=0 (placeholder never patched) and no index/footer, so
+                        // indexOff is garbage. Reject cleanly → live carve, instead of seeking to a bad offset.
+                        if (cnt <= 0 || indexOff < 18 || indexOff >= fs.Length)
+                        { Log.LogWarning($"[ProceduralTerrain] bake: incomplete/corrupt (cnt={cnt}, indexOff={indexOff}) — likely an interrupted bake. Ignoring; rebake."); fs.Dispose(); return; }
                         fs.Seek(indexOff, SeekOrigin.Begin);
                         var idx = new Dictionary<(int, int), (long, int)>(cnt);
                         for (int i = 0; i < cnt; i++)
@@ -757,8 +773,11 @@ namespace ProceduralTerrain
             // appended straight from its bake worker (StageBakeEntry → _bakeWriteStream) so peak RAM stays flat
             // regardless of radius; finally the offset index + footer. The zone count isn't known up front
             // (streamed), so it's written as a placeholder and patched in after the carve.
+            // Write to a temp file and promote on success, so a killed/interrupted bake can't clobber an existing
+            // good bake (what bit us once: an aborted 10k overwrote a working 5k, leaving cnt=0 + no footer).
+            string tmpPath = path + ".tmp";
             var index = new List<(int ox, int oz, long off, int len)>(toCarve.Count + preserved.Count);
-            using (var fs = new FileStream(path, FileMode.Create, FileAccess.ReadWrite, FileShare.None, 1 << 20))
+            using (var fs = new FileStream(tmpPath, FileMode.Create, FileAccess.ReadWrite, FileShare.None, 1 << 20))
             using (var bw2 = new BinaryWriter(fs))
             {
                 bw2.Write(0x564F5846u);          // magic
@@ -839,6 +858,12 @@ namespace ProceduralTerrain
                 bw2.Write((uint)index.Count);    // patch the real zone count
                 bw2.Flush();
             }
+
+            // Footer written → the temp file is a complete, valid bake. Promote it over any prior bake atomically
+            // (reaching here means we didn't die mid-write; a killed process leaves the .tmp and the old file intact).
+            CloseBakeStream();   // release any read handle on the target so the delete/rename isn't blocked by our own lock
+            if (File.Exists(path)) File.Delete(path);
+            File.Move(tmpPath, path);
 
             // Switch straight to streaming from the file we just wrote (it was written incrementally, never
             // held whole in RAM) — reopen read-only and index by offset.

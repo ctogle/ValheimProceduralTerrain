@@ -1026,6 +1026,43 @@ namespace ProceduralTerrain
             return float.IsNaN(sh) ? originalY : Mathf.Max(originalY, sh);
         }
 
+        // Zone key (ox,oz) that TrySampleSurfaceY will look up for a world point — for diagnostics.
+        internal static string SurfKeyFor(float worldX, float worldZ)
+        {
+            float s = _scale is { } v && v > 0f ? v
+                    : _scaleField != null && _scaleField.GetValue(null) is float sf && sf > 0f ? sf : 1f;
+            const int width = 64;
+            int gx = Mathf.RoundToInt(worldX / s), gz = Mathf.RoundToInt(worldZ / s);
+            int ox = gx - ((gx % width + width) % width);
+            int oz = gz - ((gz % width + width) % width);
+            string present;
+            lock (_surfHCache) { var ks = new List<string>(); foreach (var k in _surfHCache.Keys) { ks.Add($"({k.Item1},{k.Item2})"); if (ks.Count >= 4) break; } present = string.Join(",", ks); }
+            return $"({ox},{oz}) present[{present}]";
+        }
+
+        // Raw voxel surface Y at a world point (highest solid), or false if that zone's surfH isn't cached yet.
+        // Used by the vegetation-conform patch to snap height and build a finite-diff surface normal.
+        internal static bool TrySampleSurfaceY(float worldX, float worldZ, out float sh)
+        {
+            sh = 0f;
+            float s = _scale is { } v && v > 0f ? v
+                    : _scaleField != null && _scaleField.GetValue(null) is float sf && sf > 0f ? sf : 1f;
+            int overlap = _overlap; const int width = 64;
+            int gx = Mathf.RoundToInt(worldX / s);
+            int gz = Mathf.RoundToInt(worldZ / s);
+            int ox = gx - ((gx % width + width) % width);
+            int oz = gz - ((gz % width + width) % width);
+            (int bw, int extLo, float zs, float[] surfH) entry;
+            lock (_surfHCache)
+                if (!_surfHCache.TryGetValue((ox, oz), out entry)) return false;
+            int cx = Mathf.Clamp(gx - (ox - overlap), 0, entry.bw - 1);
+            int cz = Mathf.Clamp(gz - (oz - overlap), 0, entry.bw - 1);
+            float v2 = entry.surfH[cx * entry.bw + cz];
+            if (float.IsNaN(v2)) return false;
+            sh = v2;
+            return true;
+        }
+
         // ── BakeSdfSetup ─────────────────────────────────────────────────────────
         static void BakeSdfSetup(
             int ox, int oz, int overlap, float s, int extLo, int bh, int bw, int cw4,
@@ -2454,6 +2491,32 @@ namespace ProceduralTerrain
         }
     }
 
+    // Optional cfg-forced world seed (testing aid). Hooks the NEW-WORLD ctor `World(string name, string seed)`
+    // ONLY — the load path is `World(SaveWithBackups ...)`, which we never touch, so an existing world always
+    // keeps its saved seed regardless of the current cfg. Forcing it here matches the UI's seed-string path
+    // (m_seed = GetStableHashCode(name)); WorldGenerator + our WorldSeed() both read m_seed, so everything aligns.
+    // Not in the bake hash and not hot-reloadable into a live world by design — the seed is baked into the world.
+    [HarmonyPatch(typeof(World), MethodType.Constructor, new System.Type[] { typeof(string), typeof(string) })]
+    static class ForceSeedPatch
+    {
+        static void Postfix(World __instance)
+        {
+            string? forced = Plugin._forcedSeed;
+            // Skip empty-seed worlds: GetMenuWorld/GetEditorWorld use new World("menu"/"editor", "") — forcing a
+            // seed there hijacks (and breaks) the menu-background preview. Real new worlds always arrive with a
+            // non-empty seed (GetCreateWorld → GenerateSeed()), so this still forces every genuine new world.
+            if (string.IsNullOrEmpty(forced) || __instance == null ||
+                string.IsNullOrEmpty(__instance.m_seedName) || __instance.m_seedName == forced) return;
+            int newSeed = StringExtensionMethods.GetStableHashCode(forced);
+            Plugin.Log.LogWarning(
+                $"════════ PT SEED OVERRIDE ════════ new world forced to seed \"{forced}\" (hash {newSeed:X8}) " +
+                $"from pt cfg [Debug] seed= — typed seed \"{__instance.m_seedName}\" ({__instance.m_seed:X8}) ignored. " +
+                $"Only affects NEW worlds; existing saves keep their seed. Remove the cfg line to restore normal. ═════════");
+            __instance.m_seedName = forced;
+            __instance.m_seed     = newSeed;
+        }
+    }
+
     [HarmonyPatch]
     static class PlaceVegetationPatch
     {
@@ -2461,7 +2524,56 @@ namespace ProceduralTerrain
             typeof(ZoneSystem).GetMethod("PlaceVegetation",
                 BindingFlags.NonPublic | BindingFlags.Instance);
 
-        static bool Prefix() => !Plugin._disableVegetation;
+        static bool Prefix()
+        {
+            if (Plugin._disableVegetation) return false;   // skip entirely
+            Plugin._inVegPlacement = true;                 // scope the GetGroundData postfix to this call
+            return true;
+        }
+        static void Postfix() => Plugin._inVegPlacement = false;
+    }
+
+    // Vanilla vegetation placement samples the 2.5D heightmap via GetGroundData (it raycasts a collider with a
+    // Heightmap component — our voxel mesh has none). So trees land at heightmap height/normal, blind to our 3D
+    // terrain: under overhangs (trunk into earth above) and on voxel walls (gentle heightmap normal passes the
+    // tilt gate). Scoped to PlaceVegetation, we rewrite the sampled point to the voxel surface + voxel normal so
+    // vanilla's own altitude/tilt gates do the right thing, and hard-reject anything steeper than vegMaxTilt.
+    [HarmonyPatch]
+    static class GetGroundDataConformPatch
+    {
+        static MethodBase? TargetMethod() =>
+            typeof(ZoneSystem).GetMethod("GetGroundData",
+                BindingFlags.Public | BindingFlags.Instance);
+
+        static int _diag;
+        static void Postfix(ref Vector3 p, ref Vector3 normal)
+        {
+            if (!Plugin._inVegPlacement || !Plugin._vegetationConform) return;
+            bool diag = _diag < 40;
+            if (!Plugin.TrySampleSurfaceY(p.x, p.z, out float sh))
+            {
+                if (diag) { _diag++; Plugin.Log.LogInfo($"[PT-veg] ({p.x:F0},{p.z:F0}) surfH MISS → vanilla normal.y={normal.y:F2}  [cache={Plugin._surfHCache.Count} zones, want key={Plugin.SurfKeyFor(p.x, p.z)}]"); }
+                return;   // zone not carved yet → leave vanilla
+            }
+            float oldY = p.y;
+            p.y = sh;                                                        // snap to the voxel surface (highest solid)
+
+            // Finite-diff voxel normal from the surfH field. A sheer wall or overhang edge produces a huge
+            // gradient → near-horizontal normal → vanilla's `normal.y < cos(maxTilt)` gate rejects it.
+            const float d = 2f;
+            if (Plugin.TrySampleSurfaceY(p.x + d, p.z, out float hpx) && Plugin.TrySampleSurfaceY(p.x - d, p.z, out float hmx) &&
+                Plugin.TrySampleSurfaceY(p.x, p.z + d, out float hpz) && Plugin.TrySampleSurfaceY(p.x, p.z - d, out float hmz))
+            {
+                float dydx = (hpx - hmx) / (2f * d), dydz = (hpz - hmz) / (2f * d);
+                Vector3 n = new Vector3(-dydx, 1f, -dydz).normalized;
+                normal = n;
+                bool reject = n.y < Mathf.Cos(Mathf.Deg2Rad * Plugin._vegMaxTilt);
+                // Stricter-than-vanilla cutoff: force horizontal (y=0) so the existing tilt gate drops it.
+                if (reject) normal = new Vector3(1f, 0f, 0f);
+                if (diag) { _diag++; Plugin.Log.LogInfo($"[PT-veg] ({p.x:F0},{p.z:F0}) snapY {oldY:F1}→{sh:F1} n.y={n.y:F2} {(reject ? "REJECT" : "keep")} (surfH {hmx:F1}/{hpx:F1}/{hmz:F1}/{hpz:F1})"); }
+            }
+            else if (diag) { _diag++; Plugin.Log.LogInfo($"[PT-veg] ({p.x:F0},{p.z:F0}) snapY {oldY:F1}→{sh:F1} but neighbor surfH MISS → normal untouched"); }
+        }
     }
 
     [HarmonyPatch]

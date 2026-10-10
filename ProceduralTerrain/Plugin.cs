@@ -704,6 +704,10 @@ namespace ProceduralTerrain
 
         // ── Debug flags ───────────────────────────────────────────────────────────
         internal static volatile bool _disableVegetation;
+        internal static bool  _vegetationConform = true;   // snap vegetation to the voxel surface + reject steep/overhung spots (vanilla placement rides the 2.5D heightmap, blind to our 3D terrain)
+        internal static float _vegMaxTilt        = 30f;    // reject vegetation where the voxel surface is steeper than this (degrees); covers "flat enough to hide the trunk base"
+        [System.ThreadStatic] internal static bool _inVegPlacement;   // set only while ZoneSystem.PlaceVegetation runs, so the GetGroundData postfix scopes to vegetation
+        internal static string? _forcedSeed;   // if set (cfg [Debug] seed=), every world is forced to this seed string (testing aid); null = normal
         internal static bool _compressBake = false;
 
         // ── Biome profiles ────────────────────────────────────────────────────────

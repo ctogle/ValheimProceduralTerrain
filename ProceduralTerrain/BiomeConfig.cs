@@ -290,6 +290,12 @@ namespace ProceduralTerrain
                     {
                         if (k == "disablevegetation")
                             _disableVegetation = v == "1" || v == "true";
+                        if (k == "vegetationconform")
+                            _vegetationConform = !(v == "0" || v == "false");
+                        if (k == "vegmaxtilt" && float.TryParse(v, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float vmt))
+                            _vegMaxTilt = Mathf.Clamp(vmt, 0f, 90f);
+                        if (k == "seed")
+                            _forcedSeed = string.IsNullOrWhiteSpace(v) ? null : v.Trim();
                         if (k == "protectlocations")
                             _protectLocations = !(v == "0" || v == "false");
                         if (k == "applygroundwork")
