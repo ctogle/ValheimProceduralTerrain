@@ -295,6 +295,14 @@ namespace ProceduralTerrain
         {
             long size = pkg.ReadLong();
             if (size <= 0) { Log.LogInfo("[ProceduralTerrain] Server has no bake file — using live calc."); return; }
+            // Already have an identical bake? The bake is deterministic (same seed+cfg → identical bytes → identical
+            // size), so a size match means our local copy IS the server's — skip the (slow, RPC) download and use it.
+            string localPath = BakeFilePath(Plugin.WorldSeed(), ComputeCfgHash());
+            if (File.Exists(localPath) && new System.IO.FileInfo(localPath).Length == size)
+            {
+                Log.LogInfo($"[ProceduralTerrain] Local bake matches server ({size / 1024 / 1024} MB) — skipping download.");
+                return;
+            }
             Log.LogInfo($"[ProceduralTerrain] Server bake available ({size / 1024 / 1024} MB) — requesting download.");
             _bakeDownloadBuffer  = new System.IO.MemoryStream((int)size);
             _bakeChunksExpected  = (int)Math.Ceiling((double)size / BakeChunkSize);

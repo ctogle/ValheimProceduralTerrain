@@ -24,7 +24,7 @@ A bake is tied to **(world seed + config)** — the same seed string and the sam
 
 ### Dedicated servers
 
-Bake on the server once (`pt_bake`, admin-only). It runs in the background. When a client connects, if it doesn't already have the matching bake it **downloads it from the server** on join (with a progress bar). To skip that download, ship the `.bin` alongside the modpack — same seed+cfg means the client finds it locally.
+Bake on the server once (`pt_bake`, admin-only). It runs in the background. When a client connects, if it doesn't already have the matching bake it **downloads it from the server** on join (with a progress bar); clients that already have an identical copy skip the download.
 
 **During baking and downloading the world is fully playable** — terrain carves live as a fallback — but it **will stutter** until the bake is in place. Once it is, generation is hitch-free.
 
