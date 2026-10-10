@@ -112,7 +112,7 @@ namespace ProceduralTerrain
                 isAdmin = userId != null && (ZNet.instance?.GetAdminList()?.Contains(userId) ?? false);
             }
             if (!isAdmin) { Log.LogWarning($"[ProceduralTerrain] ClearBake from non-admin peer {sender} rejected."); return; }
-            int seed = (int)(ZNet.instance?.GetWorldUID() ?? 0L);
+            int seed = Plugin.WorldSeed();
             string pattern = $"procedural_terrain_bake_{seed:X8}_*.bin";
             var matches = System.IO.Directory.GetFiles(PTConfigDir, pattern);
             string msg;
@@ -219,7 +219,7 @@ namespace ProceduralTerrain
         internal static void RPC_BakeQuery(long sender, ZPackage pkg)
         {
             uint clientCfgHash = pkg.ReadUInt();
-            int  seed = (int)(ZNet.instance?.GetWorldUID() ?? 0L);
+            int  seed = Plugin.WorldSeed();
             uint myCfgHash = ComputeCfgHash();
             string path = BakeFilePath(seed, myCfgHash);
             var info = new ZPackage();
@@ -248,7 +248,7 @@ namespace ProceduralTerrain
         // Server: stream bake file in chunks after client requests it.
         internal static void RPC_BakeRequest(long sender, ZPackage _pkg)
         {
-            int  seed = (int)(ZNet.instance?.GetWorldUID() ?? 0L);
+            int  seed = Plugin.WorldSeed();
             uint cfgHash = ComputeCfgHash();
             string path = BakeFilePath(seed, cfgHash);
             if (_parallelBakeActive) { Log.LogInfo($"[ProceduralTerrain] Bake request from {sender} refused: bake still running."); return; }
@@ -332,7 +332,7 @@ namespace ProceduralTerrain
                 Log.LogError($"[ProceduralTerrain] Bake download corrupt: got {data.Length} bytes, expected {expectedLen}.");
                 return;
             }
-            int  seed    = (int)(ZNet.instance?.GetWorldUID() ?? 0L);
+            int  seed    = Plugin.WorldSeed();
             uint cfgHash = ComputeCfgHash();
             string path  = BakeFilePath(seed, cfgHash);
             System.IO.Directory.CreateDirectory(PTConfigDir);

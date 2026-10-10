@@ -745,6 +745,8 @@ namespace ProceduralTerrain
         internal static bool  _eikonal             = false;   // Path B: redistance the running field to true distance after each mode. OFF by default — current modes read zero-crossing elevation/normal (don't need |grad|=1). Enable only for distance-metric modes; it's a per-mode cost that explodes at fine coarseXZ.
         internal static int   _coarseXZ            = 4;      // coarse bake cell size in voxels, XZ (4=default; higher=cheaper/blockier). The XZ resolution of the whole bake grid.
         internal static int   _coarseY             = 1;      // Path B running-field cell size in voxels, Y (1=full-res Y; higher=cheaper/less vertical detail).
+        internal static int   _bakeCoarseXZ        = 1;      // carve res used DURING a pt_bake, XZ (decoupled from live coarseXZ). 1 = full-res bake quality.
+        internal static int   _bakeCoarseY         = 1;      // carve res used DURING a pt_bake, Y. Live play uses coarseXZ/coarseY; the bake carves at these.
         internal static int   CellVox  { get { return _coarseXZ < 1 ? 1 : _coarseXZ; } }  // XZ coarse cell size (voxels)
         internal static int   CellVoxY { get { return _coarseY  < 1 ? 1 : _coarseY;  } }  // Path B field Y coarse cell size (voxels)
         internal static bool  _surfaceFullRes       = true;   // surface-anchored modes: replace coarse-interp baseline with full-res addh (kills coarse faceting cliffs)
@@ -768,6 +770,7 @@ namespace ProceduralTerrain
         static float _bakeRadius = 0f;
         static int   _bakeStep   = 8;
         internal static bool _bakeVanilla = false;  // false = skip unmodified (no active mode) zones from the bake file; they carve live via VanillaFill (~11ms) and don't inflate the bake. true = bake every zone.
+        internal static bool _bakeCrossings = false; // true = store columns as sign-crossings (v6, ~14x smaller) instead of dense distance bands (v5). Surface is exact; off-surface distances are a hydrated ramp.
         internal static System.Collections.Generic.HashSet<Heightmap.Biome> _modifiedBiomes = new System.Collections.Generic.HashSet<Heightmap.Biome>();  // biomes with an active-mode profile; a zone touching none is pure vanilla (skip the blend)
         // Sparse per-zone bake (file v3). Per coarse column (col = xs*nsz + zs) we store only the
         // non-saturated band [colYLo .. colYLo+colYLen) plus the saturated fill below/above it. `step` is
@@ -783,6 +786,13 @@ namespace ProceduralTerrain
             public sbyte[] colBelow = System.Array.Empty<sbyte>(); // fill for ys < colYLo
             public sbyte[] colAbove = System.Array.Empty<sbyte>(); // fill for ys >= colYLo+colYLen
             public sbyte[] samples  = System.Array.Empty<sbyte>(); // packed band samples
+            // v6 "crossings" format: a column is stored as its sign-crossing y-positions (sub-voxel) instead of
+            // a dense distance band. colCross is flattened per column in colOff order; colNCross packs the count
+            // (low 7 bits) + sign-of-below (high bit: 1 = solid/-). crossSlope is the bytes-per-voxel hydrate ramp.
+            // When colCross != null the zone is v6 and the band fields above are unused.
+            public float[] colCross  = null;
+            public byte[]  colNCross = null;
+            public float   crossSlope;
         }
         // Staged: sparse SDF written by Carve() when within bakeRadius.
         static readonly System.Collections.Concurrent.ConcurrentDictionary<(int, int), BakeZone> _bakePending = new();
@@ -796,6 +806,7 @@ namespace ProceduralTerrain
         static readonly Queue<(int, int)> _bakeCacheOrder = new();
         const int _bakeCacheCap = 256;
         static int _bakeFileStep = 8;
+        internal static bool _bakeFileV6 = false;   // loaded bake file uses the v6 crossings layout
         static bool _bakeLoadAttempted = false;
 
         const float LocProtectR = 10f; // minimum protection radius when exteriorRadius is unavailable
@@ -827,11 +838,19 @@ namespace ProceduralTerrain
         internal static FastNoiseLite? _hmWarpX;       // Mode B: XZ warp X
         internal static FastNoiseLite? _hmWarpZ;       // Mode B: XZ warp Z
 
+        // Deterministic world seed (from the seed STRING), identical on every machine for a given seed — unlike
+        // GetWorldUID() which is a random per-world id. Keying noise + bakes on this makes terrain a pure function
+        // of (seed, cfg), so a bake is portable: same-seed world + same cfg → the file is found and matches.
+        internal static int WorldSeed()
+        {
+            var w = WorldGenerator.instance?.m_world;
+            return w != null ? w.m_seed : 12345;
+        }
+
         internal static void RebuildNoisePool(int count)
         {
             _noiseCount = count;
-            long uid  = ZNet.instance?.GetWorldUID() ?? 0L;
-            int  seed = uid != 0L ? (int)(uid * 2654435761L) : 12345;
+            int  seed = WorldSeed();
             var pool  = new FastNoiseLite[count];
             for (int i = 0; i < count; i++)
             {
@@ -1147,7 +1166,7 @@ namespace ProceduralTerrain
                     }
                     else
                     {
-                        int  seed    = (int)(ZNet.instance?.GetWorldUID() ?? 0L);
+                        int  seed    = WorldSeed();
                         uint cfgHash = ComputeCfgHash();
                         path = BakeFilePath(seed, cfgHash);
                     }
@@ -1156,7 +1175,7 @@ namespace ProceduralTerrain
                         CloseBakeStream();   // release any open read handle so delete can't be blocked
                         File.Delete(path);
                         // Reset in-memory cache if we just deleted the active file.
-                        if (System.IO.Path.GetFullPath(path) == System.IO.Path.GetFullPath(BakeFilePath((int)(ZNet.instance?.GetWorldUID() ?? 0L), ComputeCfgHash())))
+                        if (System.IO.Path.GetFullPath(path) == System.IO.Path.GetFullPath(BakeFilePath(WorldSeed(), ComputeCfgHash())))
                             { _bakeData = null; _bakeLoadAttempted = false; }
                         Console.instance?.Print($"[ProceduralTerrain] Deleted: {System.IO.Path.GetFileName(path)}");
                         Log.LogInfo($"[ProceduralTerrain] Deleted local bake file: {path}");

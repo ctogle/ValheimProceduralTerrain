@@ -21,9 +21,22 @@ namespace ProceduralTerrain
             if (_serverCfgHash.HasValue) return _serverCfgHash.Value;
             string path = ConfigPath;
             if (!File.Exists(path)) return 0u;
-            byte[] bytes = File.ReadAllBytes(path);
+            // Hash only content that affects BAKED bytes. Live-only knobs (coarseXZ/coarseY now drive the live
+            // carve, not the bake; debug/render toggles; bakeRadius selects which zones, not their content) are
+            // excluded so tuning them doesn't invalidate an existing bake.
             uint hash = 2166136261u;
-            foreach (byte b in bytes) hash = (hash ^ b) * 16777619u;
+            foreach (var rawLine in File.ReadAllLines(path))
+            {
+                string t = rawLine.TrimStart().ToLowerInvariant();
+                // Live/render-only knobs + location-overlay knobs (the bake is purely procedural — groundwork/
+                // location protection are applied live at load, never frozen in) → excluded so tuning them doesn't
+                // invalidate a bake. (debugviz covers debugviz + debugvizocclude via prefix.)
+                if (t.StartsWith("coarsexz") || t.StartsWith("coarsey") || t.StartsWith("bakeradius") ||
+                    t.StartsWith("debugviz") || t.StartsWith("hidelodmeshes") || t.StartsWith("disablevegetation") ||
+                    t.StartsWith("applygroundwork") || t.StartsWith("protectlocations") || t.StartsWith("flatplanelocations")) continue;
+                foreach (char c in rawLine) hash = (hash ^ (byte)c) * 16777619u;
+                hash = (hash ^ (byte)'\n') * 16777619u;
+            }
             return hash;
         }
 
@@ -55,7 +68,7 @@ namespace ProceduralTerrain
             CloseBakeStream();
             _bakeData = null;
             if (wg == null) return;
-            int seed = (int)(ZNet.instance?.GetWorldUID() ?? 0L);
+            int seed = Plugin.WorldSeed();
             uint cfgHash = ComputeCfgHash();
             string path = BakeFilePath(seed, cfgHash);
             if (!File.Exists(path)) return;
@@ -73,8 +86,9 @@ namespace ProceduralTerrain
                     var pr = new BinaryReader(fs, System.Text.Encoding.UTF8, leaveOpen: true);
                     if (pr.ReadUInt32() != 0x564F5846u) { Log.LogWarning("[ProceduralTerrain] bake: invalid magic."); fs.Dispose(); return; }
                     ushort pver = pr.ReadUInt16();
-                    if (pver == 5)
+                    if (pver == 5 || pver == 6)
                     {
+                        Plugin._bakeFileV6 = (pver == 6);
                         if (pr.ReadUInt64() != (ulong)(uint)seed || pr.ReadUInt32() != cfgHash)
                             { Log.LogWarning("[ProceduralTerrain] bake: seed/cfg mismatch."); fs.Dispose(); return; }
                         int cnt = (int)pr.ReadUInt32();
@@ -132,6 +146,24 @@ namespace ProceduralTerrain
             int nsx = br.ReadInt32(), nsy = br.ReadInt32(), nsz = br.ReadInt32();
             int cOrigin = br.ReadInt32();
             int ncol = nsx * nsz;
+            if (Plugin._bakeFileV6)   // crossings layout: slope + per-column (count+sign, crossing ys)
+            {
+                float slope = br.ReadSingle();
+                var nCross = new byte[ncol];
+                var crossList = new List<float>(ncol * 2);
+                for (int c = 0; c < ncol; c++)
+                {
+                    byte nb = br.ReadByte();
+                    nCross[c] = nb;
+                    int nc = nb & 0x7F;
+                    for (int j = 0; j < nc; j++)
+                        crossList.Add(br.ReadUInt16() / 256f);
+                }
+                return new BakeZone {
+                    extLo = extLo, bh = bh, bw = ebw, step = step, nsx = nsx, nsy = nsy, nsz = nsz, cOrigin = cOrigin,
+                    colCross = crossList.ToArray(), colNCross = nCross, crossSlope = slope
+                };
+            }
             var colYLo = new int[ncol]; var colYLen = new int[ncol];
             var colBelow = new sbyte[ncol]; var colAbove = new sbyte[ncol]; var colOff = new int[ncol];
             int off = 0;
@@ -161,6 +193,20 @@ namespace ProceduralTerrain
             bw2.Write(z.nsx); bw2.Write(z.nsy); bw2.Write(z.nsz);
             bw2.Write(z.cOrigin);
             int ncol = z.nsx * z.nsz;
+            if (z.colCross != null)   // v6 crossings layout
+            {
+                bw2.Write(z.crossSlope);
+                int ci = 0;
+                for (int c = 0; c < ncol; c++)
+                {
+                    byte nb = z.colNCross[c];
+                    bw2.Write(nb);
+                    int nc = nb & 0x7F;
+                    for (int j = 0; j < nc; j++)
+                        bw2.Write((ushort)Math.Max(0, Math.Min(65535, (int)Math.Round(z.colCross[ci++] * 256f))));
+                }
+                return;
+            }
             for (int c = 0; c < ncol; c++)
             {
                 bw2.Write((ushort)z.colYLo[c]);
@@ -275,14 +321,56 @@ namespace ProceduralTerrain
                 if (_sparseScratch == null || _sparseScratch.Length < owned * bh * owned) _sparseScratch = new sbyte[owned * bh * owned];
                 var colV1 = _colVScratch; var scratch1 = _sparseScratch;
                 var cStart = new int[owned * owned]; var cLen = new int[owned * owned]; var cOff = new int[owned * owned];
+                // v6 crossings: per-column offset into the flattened crossing array (prefix sum of counts).
+                bool xmode = e.colCross != null;
+                int[] xoffs = null;
+                if (xmode)
+                {
+                    xoffs = new int[e.nsx * e.nsz + 1];
+                    for (int c = 0; c < e.nsx * e.nsz; c++) xoffs[c + 1] = xoffs[c] + (e.colNCross[c] & 0x7F);
+                }
                 int tot = 0;
                 for (int ix = 0; ix < owned; ix++)
                 for (int iz = 0; iz < owned; iz++)
                 {
                     int col = ix * e.nsz + iz;
+                    float sh = float.NaN;
+                    if (xmode)
+                    {
+                        // Hydrate the column from its sign-crossings: signed distance to nearest crossing × slope,
+                        // sign flipping at each crossing (below sign in bit 7). Surface lands exactly at the crossing.
+                        int nc = e.colNCross[col] & 0x7F, xo = xoffs[col];
+                        float slope = e.crossSlope;
+                        bool belowSolid = (e.colNCross[col] & 0x80) != 0;
+                        // Single pass: crossings are sorted ascending and bakCy increases 1/voxel, so a pointer
+                        // `seg` (= #crossings strictly below bakCy) advances monotonically. Nearest crossing is
+                        // whichever of the straddling pair (seg-1, seg) is closer. O(bh), no per-voxel search.
+                        int seg = 0;
+                        for (int cy = 0; cy < bh; cy++)
+                        {
+                            int bakCy = (extLo + cy) - e.extLo;
+                            sbyte v;
+                            if (bakCy < 0) v = -127;
+                            else if (bakCy >= e.bh) v = 127;
+                            else if (nc == 0) v = belowSolid ? (sbyte)-127 : (sbyte)127;
+                            else
+                            {
+                                while (seg < nc && e.colCross[xo + seg] <= bakCy) seg++;
+                                float dmin = 1e9f;
+                                if (seg < nc) { float d = e.colCross[xo + seg] - bakCy; if (d < dmin) dmin = d; }
+                                if (seg > 0)  { float d = bakCy - e.colCross[xo + seg - 1]; if (d < dmin) dmin = d; }
+                                bool solid = belowSolid ^ ((seg & 1) != 0);
+                                int mag = (int)(dmin * slope + 0.5f); if (mag > 127) mag = 127;
+                                v = (sbyte)(solid ? -mag : mag);
+                            }
+                            colV1[cy] = v;
+                            if (v < 0) sh = (extLo + cy) * s;
+                        }
+                    }
+                    else
+                    {
                     int yLo = e.colYLo[col], yLen = e.colYLen[col], off = e.colOff[col];
                     sbyte below = e.colBelow[col], above = e.colAbove[col];
-                    float sh = float.NaN;
                     for (int cy = 0; cy < bh; cy++)
                     {
                         int bakCy = (extLo + cy) - e.extLo;
@@ -292,6 +380,7 @@ namespace ProceduralTerrain
                         else { int ys = bakCy; v = (ys < yLo) ? below : (ys < yLo + yLen) ? e.samples[off + (ys - yLo)] : above; }
                         colV1[cy] = v;
                         if (v < 0) sh = (extLo + cy) * s;
+                    }
                     }
                     surfH1[(ix + overlap) * bw + (iz + overlap)] = sh;
                     int oc = ix * owned + iz;
@@ -312,6 +401,7 @@ namespace ProceduralTerrain
                 return true;
             }
 
+            if (e.colCross != null) { Log.LogWarning($"[ProceduralTerrain] v6 crossings bake at step>1 not supported yet ({ox},{oz}) — rebake at bakeStep=1."); return false; }
             int step = e.step;
             int nsx = e.nsx, nsy = e.nsy, nsz = e.nsz;
             float scale = 32f * s / 127f;
@@ -507,6 +597,11 @@ namespace ProceduralTerrain
             var colV     = new sbyte[nsy];
             var packed   = new List<sbyte>(ncol * 4);
 
+            // v6 crossings accumulators (allocated only when storing crossings)
+            bool xmode = Plugin._bakeCrossings;
+            var crossPacked = xmode ? new List<float>(ncol * 2) : null;
+            var colNCross   = xmode ? new byte[ncol] : null;
+
             for (int xs = 0; xs < nsx; xs++)
             for (int zs = 0; zs < nsz; zs++)
             {
@@ -517,6 +612,25 @@ namespace ProceduralTerrain
                     int cy = Math.Min(ys * step, bh - 1);
                     colV[ys] = ToSDFByte(buf[(cx * bh + cy) * bw + cz], 32f * s);
                 }
+                int col = xs * nsz + zs;
+                if (xmode)
+                {
+                    // Store the column as its sign-crossing y-positions (sub-voxel, linear-interp to zero).
+                    // Count (low 7 bits) + sign-of-below (high bit: 1 = solid/negative below).
+                    int nc = 0;
+                    for (int ys = 1; ys < nsy && nc < 127; ys++)
+                    {
+                        int a = colV[ys - 1], b = colV[ys];
+                        if ((a < 0) != (b < 0))
+                        {
+                            float t = (a != b) ? a / (float)(a - b) : 0.5f;
+                            crossPacked!.Add((ys - 1) + t);
+                            nc++;
+                        }
+                    }
+                    colNCross![col] = (byte)(nc | (colV[0] < 0 ? 0x80 : 0));
+                    continue;
+                }
                 // Active band: non-saturated or straddling a sign change; the rest is constant fill.
                 int minA = int.MaxValue, maxA = int.MinValue;
                 for (int ys = 0; ys < nsy; ys++)
@@ -525,7 +639,6 @@ namespace ProceduralTerrain
                     bool active = Math.Abs((int)v) < BakeSAT || (ys > 0 && ((v < 0) != (colV[ys - 1] < 0)));
                     if (active) { if (ys < minA) minA = ys; if (ys > maxA) maxA = ys; }
                 }
-                int col = xs * nsz + zs;
                 colOff[col] = packed.Count;
                 colBelow[col] = colV[0];
                 colAbove[col] = colV[nsy - 1];
@@ -543,7 +656,10 @@ namespace ProceduralTerrain
             var z = new BakeZone {
                 extLo = extLo, bh = bh, bw = bw, step = step, nsx = nsx, nsy = nsy, nsz = nsz, cOrigin = cOrigin,
                 colYLo = colYLo, colYLen = colYLen, colOff = colOff,
-                colBelow = colBelow, colAbove = colAbove, samples = packed.ToArray()
+                colBelow = colBelow, colAbove = colAbove, samples = packed.ToArray(),
+                colCross = xmode ? crossPacked!.ToArray() : null,
+                colNCross = colNCross,
+                crossSlope = 127f / 32f   // bytes per Y-sample for a vertical surface; hydrate ramp (surface is exact at any slope)
             };
             // Bake in progress: a BAKE WORKER (off the main thread — WriteBakeFile runs under Task.Run) compresses
             // (off-lock, parallel) and appends straight to disk → RAM stays flat regardless of radius. A MAIN-THREAD
@@ -576,7 +692,7 @@ namespace ProceduralTerrain
                 Log.LogInfo($"[ProceduralTerrain] bake: scale resolved to {_scale} (raw={resolved})");
             }
             float s = _scale.Value;
-            int seed = (int)(ZNet.instance?.GetWorldUID() ?? 0L);
+            int seed = Plugin.WorldSeed();
             uint cfgHash = ComputeCfgHash();
 
             // Enumerate every zone origin within radius and ensure it's staged.
@@ -646,7 +762,7 @@ namespace ProceduralTerrain
             using (var bw2 = new BinaryWriter(fs))
             {
                 bw2.Write(0x564F5846u);          // magic
-                bw2.Write((ushort)5);            // version 5 = streamed + owned+halo grid (per-zone cOrigin); skirt never stored
+                bw2.Write((ushort)(Plugin._bakeCrossings ? 6 : 5));  // v5 = dense distance band; v6 = sign-crossings (per-column)
                 bw2.Write((ulong)(uint)seed);
                 bw2.Write(cfgHash);
                 long countPos = fs.Position;
@@ -660,6 +776,10 @@ namespace ProceduralTerrain
                 _bakeWriteStream = fs;
                 _bakeWriteIndex  = index;
                 _parallelBakeActive = true;
+                // Carve at BAKE res (full by default), decoupled from live coarseXZ/coarseY. Restored in finally.
+                int liveCoarseXZ = Plugin._coarseXZ, liveCoarseY = Plugin._coarseY;
+                Plugin._coarseXZ = Plugin._bakeCoarseXZ; Plugin._coarseY = Plugin._bakeCoarseY;
+                Log.LogInfo($"[ProceduralTerrain] bake carve res: coarseXZ={Plugin._coarseXZ} coarseY={Plugin._coarseY} (live was {liveCoarseXZ}/{liveCoarseY})");
                 try
                 {
                     System.Threading.Tasks.Parallel.ForEach(toCarve,
@@ -707,7 +827,8 @@ namespace ProceduralTerrain
                     // so far instead of leaving a headers-only file with no footer (unloadable).
                     Log.LogError($"[ProceduralTerrain] bake aborted mid-run after {index.Count} zones; finalizing partial bake: {bex.GetType().Name}: {bex.Message}\n{bex.StackTrace}");
                 }
-                finally { _parallelBakeActive = false; _bakeWriteStream = null; _bakeWriteIndex = null; }
+                finally { _parallelBakeActive = false; _bakeWriteStream = null; _bakeWriteIndex = null;
+                          Plugin._coarseXZ = liveCoarseXZ; Plugin._coarseY = liveCoarseY; }   // restore live carve res
 
                 bw2.Flush();
                 long indexOff = fs.Position;
@@ -727,8 +848,12 @@ namespace ProceduralTerrain
             _bakeIndex  = idx2;
             _bakeStream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
             _bakeFileStep = _bakeStep;
+            Plugin._bakeFileV6 = _bakeCrossings;   // just-written format — reads must match (loader sets this; the post-bake rewire bypasses it)
+            _bakeZoneCache.Clear(); _bakeCacheOrder.Clear();   // drop any zones decoded against the old file/format
             _bakePending.Clear();
-            Log.LogInfo($"[ProceduralTerrain] Bake written (v5 streamed): {index.Count} zones, radius={radius:F0}m → {path}");
+            long bakeSecs = bakeSw.ElapsedMilliseconds / 1000;
+            float zps = bakeSecs > 0 ? index.Count / (float)bakeSecs : 0f;
+            Log.LogInfo($"[ProceduralTerrain] Bake written (v{(_bakeCrossings ? 6 : 5)} streamed): {index.Count} zones in {bakeSecs / 60}:{bakeSecs % 60:00} ({zps:F1} zones/s), radius={radius:F0}m → {path}");
         }
 
         // ── Hot-reload: re-run the full voxel pipeline on every loaded zone ───────
@@ -885,7 +1010,7 @@ public class BakeProgressUI : MonoBehaviour
             long elS = (Plugin._bakeDownloadTimer?.ElapsedMilliseconds ?? 0) / 1000;
             float eta = pct > 0.01f ? elS / pct * (1f - pct) : 0f;
             label    = $"Downloading world terrain…  {pct * 100f:F0}%";
-            sublabel = eta > 0 ? $"ETA {eta:F0}s" : "Connecting…";
+            sublabel = eta > 0 ? $"ETA {eta:F0}s  ·  {elS / 60}:{elS % 60:00} elapsed" : "Connecting…";
         }
         else
         {
@@ -893,7 +1018,7 @@ public class BakeProgressUI : MonoBehaviour
             long elS = (Plugin._bakeProgressTimer?.ElapsedMilliseconds ?? 0) / 1000;
             float eta = pct > 0.01f ? elS / pct * (1f - pct) : 0f;
             label    = $"Baking terrain…  {pct * 100f:F0}%";
-            sublabel = eta > 0 ? $"ETA {eta:F0}s  ({Plugin._bakeProgressDone}/{Plugin._bakeProgressTotal} zones)" : "Starting…";
+            sublabel = eta > 0 ? $"ETA {eta:F0}s  ·  {elS / 60}:{elS % 60:00} elapsed  ({Plugin._bakeProgressDone}/{Plugin._bakeProgressTotal} zones)" : "Starting…";
         }
 
         float w = 420f, h = 90f;

@@ -332,6 +332,10 @@ namespace ProceduralTerrain
                             _coarseXZ = Mathf.Clamp(cxz, 1, 64);
                         if (k == "coarsey" && int.TryParse(v, out int cyv))
                             _coarseY = Mathf.Clamp(cyv, 1, 64);
+                        if (k == "bakecoarsexz" && int.TryParse(v, out int bcxz))
+                            _bakeCoarseXZ = Mathf.Clamp(bcxz, 1, 64);
+                        if (k == "bakecoarsey" && int.TryParse(v, out int bcy))
+                            _bakeCoarseY = Mathf.Clamp(bcy, 1, 64);
                         if (k == "surfacefullres")
                             _surfaceFullRes = !(v == "0" || v == "false");
                         if (k == "vanillaheight")
@@ -351,6 +355,8 @@ namespace ProceduralTerrain
                             _compressBake = !(v == "0" || v == "false");
                         if (k == "bakevanilla")
                             _bakeVanilla = !(v == "0" || v == "false");
+                        if (k == "bakeformat")
+                            _bakeCrossings = v.Trim().Equals("crossings", StringComparison.OrdinalIgnoreCase);
                         if (k == "noise_count" && int.TryParse(v, out int nc))
                         {
                             nc = Mathf.Clamp(nc, 10, 256);
@@ -560,9 +566,8 @@ namespace ProceduralTerrain
         static void InitNoise()
         {
             if (_noisePool != null) return;
-            long uid = ZNet.instance?.GetWorldUID() ?? 0L;
-            int seed = uid != 0L ? (int)(uid * 2654435761L) : 12345;
-            Log.LogInfo($"[ProceduralTerrain] noise seed={seed} (uid={uid})");
+            int seed = Plugin.WorldSeed();
+            Log.LogInfo($"[ProceduralTerrain] noise seed={seed} (world seed string, portable)");
 
             FastNoiseLite MakeNoise(int offset)
             {
