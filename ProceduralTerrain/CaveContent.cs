@@ -56,98 +56,8 @@ namespace ProceduralTerrain
     {
         internal static bool _caveContent = false;   // cfg [Debug] cavecontent
 
-        // Tunables (deliberately a bit hot; turn down later)
-        const float CC_DepthFull  = 60f;     // metres below surface where the ramp reaches full probability
-        const float CC_OreMaxProb = 0.006f;  // per-crossing chance at full depth (hunt a little)
-        const float CC_SpawnerMaxProb = 0.012f; // per-floor-crossing chance at full depth (saturate toward packs)
-        const int   CC_OreCap     = 6;       // HARD cap per zone (~1/5 of the earlier test density)
-        const int   CC_SpawnerCap = 8;       // per-zone total across types (per-type maxes keep the mix sane)
-        const float CC_OreSpacing   = 6f;    // min metres between placed ore (no clumped silver piles)
-        const float CC_SpawnerSpacing = 10f;   // tight → clusters/packs
-        const float CC_GiantSpacing = 40f;
-
-        // Resource → candidate prefab names (first that resolves wins). Logged once so we learn the real names.
-        // tag, prefab names, relative weight, embed depth (metres buried below a FLOOR crossing; 0 = sits on surface,
-        // any crossing). Buried deposits (silver/scrap/copper) only spawn on floors, dug out like vanilla + Wishbone-findable.
-        static readonly (string tag, string[] cands, int weight, float embed)[] _oreCands =
-        {
-            ("tin",      new[]{ "MineRock_Tin" },       10, 0f),  // fine on the surface
-            ("flint",    new[]{ "Pickable_Flint" },      7, 0f),  // interactable pile, not the raw item drop
-            ("obsidian", new[]{ "MineRock_Obsidian" },   4, 0f),
-            ("copper",   new[]{ "rock4_copper" },        3, 1.0f), // LARGE BF deposit; only sink ~1m so the big top sticks well out
-            ("muddyscrap", new[]{ "mudpile2", "mudpile" }, 3, 4.0f), // sunk ~fully, dug out + Wishbone-findable
-            ("silver",   new[]{ "silvervein" },          2, 4.0f), // sunk ~fully, Wishbone-findable
-        };
-        // Placed CreatureSpawner prefabs (respawn, self-cap, day/night, base-blocking all built in). Mountain set:
-        // Fenring/Cultist (nocturnal), Bat, Ulv (wolf-type day predator), StoneGolem (rare). tag, names, weight.
-        // tag, chassis prefab, weight, creature-override (disabled for now → null), per-type max-per-zone.
-        // Packs: ulv/bat saturate; golem stays 1. (True Wolf via a safe override path later.)
-        static readonly (string tag, string[] cands, int weight, string? over, int max)[] _spawnerCands =
-        {
-            ("wolf",    new[]{ "Spawner_Ulv" },       8, "Wolf", 7),  // Ulv chassis → override to Wolf; big packs
-            ("fenring", new[]{ "Spawner_Fenring" },   1, null,   2),  // nocturnal, uncommon
-            ("golem",   new[]{ "Spawner_StoneGolem" }, 1, null,  1),  // 1 tops
-        };
-        static GameObject[]? _spawnerResolved;
-        static int[]? _spawnerOverride;   // parallel: creature-prefab hash to force, or 0
-
-        // Bats get their own channel (they swarm, fly, fill the volume) — not bound by the ground-spawner cap.
-        static GameObject? _batResolved;
-        const float CC_BatProb    = 0.02f;  // per crossing (toward swarms in bigger caves)
-        const float CC_BatSpacing = 4f;
-        const int   CC_BatCap     = 20;      // dungeon-style swarm ceiling per zone
-
-        // Mistlands giant-corpse SCENERY, deep only. Confirmed names. giant_skull/giant_brain EXCLUDED — those
-        // carry late-game resources; sword/helmet/ribs/arm are just scenery (safe for early mountains).
-        static readonly (string tag, string[] cands)[] _giantCands =
-        {
-            ("giant_sword",  new[]{ "giant_sword1", "giant_sword2" }),
-            ("giant_helmet", new[]{ "giant_helmet1", "giant_helmet2" }),
-        };
-        static GameObject[]? _giantResolved;
-        const float CC_GiantMinDepth = 40f;    // only this far below surface
-        const float CC_GiantProb     = 0.02f;  // per deep flat-floor crossing
-        const int   CC_GiantCap      = 1;       // per zone (they're enormous)
-        const float CC_GiantZoneChance = 0.1f;  // only ~1 in 10 mountain zones is even eligible for a giant
-
-        static GameObject[]? _oreResolved;   // parallel to _oreCands
         static bool _ccDumped;
         static int  _ccLogged;
-
-        static GameObject? Resolve(string[] cands)
-        {
-            var zs = ZNetScene.instance; if (zs == null) return null;
-            foreach (var n in cands) { var p = zs.GetPrefab(n); if (p != null) return p; }
-            return null;
-        }
-
-        static void CaveContentResolve()
-        {
-            if (_oreResolved != null) return;
-            _oreResolved = new GameObject[_oreCands.Length];
-            for (int i = 0; i < _oreCands.Length; i++)
-            {
-                _oreResolved[i] = Resolve(_oreCands[i].cands)!;
-                Log.LogInfo($"[PT-cave] resolve {_oreCands[i].tag}: {(_oreResolved[i] ? _oreResolved[i].name : "NONE of [" + string.Join(",", _oreCands[i].cands) + "]")}");
-            }
-            _spawnerResolved = new GameObject[_spawnerCands.Length];
-            _spawnerOverride = new int[_spawnerCands.Length];
-            for (int i = 0; i < _spawnerCands.Length; i++)
-            {
-                _spawnerResolved[i] = Resolve(_spawnerCands[i].cands)!;
-                _spawnerOverride[i] = _spawnerCands[i].over != null ? StringExtensionMethods.GetStableHashCode(_spawnerCands[i].over) : 0;
-                string ov = _spawnerCands[i].over != null ? $" → {_spawnerCands[i].over}" : "";
-                Log.LogInfo($"[PT-cave] resolve {_spawnerCands[i].tag}: {(_spawnerResolved[i] ? _spawnerResolved[i].name : "NONE of [" + string.Join(",", _spawnerCands[i].cands) + "]")}{ov}");
-            }
-            _batResolved = Resolve(new[] { "Spawner_Bat" });
-            Log.LogInfo($"[PT-cave] resolve bat: {(_batResolved ? _batResolved!.name : "NONE")}");
-            _giantResolved = new GameObject[_giantCands.Length];
-            for (int i = 0; i < _giantCands.Length; i++)
-            {
-                _giantResolved[i] = Resolve(_giantCands[i].cands)!;
-                Log.LogInfo($"[PT-cave] resolve {_giantCands[i].tag}: {(_giantResolved[i] ? _giantResolved[i].name : "NONE of [" + string.Join(",", _giantCands[i].cands) + "]")}");
-            }
-        }
 
         // One-time dump of all ZNetScene prefab names matching ore/rock keywords — so we discover exact names.
         static void CaveContentDump()
@@ -178,35 +88,98 @@ namespace ProceduralTerrain
             return (h & 0xFFFFFF) / (float)0x1000000;
         }
 
+        // Placed-count + spacing-point bookkeeping, keyed per Placement rule.
+        sealed class PlaceState { public int count; public List<Vector3> pts = new(); }
+
         internal static void PlaceCaveContent(Vector3 zoneCenterPos, object mode, List<GameObject> spawnedObjects)
         {
-            if (!_caveContent) return;
+            if (!_caveContent || _placements.Count == 0) return;
             var wg = WorldGenerator.instance; if (wg == null) return;
             CaveContentDump();
-            CaveContentResolve();
+            ResolvePlacements();
             var biome = wg.GetBiome(zoneCenterPos.x, zoneCenterPos.z);
             if (_ccLogged < 25) { _ccLogged++; Log.LogDebug($"[PT-cave] zone center ({zoneCenterPos.x:F0},{zoneCenterPos.z:F0}) biome={biome}"); }
-            if (biome != Heightmap.Biome.Mountain) return;
+
+            // Rules active in this biome, split by how they compete: shared object pool, shared spawner pool,
+            // and independent channels (Prob>=0). Channels with ZoneChance<1 roll per-zone eligibility once.
+            var objPool = new List<Placement>(); var spwPool = new List<Placement>(); var channels = new List<Placement>();
+            foreach (var p in _placements)
+            {
+                if (p.Resolved == null || !p.Biomes.Contains(biome)) continue;
+                if (p.Prob >= 0f) channels.Add(p);
+                else if (p.Kind == PlacementKind.Spawner) spwPool.Add(p);
+                else objPool.Add(p);
+            }
+            if (objPool.Count == 0 && spwPool.Count == 0 && channels.Count == 0) return;
 
             float s = ActiveScale();
             var (ox, oz) = ZoneOriginFromWorld(zoneCenterPos.x, zoneCenterPos.z, s);
             if (!_sdfCache.TryGetValue($"{ox},{oz}", out var e)) { if (_ccLogged < 5) { _ccLogged++; Log.LogWarning($"[PT-cave] zone ({ox},{oz}) SDF not cached — skipped."); } return; }
 
             bool ghost = mode.ToString() == "Ghost";
-            bool giantEligible = CCRand(ox, oz, 0, 6) < CC_GiantZoneChance;   // most zones get NO giant
-            int width = e.width, placedOre = 0, placedSpawner = 0, placedGiant = 0, placedBat = 0;
-            var perType = new int[_oreCands.Length];
-            var perSpawnerType = new int[_spawnerCands.Length];
-            var oreP = new List<Vector3>(); var spawnerP = new List<Vector3>(); var giantP = new List<Vector3>(); var batP = new List<Vector3>();
+            var st = new Dictionary<Placement, PlaceState>();
+            PlaceState S(Placement p) { if (!st.TryGetValue(p, out var v)) { v = new PlaceState(); st[p] = v; } return v; }
+            // per-zone channel eligibility (ZoneChance gate), salted by channel index
+            var chanOn = new bool[channels.Count];
+            for (int j = 0; j < channels.Count; j++) chanOn[j] = channels[j].ZoneChance >= 1f || CCRand(ox, oz, j, 6) < channels[j].ZoneChance;
+            int objPlaced = 0, spwPlaced = 0, width = e.width;
+
+            // place one rule at a crossing, honoring its cap + spacing + flatness; returns true if placed.
+            bool TryPlace(Placement p, int ix, int iz, int ci, bool isFloor, float cyY, float worldX, float worldZ, float yaw)
+            {
+                int cap = p.Cap < 0 ? int.MaxValue : p.Cap;
+                var ps = S(p); if (ps.count >= cap) return false;
+                if (p.FloorOnly && !isFloor) return false;
+                float spacing = p.Spacing < 0f ? (p.Kind == PlacementKind.Spawner ? _ccSpawnerSpacing : _ccObjectSpacing) : p.Spacing;
+                Vector3 anchor = new Vector3(worldX, cyY, worldZ);
+                if (TooClose(ps.pts, anchor, spacing)) return false;
+                // floor PROPS (static objects) need a reasonably flat floor so nothing juts out of a near-vertical
+                // "floor". Creatures handle slopes fine, so this gate is objects-only (gating spawners here blocked
+                // wolves on sloped cave floors).
+                if (p.Kind == PlacementKind.Object && p.FloorOnly && CaveFloorNormal(e, ix, iz, width, cyY, s).y < 0.6f) return false;
+
+                Vector3 pos = anchor; Quaternion rot;
+                if (p.Kind == PlacementKind.Spawner) rot = Quaternion.Euler(0f, yaw, 0f);
+                else if (p.Embed > 0f) { pos = new Vector3(worldX, cyY - p.Embed, worldZ); rot = Quaternion.Euler(0f, yaw, 0f); } // buried: upright
+                else if (p.Upright) rot = Quaternion.Euler(0f, yaw, 0f);
+                else if (isFloor) rot = Quaternion.FromToRotation(Vector3.up, CaveFloorNormal(e, ix, iz, width, cyY, s)) * Quaternion.Euler(0f, yaw, 0f);
+                else rot = Quaternion.Euler(0f, yaw, 0f);
+                // lift off the crossing into the air side (flying spawners born on the surface clip into rock →
+                // Voxheim "unburies" them every tick). Air is up on a floor crossing, down on a ceiling crossing.
+                if (p.Lift != 0f) pos += (isFloor ? Vector3.up : Vector3.down) * p.Lift;
+
+                if (!SpawnCave(p.Resolved!, pos, rot, ghost, spawnedObjects, p.CreatureHash)) return false;
+                ps.count++; ps.pts.Add(anchor);
+                return true;
+            }
+
+            // weighted pick among pool rules eligible at this crossing (eff weight = Weight * depth ramp).
+            Placement? PickPool(List<Placement> pool, bool isFloor, float depth, int ix, int iz, int ci, int salt)
+            {
+                float total = 0f;
+                for (int i = 0; i < pool.Count; i++)
+                {
+                    var p = pool[i]; if (p.FloorOnly && !isFloor) continue;
+                    float r = p.Ramp(depth); if (r <= 0f) continue;
+                    total += p.Weight * r;
+                }
+                if (total <= 0f) return null;
+                float roll = CCRand(ox + ix, oz + iz, ci, salt) * total, acc = 0f;
+                for (int i = 0; i < pool.Count; i++)
+                {
+                    var p = pool[i]; if (p.FloorOnly && !isFloor) continue;
+                    float r = p.Ramp(depth); if (r <= 0f) continue;
+                    acc += p.Weight * r; if (roll < acc) return p;
+                }
+                return null;
+            }
+
             for (int ix = 0; ix < width; ix++)
             for (int iz = 0; iz < width; iz++)
             {
-                if (placedOre >= CC_OreCap && placedSpawner >= CC_SpawnerCap && placedGiant >= CC_GiantCap && placedBat >= CC_BatCap) break;
                 int oc = ix * width + iz;
                 int start = e.colStart[oc]; if (start < 0) continue;
                 int len = e.colLen[oc], off = e.colOff[oc];
-                // crossings within the deviating band: sign change between consecutive voxels
-                // first pass: surface = highest crossing (largest cy)
                 int surfCy = -1;
                 for (int k = 1; k < len; k++)
                     if ((e.band[off + k - 1] < 0) != (e.band[off + k] < 0)) surfCy = start + k;
@@ -222,108 +195,39 @@ namespace ProceduralTerrain
                     int cy = start + k; ci++;
                     float cyY = (e.extLo + cy) * s;
                     float depth = surfaceY - cyY; if (depth <= 1f) continue;   // skip the surface crossing itself
-                    float ramp = Mathf.Clamp01(depth / CC_DepthFull);
                     bool isFloor = aSolid && !bSolid;   // solid below, air above = standing floor
                     float yaw = CCRand(ox + ix, oz + iz, ci, 7) * 360f;
-                    // ground props tilt to the local cave-floor normal; wall/ceiling crossings stay upright.
-                    Quaternion rot = isFloor
-                        ? Quaternion.FromToRotation(Vector3.up, CaveFloorNormal(e, ix, iz, width, cyY, s)) * Quaternion.Euler(0f, yaw, 0f)
-                        : Quaternion.Euler(0f, yaw, 0f);
 
-                    Vector3 pOre = new Vector3(worldX, cyY, worldZ);
-                    // ore: any crossing
-                    if (placedOre < CC_OreCap && CCRand(ox + ix, oz + iz, ci, 1) < CC_OreMaxProb * ramp && !TooClose(oreP, pOre, CC_OreSpacing))
+                    // shared OBJECT pool: pool-wide fire chance, then weighted pick scaled by depth ramp
+                    if (objPlaced < _ccObjectCap && objPool.Count > 0 && CCRand(ox + ix, oz + iz, ci, 1) < _ccObjectProb)
                     {
-                        int oi = PickOreIndex(ox + ix, oz + iz, ci);
-                        float embed = oi >= 0 ? _oreCands[oi].embed : 0f;
-                        // buried deposits (embed>0) only on floors; bury them into the rock so they're dug out + Wishbone-findable.
-                        if (oi >= 0 && (embed == 0f || isFloor))
-                        {
-                            Vector3 p = embed > 0f ? new Vector3(worldX, cyY - embed, worldZ) : pOre;
-                            Quaternion orot = embed > 0f ? Quaternion.Euler(0f, yaw, 0f) : rot;   // buried: keep upright, don't tilt
-                            if (SpawnCave(_oreResolved![oi], p, orot, ghost, spawnedObjects))
-                            {
-                                placedOre++; perType[oi]++; oreP.Add(pOre);
-                                if (_ccLogged < 15) { _ccLogged++; Log.LogDebug($"[PT-cave] ore {_oreResolved[oi].name} at ({worldX:F0},{p.y:F0},{worldZ:F0}) depth={depth:F0} embed={embed:F0}"); }
-                            }
-                        }
+                        var p = PickPool(objPool, isFloor, depth, ix, iz, ci, 3);
+                        if (p != null && TryPlace(p, ix, iz, ci, isFloor, cyY, worldX, worldZ, yaw)) objPlaced++;
                     }
-                    // creature spawner POC: floor crossings only
-                    if (isFloor && placedSpawner < CC_SpawnerCap && CCRand(ox + ix, oz + iz, ci, 2) < CC_SpawnerMaxProb * ramp)
+                    // shared SPAWNER pool
+                    if (spwPlaced < _ccSpawnerCap && spwPool.Count > 0 && CCRand(ox + ix, oz + iz, ci, 2) < _ccSpawnerProb)
                     {
-                        Vector3 pS = new Vector3(worldX, cyY, worldZ);
-                        int si = PickSpawnerIndex(ox + ix, oz + iz, ci);
-                        if (si >= 0 && perSpawnerType[si] < _spawnerCands[si].max && !TooClose(spawnerP, pS, CC_SpawnerSpacing) && SpawnCave(_spawnerResolved![si], pS, Quaternion.Euler(0f, yaw, 0f), ghost, spawnedObjects, _spawnerOverride![si]))
-                        {
-                            placedSpawner++; perSpawnerType[si]++; spawnerP.Add(pS);
-                            Log.LogDebug($"[PT-cave] spawner {_spawnerResolved[si].name} at ({worldX:F0},{cyY:F0},{worldZ:F0}) depth={depth:F0}");
-                        }
+                        var p = PickPool(spwPool, isFloor, depth, ix, iz, ci, 10);
+                        if (p != null && TryPlace(p, ix, iz, ci, isFloor, cyY, worldX, worldZ, yaw)) spwPlaced++;
                     }
-
-                    // bats: own channel, any crossing, tight spacing, high cap → swarms in bigger caves
-                    if (placedBat < CC_BatCap && _batResolved != null && CCRand(ox + ix, oz + iz, ci, 11) < CC_BatProb * ramp)
+                    // independent channels (bats, giants, …): own per-crossing prob × depth ramp
+                    for (int j = 0; j < channels.Count; j++)
                     {
-                        Vector3 pB = new Vector3(worldX, cyY, worldZ);
-                        if (!TooClose(batP, pB, CC_BatSpacing) && SpawnCave(_batResolved, pB, Quaternion.Euler(0f, yaw, 0f), ghost, spawnedObjects)) { placedBat++; batP.Add(pB); }
-                    }
-
-                    // giant corpse scenery: deep, flat floor only, very rare, capped. Stand mostly VERTICAL with a
-                    // slight monument lean (not tilted flat to the floor like ore).
-                    if (giantEligible && isFloor && placedGiant < CC_GiantCap && depth >= CC_GiantMinDepth && CCRand(ox + ix, oz + iz, ci, 4) < CC_GiantProb && !TooClose(giantP, pOre, CC_GiantSpacing)
-                        && CaveFloorNormal(e, ix, iz, width, cyY, s).y > 0.85f)   // flat enough to stand
-                    {
-                        int gi = PickGiantIndex(ox + ix, oz + iz, ci);
-                        float tx = (CCRand(ox + ix, oz + iz, ci, 8) - 0.5f) * 24f;   // ±12° lean
-                        float tz = (CCRand(ox + ix, oz + iz, ci, 9) - 0.5f) * 24f;
-                        Quaternion grot = Quaternion.Euler(tx, yaw, tz);
-                        if (gi >= 0 && SpawnCave(_giantResolved![gi], pOre, grot, ghost, spawnedObjects))
-                        {
-                            placedGiant++; giantP.Add(pOre);
-                            Log.LogDebug($"[PT-cave] giant {_giantResolved[gi].name} at ({worldX:F0},{cyY:F0},{worldZ:F0}) depth={depth:F0}");
-                        }
+                        if (!chanOn[j]) continue;
+                        var p = channels[j];
+                        float r = p.Ramp(depth); if (r <= 0f) continue;
+                        if (CCRand(ox + ix, oz + iz, ci, 20 + j) >= p.Prob * r) continue;
+                        TryPlace(p, ix, iz, ci, isFloor, cyY, worldX, worldZ, yaw);
                     }
                 }
             }
-            if (placedOre + placedSpawner + placedBat > 0)
+            if (st.Count > 0)
             {
                 var sb = new System.Text.StringBuilder();
-                for (int i = 0; i < perType.Length; i++) if (perType[i] > 0) sb.Append($" {_oreCands[i].tag}={perType[i]}");
-                Log.LogDebug($"[PT-cave] zone ({ox},{oz}): +{placedOre} ore ({sb}), +{placedSpawner} spawners, +{placedBat} bats, +{placedGiant} giant");
+                int tot = 0;
+                foreach (var kv in st) if (kv.Value.count > 0) { sb.Append($" {kv.Key.Name}={kv.Value.count}"); tot += kv.Value.count; }
+                if (tot > 0) Log.LogDebug($"[PT-cave] zone ({ox},{oz}):{sb}");
             }
-        }
-
-        static int PickSpawnerIndex(int a, int b, int c)
-        {
-            if (_spawnerResolved == null) return -1;
-            int total = 0;
-            for (int i = 0; i < _spawnerResolved.Length; i++) if (_spawnerResolved[i] != null) total += _spawnerCands[i].weight;
-            if (total == 0) return -1;
-            float r = CCRand(a, b, c, 10) * total; int acc = 0;
-            for (int i = 0; i < _spawnerResolved.Length; i++)
-                if (_spawnerResolved[i] != null) { acc += _spawnerCands[i].weight; if (r < acc) return i; }
-            return -1;
-        }
-
-        static int PickGiantIndex(int a, int b, int c)
-        {
-            if (_giantResolved == null) return -1;
-            var idx = new List<int>();
-            for (int i = 0; i < _giantResolved.Length; i++) if (_giantResolved[i] != null) idx.Add(i);
-            if (idx.Count == 0) return -1;
-            return idx[(int)(CCRand(a, b, c, 5) * idx.Count) % idx.Count];
-        }
-
-        // weighted pick among RESOLVED ores (skips NONE slots), or -1 if none resolved.
-        static int PickOreIndex(int a, int b, int c)
-        {
-            if (_oreResolved == null) return -1;
-            int total = 0;
-            for (int i = 0; i < _oreResolved.Length; i++) if (_oreResolved[i] != null) total += _oreCands[i].weight;
-            if (total == 0) return -1;
-            float r = CCRand(a, b, c, 3) * total; int acc = 0;
-            for (int i = 0; i < _oreResolved.Length; i++)
-                if (_oreResolved[i] != null) { acc += _oreCands[i].weight; if (r < acc) return i; }
-            return -1;
         }
 
         static bool TooClose(List<Vector3> pts, Vector3 p, float min)
@@ -340,9 +244,17 @@ namespace ProceduralTerrain
                 if (ghost) ZNetView.StartGhostInit();
                 var go = UnityEngine.Object.Instantiate(prefab, pos, rot);
                 if (ghost) { spawnedObjects.Add(go); ZNetView.FinishGhostInit(); }
-                // ZDO exists now (committed for ghost at FinishGhostInit); stamp it so the Awake patch picks it up.
                 if (overrideCreature != 0)
+                {
+                    // Two steps, because CreatureSpawner.Awake already ran during Instantiate (before the ZDO
+                    // existed) so its read of our key found nothing:
+                    //  1) stamp the ZDO — picked up by the Awake patch on every FUTURE load of this spawner.
+                    //  2) set m_creaturePrefab directly on THIS instance — applies now, for the current session.
                     go.GetComponent<ZNetView>()?.GetZDO()?.Set(CreatureSpawnerOverridePatch.Key, overrideCreature);
+                    var cs = go.GetComponent<CreatureSpawner>();
+                    var pf = ZNetScene.instance?.GetPrefab(overrideCreature);
+                    if (cs != null && pf != null && pf.GetComponent<Character>() != null) cs.m_creaturePrefab = pf;
+                }
                 return true;
             }
             catch (Exception ex) { Log.LogWarning($"[PT-cave] spawn {prefab.name} failed: {ex.Message}"); if (ghost) ZNetView.FinishGhostInit(); return false; }

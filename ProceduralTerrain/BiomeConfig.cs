@@ -35,7 +35,17 @@ namespace ProceduralTerrain
         internal static string PTConfigDir =>
             Path.Combine(BepInEx.Paths.ConfigPath, "ProceduralTerrain");
         internal static string ConfigPath =>
-            Path.Combine(PTConfigDir, "procedural_terrain_biomes.cfg");
+            Path.Combine(PTConfigDir, "biomes.cfg");
+
+        // Read an embedded default config (configs/*.cfg, embedded at build). Empty string if absent.
+        internal static string ReadEmbeddedConfig(string logicalName)
+        {
+            var asm = typeof(Plugin).Assembly;
+            using var s = asm.GetManifestResourceStream(logicalName);
+            if (s == null) { Log.LogWarning($"[ProceduralTerrain] embedded config '{logicalName}' missing."); return ""; }
+            using var r = new StreamReader(s);
+            return r.ReadToEnd();
+        }
 
         // Parse a [Mode:name] section into a ModeDefinition subclass.
         static ModeDefinition? ParseModeDefinition(string name, List<(string key, string val)> kvs)
@@ -288,16 +298,10 @@ namespace ProceduralTerrain
                 {
                     foreach (var (k, v) in kvs)
                     {
-                        if (k == "disablevegetation")
-                            _disableVegetation = v == "1" || v == "true";
-                        if (k == "vegetationconform")
-                            _vegetationConform = !(v == "0" || v == "false");
-                        if (k == "vegmaxtilt" && float.TryParse(v, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float vmt))
-                            _vegMaxTilt = Mathf.Clamp(vmt, 0f, 90f);
+                        // NOTE: vegetation + cave-content/placement keys live in the separate placement cfg
+                        // (procedural_terrain_placements.cfg), not here. This cfg is terrain shaping only.
                         if (k == "seed")
                             _forcedSeed = string.IsNullOrWhiteSpace(v) ? null : v.Trim();
-                        if (k == "cavecontent")
-                            _caveContent = (v == "1" || v == "true");
                         if (k == "prefetch")
                             ZonePrefetcher.Enabled = (v == "1" || v == "true");
                         if (k == "prefetchradius" && int.TryParse(v, out int prr))
@@ -498,62 +502,12 @@ namespace ProceduralTerrain
             }
         }
 
+        // Write the shipped, tuned biome config (embedded at build from configs/biomes.cfg) to disk on first
+        // launch. Only called when the file is absent, so player edits are never clobbered on update.
         static void WriteDefaultBiomeConfig(string path)
         {
-            var sb = new System.Text.StringBuilder();
-
-            sb.AppendLine("# ProceduralTerrain — edit and save to hot-reload in-game");
-            sb.AppendLine("#");
-            sb.AppendLine("# Three-tier config: Modes → Profiles → Biomes");
-            sb.AppendLine("#   [Mode:name]     — named terrain primitive (type A/B/C/D + params)");
-            sb.AppendLine("#   [Profile:name]  — ordered list of mode names + profile-level params");
-            sb.AppendLine("#   [BiomeName]     — assigns a profile to a biome");
-            sb.AppendLine("#");
-            sb.AppendLine("# ── Mode parameter reference ──────────────────────────────────────────");
-            sb.AppendLine("# [Mode:my_mode]");
-            sb.AppendLine("# type        = D          # A / B / C / D");
-            sb.AppendLine("# amplitude   = 0          # on/off + strength; distance-blended across biomes");
-            sb.AppendLine("# # Type A (tunnel network): frequency warpAmp warpAmpY warpFrequency vScale widthVary widthFrequency yOffset");
-            sb.AppendLine("# # Type B (surface band):   warpAmp warpFrequency vScale noiseAmp yOffset twist");
-            sb.AppendLine("# # Type C (density field):  threshold frequency warpAmp warpFrequency vScale twist twistVary twistFrequency ampVary ampFrequency flare yOffset");
-            sb.AppendLine("# # Type D (coast ridges):   freqT freqN blurRadius alignment vScale gradFade seaFade");
-            sb.AppendLine("#");
-            sb.AppendLine("# ── Profile reference ────────────────────────────────────────────────");
-            sb.AppendLine("# [Profile:my_profile]");
-            sb.AppendLine("# include     = other_profile   # prepend another profile's modes (must be defined above)");
-            sb.AppendLine("# modes       = mode_a, mode_b  # ordered list of mode names");
-            sb.AppendLine("# floorDepth  = 8               # wu below surface where carving stops");
-            sb.AppendLine("# floorFade   = 0               # wu above floorY over which carving tapers");
-            sb.AppendLine("# blur_passes = 0               # XZ smoothing passes (0=off)");
-            sb.AppendLine("# ─────────────────────────────────────────────────────────────────────");
-            sb.AppendLine();
-            sb.AppendLine("[Debug]");
-            sb.AppendLine("disableVegetation = false");
-            sb.AppendLine("protectLocations  = true");
-            sb.AppendLine("islandRemoval     = true");
-            sb.AppendLine("pocketRemoval     = true");
-            sb.AppendLine("biomeBlendRadius  = 192");
-            sb.AppendLine("coastFade         = 0");
-            sb.AppendLine();
-
-            sb.AppendLine("[Profile:vanilla_heightmap]");
-            sb.AppendLine("# No modes — vanilla heightmap only");
-            sb.AppendLine();
-
-            var biomes = new[]
-            {
-                Heightmap.Biome.Meadows, Heightmap.Biome.BlackForest, Heightmap.Biome.Swamp,
-                Heightmap.Biome.Mountain, Heightmap.Biome.Plains, Heightmap.Biome.Mistlands,
-                Heightmap.Biome.AshLands, Heightmap.Biome.DeepNorth, Heightmap.Biome.Ocean,
-            };
-            foreach (var biome in biomes)
-            {
-                sb.AppendLine($"[{biome}]");
-                sb.AppendLine("profile = vanilla_heightmap");
-                sb.AppendLine();
-            }
-
-            File.WriteAllText(path, sb.ToString());
+            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+            File.WriteAllText(path, ReadEmbeddedConfig("ProceduralTerrain.biomes.cfg"));
             Log.LogInfo($"[ProceduralTerrain] Wrote default biome config to {path}");
         }
 

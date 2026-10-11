@@ -26,10 +26,6 @@ target = "plugins/ProceduralTerrain.dll"
 source = "./CHANGELOG.md"
 target = "CHANGELOG.md"
 
-[[build.copy]]
-source = "./procedural_terrain_biomes.example.cfg"
-target = "config/procedural_terrain_biomes.example.cfg"
-
 [publish]
 repository = "https://thunderstore.io"
 communities = ["valheim"]

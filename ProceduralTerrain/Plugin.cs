@@ -1011,6 +1011,7 @@ namespace ProceduralTerrain
             RebuildNoisePool(_noiseCount);
             LoadBiomeConfig();
             WatchBiomeConfig();
+            LoadPlacementConfig();
             var harmony = new Harmony("com.ctogle.procedural_terrain");
             harmony.PatchAll();
 
@@ -1417,6 +1418,8 @@ namespace ProceduralTerrain
 
             if (!_locationsCached)
                 BuildLocationCache(); // caches once LocationsGenerated; sets _hotReloadPending → RecarveAll
+
+            WatchPlacementConfigReload();   // independent file; no recarve needed
 
             var t    = File.GetLastWriteTimeUtc(ConfigPath);
             var tLua = LatestLuaWrite();

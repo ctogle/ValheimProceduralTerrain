@@ -6,17 +6,19 @@ Procedural terrain system for Valheim built on top of [Voxheim](https://thunders
 
 ## Features
 
-- **Hot-reload config** — edit and save `procedural_terrain_biomes.cfg` while in-game; terrain remeshes live without restarting
+- **Hot-reload config** — edit and save the config files while in-game; terrain remeshes live without restarting
 - **Per-biome noise profiles** — combine named terrain modes into profiles and map each biome to one; biome boundaries blend smoothly
-- **SDF bake system** — pre-compute terrain for a radius and save to disk, eliminating zone-load hitching for baked areas
+- **Cave content** — ore, scenery, and creature spawners placed inside carved caverns (on top of vanilla), configurable per prefab and biome
+- **Locations preserved** — world locations (dungeons, bosses, villages, etc.) sit at their exact vanilla positions, and the terrain around them is protected during generation so they stay accessible
+- **SDF bake system** — pre-compute terrain for a radius and save to disk, so baked areas load cheaply instead of carving live
 - **Multiplayer bake distribution** — clients auto-download a server's bake on join; playable (with stutter) while the bake generates and downloads, hitch-free once it's in place
 
 ## How it works
 
 Two steps:
 
-1. **Configure the terrain** *(optional)*. The world's shape comes from `procedural_terrain_biomes.cfg` — noise modes combined into per-biome profiles. Tuning it well is the deep end and takes effort. **If you just want to play, skip this** — the mod ships with novel defaults for the first four biomes.
-2. **Bake it for a playthrough.** Once you've settled on a config, bake the terrain to disk. Generating it at full quality live is expensive, so the bake pre-computes it once and serves it back with no hitching.
+1. **Configure the terrain** *(optional)*. The world's shape comes from `biomes.cfg` — noise modes combined into per-biome profiles. Tuning it well is the deep end and takes effort. **If you just want to play, skip this** — the mod writes tuned defaults on first launch (novel terrain for the first four biomes).
+2. **Bake it for a playthrough.** Once you've settled on a config, bake the terrain to disk. Generating it at full quality live is expensive, so the bake pre-computes it once and serves it back cheaply.
 
 ### Why bake, and how it's keyed
 
@@ -26,7 +28,7 @@ A bake is tied to **(world seed + config)** — the same seed string and the sam
 
 Bake on the server once (`pt_bake`, admin-only). It runs in the background. When a client connects, if it doesn't already have the matching bake it **downloads it from the server** on join (with a progress bar); clients that already have an identical copy skip the download.
 
-**During baking and downloading the world is fully playable** — terrain carves live as a fallback — but it **will stutter** until the bake is in place. Once it is, generation is hitch-free.
+**During baking and downloading the world is fully playable** — terrain carves live as a fallback — but it **will stutter** until the bake is in place. Once it is, zone loading is cheap.
 
 ## Requirements
 
@@ -35,12 +37,18 @@ Bake on the server once (`pt_bake`, admin-only). It runs in the background. When
 
 ## Configuration
 
-Biome profiles live in `BepInEx/config/procedural_terrain_biomes.cfg` and hot-reload on save. A fully commented example config with all parameters documented is included in the download.
+Config lives in `BepInEx/config/ProceduralTerrain/` as two files, both fully commented and both hot-reloading on save. The mod writes them with tuned defaults on first launch; edits are never overwritten on update.
 
-The config has three sections:
-- `[Bake]` — bake resolution and compression settings
-- `[Debug]` — global terrain toggles and blending parameters
-- `[Profile:name]` / `[BiomeName]` — per-biome noise profiles and biome-to-profile mappings
+**`biomes.cfg`** — the terrain *shape*:
+- `[Bake]` — bake resolution, format, and compression
+- `[Debug]` — global terrain toggles, blend radius, live carve resolution, and the optional forced seed
+- `[Profile:name]` / `[BiomeName]` — named noise profiles and the biome→profile assignments
+- `[Mode:name]` / `[Pipeline]` — the terrain primitives and the order they run in
+
+**`placements.cfg`** — *what* gets placed in the world:
+- `[Vegetation]` — whether trees/bushes place at all, and how they conform to carved ground
+- `[CaveContent]` — master toggle plus the shared ore/spawner pool densities and per-zone caps
+- `[Placement:name]` — one rule per thing spawned in caves (ore, scenery, or creature spawner): its prefab/chassis, biome, weight, and depth/placement options
 
 ## Baking
 
