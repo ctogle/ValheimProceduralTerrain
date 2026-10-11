@@ -296,6 +296,8 @@ namespace ProceduralTerrain
                             _vegMaxTilt = Mathf.Clamp(vmt, 0f, 90f);
                         if (k == "seed")
                             _forcedSeed = string.IsNullOrWhiteSpace(v) ? null : v.Trim();
+                        if (k == "cavecontent")
+                            _caveContent = (v == "1" || v == "true");
                         if (k == "prefetch")
                             ZonePrefetcher.Enabled = (v == "1" || v == "true");
                         if (k == "prefetchradius" && int.TryParse(v, out int prr))
@@ -314,6 +316,8 @@ namespace ProceduralTerrain
                             _pocketRemoval = !(v == "0" || v == "false");
                         if (k == "hidelodmeshes")
                             _hideLodMeshes = (v == "1" || v == "true");
+                        if (k == "lodunderground")
+                            _lodUnderground = !(v == "0" || v == "false");
                         if (k == "debugviz")
                             DebugViz.Enabled = _debugViz = (v == "1" || v == "true");
                         if (k == "debugvizocclude")

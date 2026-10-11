@@ -2573,7 +2573,13 @@ namespace ProceduralTerrain
             Plugin._inVegPlacement = true;                 // scope the GetGroundData postfix to this call
             return true;
         }
-        static void Postfix() => Plugin._inVegPlacement = false;
+        // runs once per zone at generation, SDF ready (gate) → place additional cave content (rung 2 POC)
+        static void Postfix(Vector3 zoneCenterPos, ZoneSystem.SpawnMode mode, List<GameObject> spawnedObjects)
+        {
+            Plugin._inVegPlacement = false;
+            try { Plugin.PlaceCaveContent(zoneCenterPos, mode, spawnedObjects); }
+            catch (Exception e) { Plugin.Log.LogWarning($"[PT-cave] PlaceCaveContent threw: {e.Message}"); }
+        }
     }
 
     // Vanilla vegetation placement samples the 2.5D heightmap via GetGroundData (it raycasts a collider with a

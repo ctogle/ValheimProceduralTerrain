@@ -151,16 +151,29 @@ namespace ProceduralTerrain
     [HarmonyPatch(typeof(TerrainLod), "Update")]
     static class TerrainLodHidePatch
     {
-        static bool Prefix(TerrainLod __instance)
+        static bool _hidden;   // transition tracking so we re-show when surfacing
+
+        static void SetAll(TerrainLod inst, bool active)
         {
-            if (!Plugin._hideLodMeshes) return true;
-            if (Traverse.Create(__instance).Field("m_heightmaps").GetValue() is System.Collections.IList hms)
+            if (Traverse.Create(inst).Field("m_heightmaps").GetValue() is System.Collections.IList hms)
                 foreach (var o in hms)
                 {
                     var hm = Traverse.Create(o).Field("m_heightmap").GetValue<Heightmap>();
-                    if (hm != null && hm.gameObject.activeSelf) hm.gameObject.SetActive(false);
+                    if (hm != null && hm.gameObject.activeSelf != active) hm.gameObject.SetActive(active);
                 }
-            return false;   // skip the normal update so meshes aren't rebuilt/re-shown
+        }
+
+        static bool Prefix(TerrainLod __instance)
+        {
+            // Hide when manually forced OR when the player is underground (auto). Dynamic: re-show on surfacing.
+            bool hide = Plugin._hideLodMeshes || (Plugin._lodUnderground && Plugin._playerUnderground);
+            if (hide)
+            {
+                if (!_hidden) { SetAll(__instance, false); _hidden = true; }
+                return false;   // skip the normal update so meshes aren't rebuilt/re-shown
+            }
+            if (_hidden) { SetAll(__instance, true); _hidden = false; }   // surfaced → restore
+            return true;        // normal LOD update
         }
     }
 

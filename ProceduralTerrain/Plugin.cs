@@ -741,6 +741,9 @@ namespace ProceduralTerrain
         internal static bool  _islandRemoval       = true;
         internal static bool  _pocketRemoval       = true;
         internal static bool  _hideLodMeshes       = false;  // DEBUG: hide Valheim's distant TerrainLod meshes (clear view of voxel features)
+        internal static bool  _lodUnderground      = true;   // auto-hide the distant LOD terrain while the player is underground (in a cave/tunnel)
+        internal static volatile bool _playerUnderground;    // updated each Update from player Y vs the carved surface
+        const float LOD_UndergroundMargin = 4f;              // metres below surface before we consider the player "underground"
         internal static bool  _debugViz            = false;  // DEBUG: draw see-through overlay lines for brush seeds/paths (tunnels now, spines later)
         internal static int   _overlap             = 4;      // running-field margin (voxels) shared with neighbour zones; caps seam-free feature reach
         internal static float _fieldDepthLo        = 0f;     // min world-metres the carvable field extends BELOW terrain min (0=default). Raise so deep tunnels stay in-field
@@ -1124,6 +1127,25 @@ namespace ProceduralTerrain
                 }
                 catch (Exception e) { Log.LogError($"[PT] noisemap exception: {e}"); }
             });
+            new Terminal.ConsoleCommand("pt_dumpprefabs", "pt_dumpprefabs — write every ZNetScene prefab name (sorted) to BepInEx/config/ProceduralTerrain/prefab_names.txt", _ =>
+            {
+                try
+                {
+                    var zs = ZNetScene.instance;
+                    if (zs == null) { Console.instance?.Print("[PT] ZNetScene not ready (load a world first)."); return; }
+                    var f = typeof(ZNetScene).GetField("m_namedPrefabs", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+                    var names = new System.Collections.Generic.List<string>();
+                    if (f?.GetValue(zs) is System.Collections.IDictionary dict)
+                        foreach (var v in dict.Values) if (v is GameObject go) names.Add(go.name);
+                    names.Sort(StringComparer.OrdinalIgnoreCase);
+                    System.IO.Directory.CreateDirectory(PTConfigDir);
+                    string path = System.IO.Path.Combine(PTConfigDir, "prefab_names.txt");
+                    System.IO.File.WriteAllLines(path, names);
+                    var msg = $"[PT] wrote {names.Count} prefab names → {path}";
+                    Log.LogInfo(msg); Console.instance?.Print(msg);
+                }
+                catch (Exception e) { Log.LogError($"[PT] dumpprefabs: {e}"); }
+            });
             new Terminal.ConsoleCommand("pt_bake", "pt_bake [radius] — bake terrain SDF for a radius in meters; runs on server (admin only)", args =>
             {
                 float radius = _bakeRadius;
@@ -1373,6 +1395,19 @@ namespace ProceduralTerrain
             // Demand-driven carve: the SpawnZone gate (SpawnZonePrefetchGate) requests carves as ZoneSystem
             // asks for zones and makes it retry until ready — no racing ring. Just keep workers alive.
             if (ZonePrefetcher.Enabled) ZonePrefetcher.Start();   // idempotent
+
+            // Track underground state for the LOD-hide toggle: player Y well below the carved surface = in a cave.
+            if (_lodUnderground)
+            {
+                var pl = Player.m_localPlayer;
+                if (pl != null)
+                {
+                    var p = pl.transform.position;
+                    _playerUnderground = FindCarvedSurfaceY(p.x, p.y, p.z) - p.y > LOD_UndergroundMargin;
+                }
+                else _playerUnderground = false;
+            }
+            else _playerUnderground = false;
 
             // Fast-poll while waiting for locations to finish generating (the time-sliced coroutine
             // fills them over several frames); BuildLocationCache no-ops until ZoneSystem reports
