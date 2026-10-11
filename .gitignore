@@ -10,8 +10,8 @@
 dist/
 *.zip
 
-# Machine-specific files — copy *.template, fill in your paths
-ProceduralTerrain/ProceduralTerrain.csproj
+# Machine-specific files — copy *.example / *.template, fill in your paths
+ProceduralTerrain/Directory.Build.props
 deploy.sh
 publish.sh
 sync_server.sh

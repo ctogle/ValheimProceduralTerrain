@@ -1,0 +1,10 @@
+<!-- Copy this file to Directory.Build.props (which is gitignored) and point these at your install.
+     MSBuild auto-imports Directory.Build.props before building ProceduralTerrain.csproj. -->
+<Project>
+  <PropertyGroup>
+    <!-- Valheim's managed DLL folder (UnityEngine.*, assembly_valheim, etc.) -->
+    <ValheimManaged>C:\Program Files (x86)\Steam\steamapps\common\Valheim\valheim_Data\Managed</ValheimManaged>
+    <!-- Your BepInEx root (contains core\ and plugins\Voxheim-Voxheim\) -->
+    <BepInExPath>C:\path\to\BepInEx</BepInExPath>
+  </PropertyGroup>
+</Project>
