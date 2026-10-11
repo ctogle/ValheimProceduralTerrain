@@ -185,7 +185,7 @@ namespace ProceduralTerrain
             CaveContentDump();
             CaveContentResolve();
             var biome = wg.GetBiome(zoneCenterPos.x, zoneCenterPos.z);
-            if (_ccLogged < 25) { _ccLogged++; Log.LogInfo($"[PT-cave] zone center ({zoneCenterPos.x:F0},{zoneCenterPos.z:F0}) biome={biome}"); }
+            if (_ccLogged < 25) { _ccLogged++; Log.LogDebug($"[PT-cave] zone center ({zoneCenterPos.x:F0},{zoneCenterPos.z:F0}) biome={biome}"); }
             if (biome != Heightmap.Biome.Mountain) return;
 
             float s = ActiveScale();
@@ -244,7 +244,7 @@ namespace ProceduralTerrain
                             if (SpawnCave(_oreResolved![oi], p, orot, ghost, spawnedObjects))
                             {
                                 placedOre++; perType[oi]++; oreP.Add(pOre);
-                                if (_ccLogged < 15) { _ccLogged++; Log.LogInfo($"[PT-cave] ore {_oreResolved[oi].name} at ({worldX:F0},{p.y:F0},{worldZ:F0}) depth={depth:F0} embed={embed:F0}"); }
+                                if (_ccLogged < 15) { _ccLogged++; Log.LogDebug($"[PT-cave] ore {_oreResolved[oi].name} at ({worldX:F0},{p.y:F0},{worldZ:F0}) depth={depth:F0} embed={embed:F0}"); }
                             }
                         }
                     }
@@ -256,7 +256,7 @@ namespace ProceduralTerrain
                         if (si >= 0 && perSpawnerType[si] < _spawnerCands[si].max && !TooClose(spawnerP, pS, CC_SpawnerSpacing) && SpawnCave(_spawnerResolved![si], pS, Quaternion.Euler(0f, yaw, 0f), ghost, spawnedObjects, _spawnerOverride![si]))
                         {
                             placedSpawner++; perSpawnerType[si]++; spawnerP.Add(pS);
-                            Log.LogInfo($"[PT-cave] spawner {_spawnerResolved[si].name} at ({worldX:F0},{cyY:F0},{worldZ:F0}) depth={depth:F0}");
+                            Log.LogDebug($"[PT-cave] spawner {_spawnerResolved[si].name} at ({worldX:F0},{cyY:F0},{worldZ:F0}) depth={depth:F0}");
                         }
                     }
 
@@ -279,7 +279,7 @@ namespace ProceduralTerrain
                         if (gi >= 0 && SpawnCave(_giantResolved![gi], pOre, grot, ghost, spawnedObjects))
                         {
                             placedGiant++; giantP.Add(pOre);
-                            Log.LogInfo($"[PT-cave] giant {_giantResolved[gi].name} at ({worldX:F0},{cyY:F0},{worldZ:F0}) depth={depth:F0}");
+                            Log.LogDebug($"[PT-cave] giant {_giantResolved[gi].name} at ({worldX:F0},{cyY:F0},{worldZ:F0}) depth={depth:F0}");
                         }
                     }
                 }
@@ -288,7 +288,7 @@ namespace ProceduralTerrain
             {
                 var sb = new System.Text.StringBuilder();
                 for (int i = 0; i < perType.Length; i++) if (perType[i] > 0) sb.Append($" {_oreCands[i].tag}={perType[i]}");
-                Log.LogInfo($"[PT-cave] zone ({ox},{oz}): +{placedOre} ore ({sb}), +{placedSpawner} spawners, +{placedBat} bats, +{placedGiant} giant");
+                Log.LogDebug($"[PT-cave] zone ({ox},{oz}): +{placedOre} ore ({sb}), +{placedSpawner} spawners, +{placedBat} bats, +{placedGiant} giant");
             }
         }
 

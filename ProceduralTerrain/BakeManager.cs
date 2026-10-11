@@ -573,7 +573,7 @@ namespace ProceduralTerrain
             long _tpEnd = System.Diagnostics.Stopwatch.GetTimestamp();
             double _yi = yInterpTicks * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
             double _enc = encodeTicks * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
-            Log.LogInfo($"[PT-serve] ({ox},{oz}) decode={MsBetween(_tp0,_tpDec):F1} raw={MsBetween(_tpDec,_tpRaw):F1} passX={MsBetween(_tpRaw,_tpX):F1} passZ={MsBetween(_tpX,_tpZ):F1} yrecon={MsBetween(_tpZ,_tpY):F1}[yinterp={_yi:F1} encode={_enc:F1}] finalize={MsBetween(_tpY,_tpEnd):F1} total={MsBetween(_tp0,_tpEnd):F1}ms");
+            Log.LogDebug($"[PT-serve] ({ox},{oz}) decode={MsBetween(_tp0,_tpDec):F1} raw={MsBetween(_tpDec,_tpRaw):F1} passX={MsBetween(_tpRaw,_tpX):F1} passZ={MsBetween(_tpX,_tpZ):F1} yrecon={MsBetween(_tpZ,_tpY):F1}[yinterp={_yi:F1} encode={_enc:F1}] finalize={MsBetween(_tpY,_tpEnd):F1} total={MsBetween(_tp0,_tpEnd):F1}ms");
             return true;
         }
 

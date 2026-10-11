@@ -112,7 +112,7 @@ namespace ProceduralTerrain
                 {
                     _lastLogCarved = (int)carved;
                     int qd, ifl; lock (_lock) { qd = _queue.Count; ifl = _inFlight.Count; }
-                    Plugin.Log.LogInfo($"[PT-prefetch] carved={carved} failed={Interlocked.Read(ref _failed)} queue={qd} inflight={ifl} cache={Plugin._sdfCache.Count}");
+                    Plugin.Log.LogDebug($"[PT-prefetch] carved={carved} failed={Interlocked.Read(ref _failed)} queue={qd} inflight={ifl} cache={Plugin._sdfCache.Count}");
                 }
             }
         }

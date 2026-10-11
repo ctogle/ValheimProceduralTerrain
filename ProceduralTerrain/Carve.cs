@@ -88,7 +88,7 @@ namespace ProceduralTerrain
                 if (PopulateSparseFromBake(ox, oz, bwEarly, bakedE.bh, bakedE.extLo, s, voxelFloorY, overlap))
                 {
                     double fms = (System.Diagnostics.Stopwatch.GetTimestamp() - ft0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
-                    if (fms > 2.0) Log.LogInfo($"[PT-load] baked zone ({ox},{oz}) fused={fms:F2}ms (bh={bakedE.bh})");
+                    if (fms > 2.0) Log.LogDebug($"[PT-load] baked zone ({ox},{oz}) fused={fms:F2}ms (bh={bakedE.bh})");
                     return;
                 }
             }
@@ -119,7 +119,7 @@ namespace ProceduralTerrain
             long _tbbp = System.Diagnostics.Stopwatch.GetTimestamp();
             if (wg != null && !knownVanilla) BakeBlendedProfiles(cw4Early, ox, oz, overlap, s, wg);
             double bbpMs = (System.Diagnostics.Stopwatch.GetTimestamp() - _tbbp) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
-            if (bbpMs > 3.0) Log.LogInfo($"[PT-load] BakeBlendedProfiles ({ox},{oz}) = {bbpMs:F2}ms cw4Early={cw4Early}");
+            if (bbpMs > 3.0) Log.LogDebug($"[PT-load] BakeBlendedProfiles ({ox},{oz}) = {bbpMs:F2}ms cw4Early={cw4Early}");
 
             CaveProfile ProfAt(int cx4, int cz4) =>
                 (_blendedProfs != null && cx4 * cw4Early + cz4 < _blendedProfs.Length)
@@ -578,7 +578,7 @@ namespace ProceduralTerrain
             _phSparse = System.Diagnostics.Stopwatch.GetTimestamp();
             double _pms(long a, long b) => (b - a) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
             if (_pms(_ph0, _phSparse) > 5.0)
-                Log.LogInfo($"[PT-phases] ({ox},{oz}) setup={_pms(_ph0,_phSetup):F1} fill={_pms(_phSetup,_phFill):F1} blur={_pms(_phFill,_phBlur):F1} island={_pms(_phBlur,_phIsland):F1} pocket={_pms(_phIsland,_phPocket):F1} stage={_pms(_phPocket,_phStage):F1} surf={_pms(_phStage,_phSurf):F1} sparse={_pms(_phSurf,_phSparse):F1} total={_pms(_ph0,_phSparse):F1}ms (bh={bh})");
+                Log.LogDebug($"[PT-phases] ({ox},{oz}) setup={_pms(_ph0,_phSetup):F1} fill={_pms(_phSetup,_phFill):F1} blur={_pms(_phFill,_phBlur):F1} island={_pms(_phBlur,_phIsland):F1} pocket={_pms(_phIsland,_phPocket):F1} stage={_pms(_phPocket,_phStage):F1} surf={_pms(_phStage,_phSurf):F1} sparse={_pms(_phSurf,_phSparse):F1} total={_pms(_ph0,_phSparse):F1}ms (bh={bh})");
 
             if (_dumpZonesRemaining > 0)
             {
@@ -1706,7 +1706,7 @@ namespace ProceduralTerrain
                             else if (c.y > fieldYhi) aboveField++;
                             if (c.x < wxLo || c.x > wxHi || c.z < wzLo || c.z > wzHi) outsideXZ++;
                         }
-                        Log.LogInfo($"[PT-blobs-diag] ({ox},{oz}) fieldY=[{fieldYlo:F0},{fieldYhi:F0}] stampY=[{minCY:F0},{maxCY:F0}] centers={centers.Count} belowField={belowField} aboveField={aboveField} outsideXZ={outsideXZ}");
+                        Log.LogDebug($"[PT-blobs-diag] ({ox},{oz}) fieldY=[{fieldYlo:F0},{fieldYhi:F0}] stampY=[{minCY:F0},{maxCY:F0}] centers={centers.Count} belowField={belowField} aboveField={aboveField} outsideXZ={outsideXZ}");
 
                         // Spatial buckets (cell = reach) so each voxel tests only stamps in its 27 neighbour
                         // buckets, not all N. Turns the union from O(voxels*centers) into O(voxels*localCenters).
@@ -1772,7 +1772,7 @@ namespace ProceduralTerrain
                                 if (nr != r) { r = nr; dbgHit++; }
                             }
                         }
-                        Log.LogInfo($"[PT-blobs] centers={centers.Count} L={L:F0} rad=[{minR:F1},{maxR:F1}] stretchN={stretchN:F1} carve={carve} branches={branchEvents} branchprob={branchProb:F2} flow={flowSteer:F2} hub={hubSeek:F2} maxreach={maxChainReach:F0}m ridgeratio={ridgeRatio:F1} solidVoxels={dbgHit} curv=[{curvMin:F3},{curvMax:F3}]");
+                        Log.LogDebug($"[PT-blobs] centers={centers.Count} L={L:F0} rad=[{minR:F1},{maxR:F1}] stretchN={stretchN:F1} carve={carve} branches={branchEvents} branchprob={branchProb:F2} flow={flowSteer:F2} hub={hubSeek:F2} maxreach={maxChainReach:F0}m ridgeratio={ridgeRatio:F1} solidVoxels={dbgHit} curv=[{curvMin:F3},{curvMax:F3}]");
                         if (needsEikonal) RedistanceEikonal(_runSDF!, cw4, cw4, ch, xzStep, xzStep, yStep, 2);
                         continue;
                     }
@@ -1791,7 +1791,7 @@ namespace ProceduralTerrain
                             float maxD = 0f;
                             for (int cell = 0; cell < cellCount; cell++)
                                 maxD = Mathf.Max(maxD, Mathf.Abs(_composeInH![cell] - _composeHCell![cell]));
-                            Log.LogInfo($"[PT-compose] {mode.Name}: incoming surface vs base ground maxΔ={maxD:F1}m (>0 ⇒ conforming to prior modes)");
+                            Log.LogDebug($"[PT-compose] {mode.Name}: incoming surface vs base ground maxΔ={maxD:F1}m (>0 ⇒ conforming to prior modes)");
                         }
                         // ...then the downslope frame from that elevation field (central difference).
                         for (int cx4 = 0; cx4 < cw4; cx4++)
@@ -2601,7 +2601,7 @@ namespace ProceduralTerrain
             bool diag = _diag < 40;
             if (!Plugin.TrySampleSurfaceY(p.x, p.z, out float sh))
             {
-                if (diag) { _diag++; Plugin.Log.LogInfo($"[PT-veg] ({p.x:F0},{p.z:F0}) surfH MISS → vanilla normal.y={normal.y:F2}  [cache={Plugin._surfHCache.Count} zones, want key={Plugin.SurfKeyFor(p.x, p.z)}]"); }
+                if (diag) { _diag++; Plugin.Log.LogDebug($"[PT-veg] ({p.x:F0},{p.z:F0}) surfH MISS → vanilla normal.y={normal.y:F2}  [cache={Plugin._surfHCache.Count} zones, want key={Plugin.SurfKeyFor(p.x, p.z)}]"); }
                 return;   // zone not carved yet → leave vanilla
             }
             float oldY = p.y;
@@ -2619,9 +2619,9 @@ namespace ProceduralTerrain
                 bool reject = n.y < Mathf.Cos(Mathf.Deg2Rad * Plugin._vegMaxTilt);
                 // Stricter-than-vanilla cutoff: force horizontal (y=0) so the existing tilt gate drops it.
                 if (reject) normal = new Vector3(1f, 0f, 0f);
-                if (diag) { _diag++; Plugin.Log.LogInfo($"[PT-veg] ({p.x:F0},{p.z:F0}) snapY {oldY:F1}→{sh:F1} n.y={n.y:F2} {(reject ? "REJECT" : "keep")} (surfH {hmx:F1}/{hpx:F1}/{hmz:F1}/{hpz:F1})"); }
+                if (diag) { _diag++; Plugin.Log.LogDebug($"[PT-veg] ({p.x:F0},{p.z:F0}) snapY {oldY:F1}→{sh:F1} n.y={n.y:F2} {(reject ? "REJECT" : "keep")} (surfH {hmx:F1}/{hpx:F1}/{hmz:F1}/{hpz:F1})"); }
             }
-            else if (diag) { _diag++; Plugin.Log.LogInfo($"[PT-veg] ({p.x:F0},{p.z:F0}) snapY {oldY:F1}→{sh:F1} but neighbor surfH MISS → normal untouched"); }
+            else if (diag) { _diag++; Plugin.Log.LogDebug($"[PT-veg] ({p.x:F0},{p.z:F0}) snapY {oldY:F1}→{sh:F1} but neighbor surfH MISS → normal untouched"); }
         }
     }
 

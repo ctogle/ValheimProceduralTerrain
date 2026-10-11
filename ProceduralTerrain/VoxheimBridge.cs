@@ -225,7 +225,7 @@ namespace ProceduralTerrain
                 try { Plugin.Carve(context.Heights, ox, oz, width, context.InitialScanLo, context.InitialScanHi, context.Heights.Scale, context.Heights, context.Floor.Y); }
                 catch (Exception e) { Plugin.Log.LogError($"[PT] Carve ({ox},{oz}): {e.Message}"); return; }
                 double carveMs = (System.Diagnostics.Stopwatch.GetTimestamp() - _tc0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
-                if (carveMs > 3.0) Plugin.Log.LogInfo($"[PT-load] Carve ({ox},{oz}) = {carveMs:F2}ms (live/unbaked)");
+                if (carveMs > 3.0) Plugin.Log.LogDebug($"[PT-load] Carve ({ox},{oz}) = {carveMs:F2}ms (live/unbaked)");
                 if (!Plugin._sdfCache.TryGetValue(zoneKey, out c)) return;
             }
 
@@ -285,11 +285,11 @@ namespace ProceduralTerrain
                 }
             }
             double setMs = (System.Diagnostics.Stopwatch.GetTimestamp() - _tSet0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
-            if (gwGrid != null) Plugin.Log.LogInfo($"[PT-conform] zone ({ox},{oz}) groundwork overlay: override columns={ovCols}");
-            if (setMs > 2.0) Plugin.Log.LogInfo($"[PT-load] Field.Set zone ({ox},{oz}) = {setMs:F2}ms set={setCount} ({width}x{width}x{c.bh})");
+            if (gwGrid != null) Plugin.Log.LogDebug($"[PT-conform] zone ({ox},{oz}) groundwork overlay: override columns={ovCols}");
+            if (setMs > 2.0) Plugin.Log.LogDebug($"[PT-load] Field.Set zone ({ox},{oz}) = {setMs:F2}ms set={setCount} ({width}x{width}x{c.bh})");
             int d0 = GC.CollectionCount(0) - _gc0, d1 = GC.CollectionCount(1) - _gc1, d2 = GC.CollectionCount(2) - _gc2;
             if (d0 > 0 || d1 > 0 || d2 > 0)
-                Plugin.Log.LogInfo($"[PT-gc] zone ({ox},{oz}) load triggered GC: gen0+{d0} gen1+{d1} gen2+{d2}  (gen={_genThisZone})");
+                Plugin.Log.LogDebug($"[PT-gc] zone ({ox},{oz}) load triggered GC: gen0+{d0} gen1+{d1} gen2+{d2}  (gen={_genThisZone})");
         }
 
         // Build a per-zone height grid with overlapping LOCATION terrain ops baked in, using vanilla
@@ -427,7 +427,7 @@ namespace ProceduralTerrain
                 effective[i] = eff[i];
                 if (i < baseH.Count && Math.Abs(eff[i] - baseH[i]) > 0.01f) changed++;
             }
-            Plugin.Log.LogInfo($"[PT-gw] zone {zoneKey} extractor ok: changed={changed}/{n} (0 ⇒ extractor found no location modifiers here)");
+            Plugin.Log.LogDebug($"[PT-gw] zone {zoneKey} extractor ok: changed={changed}/{n} (0 ⇒ extractor found no location modifiers here)");
             return true;
         }
     }
