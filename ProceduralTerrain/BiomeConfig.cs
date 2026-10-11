@@ -330,6 +330,8 @@ namespace ProceduralTerrain
                             _overlap = Mathf.Clamp(ov, 2, 16);
                         if (k == "fielddepthlo" && float.TryParse(v, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float fdl))
                             _fieldDepthLo = Mathf.Max(0f, fdl);
+                        if (k == "surfacedither" && float.TryParse(v, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float sdth))
+                            _surfaceDither = Mathf.Max(0f, sdth);
                         // NOTE: bake interp (tricubic/trilinear) is a load-side choice, deliberately NOT a cfg key —
                         // it must not affect the bake's cfg-hash. Toggle it at runtime with the pt_interp command.
                         if (k == "biomeblendradius" && float.TryParse(v, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float bbr))
@@ -533,8 +535,23 @@ namespace ProceduralTerrain
         // ── Noise initialisation ──────────────────────────────────────────────────
         // All objects at frequency=1.0; call sites scale coordinates explicitly so
         // blended per-biome frequencies interpolate correctly across biome boundaries.
+        // Surface-shell micro-dither (anti-degenerate-normal). Amplitude in metres; 0 = off. Hashed (affects
+        // baked geometry). _ditherNoise is a low-frequency OpenSimplex so flats get a smooth tilt, not roughness.
+        internal static float _surfaceDither = 0.3f;
+        internal static FastNoiseLite? _ditherNoise;
+        internal static int _ditherLogCount;   // diagnostic: cap the one-time [PT-dither] exec logs
+
         static void InitNoise()
         {
+            // MUST run before the _noisePool guard: the pool is pre-built at startup via RebuildNoisePool(), so
+            // InitNoise early-returns on the first carve and anything placed only below the guard never inits.
+            if (_ditherNoise == null)
+            {
+                _ditherNoise = new FastNoiseLite(Plugin.WorldSeed() + 23);
+                _ditherNoise.SetNoiseType(FastNoiseLite.NoiseType.OpenSimplex2);
+                _ditherNoise.SetFrequency(0.08f);   // ~12m wavelength: gentle tilt across a flat face
+            }
+
             if (_noisePool != null) return;
             int seed = Plugin.WorldSeed();
             Log.LogInfo($"[ProceduralTerrain] noise seed={seed} (world seed string, portable)");

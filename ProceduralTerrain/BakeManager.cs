@@ -16,6 +16,16 @@ namespace ProceduralTerrain
     {
         // ── SDF bake helpers ─────────────────────────────────────────────────────
 
+        // Format a duration as m:ss (used for both ETA and elapsed so the bake/download UIs read consistently).
+        internal static string FmtMMSS(float seconds) { int t = Mathf.Max(0, (int)seconds); return $"{t / 60}:{t % 60:00}"; }
+
+        // Trailing-rate ETA state. The naive cumulative rate (done/elapsed) is dominated by the many fast early
+        // zones, so it badly underestimates once the slow island-removal tail hits. EMA the recent seconds/zone
+        // instead, so the ETA tracks current throughput and grows into the tail.
+        static readonly object _etaLock = new object();
+        static int   _etaLastN;
+        static float _etaLastSec, _etaEmaSecPerZone;
+
         // Keys excluded from the bake hash: live/render-only, location-overlay (applied live, never baked), and
         // the seed (captured in the bake filename's seed field). Exact-match so param names can't collide.
         static readonly HashSet<string> _hashExcludedKeys = new(StringComparer.OrdinalIgnoreCase)
@@ -746,6 +756,7 @@ namespace ProceduralTerrain
             Log.LogInfo($"[ProceduralTerrain] bake: {toCarve.Count} zones to carve (radius={radius:F0}m, threads={threads})...");
             var bakeSw = System.Diagnostics.Stopwatch.StartNew();
             int doneCount = 0;
+            lock (_etaLock) { _etaLastN = 0; _etaLastSec = 0f; _etaEmaSecPerZone = 0f; }
             Plugin._bakeProgressTotal = toCarve.Count;
             Plugin._bakeProgressDone  = 0;
             // Pre-warm Script pool so bake threads don't all create Scripts simultaneously.
@@ -802,7 +813,12 @@ namespace ProceduralTerrain
                 Log.LogInfo($"[ProceduralTerrain] bake carve res: coarseXZ={Plugin._coarseXZ} coarseY={Plugin._coarseY} (live was {liveCoarseXZ}/{liveCoarseY})");
                 try
                 {
-                    System.Threading.Tasks.Parallel.ForEach(toCarve,
+                    // NoBuffering dynamic partitioner: hand out ONE zone at a time so an idle worker immediately
+                    // grabs the next, instead of the default range partitioner giving each worker a contiguous
+                    // chunk of the raster-ordered list (which clusters the slow island-removal mountain zones onto
+                    // a few workers while the rest idle → long tail). Spreads slow zones across all cores.
+                    System.Threading.Tasks.Parallel.ForEach(
+                        System.Collections.Concurrent.Partitioner.Create(toCarve, System.Collections.Concurrent.EnumerablePartitionerOptions.NoBuffering),
                         new System.Threading.Tasks.ParallelOptions { MaxDegreeOfParallelism = threads },
                         zone =>
                         {
@@ -830,8 +846,21 @@ namespace ProceduralTerrain
                                 try
                                 {
                                     float elapsed = bakeSw.ElapsedMilliseconds / 1000f;
-                                    float eta = elapsed > 0f ? (toCarve.Count - n) / (n / elapsed) : 0f;
-                                    Log.LogInfo($"[ProceduralTerrain] bake: {n}/{toCarve.Count} zones — {eta:F0}s remaining");
+                                    float eta;
+                                    lock (_etaLock)
+                                    {
+                                        float dSec = elapsed - _etaLastSec;
+                                        int   dN   = n - _etaLastN;
+                                        if (dN > 0 && dSec > 0f)   // trailing wall-seconds per completed zone, EMA-smoothed
+                                        {
+                                            float recent = dSec / dN;
+                                            _etaEmaSecPerZone = _etaEmaSecPerZone <= 0f ? recent : _etaEmaSecPerZone * 0.6f + recent * 0.4f;
+                                            _etaLastN = n; _etaLastSec = elapsed;
+                                        }
+                                        float spz = _etaEmaSecPerZone > 0f ? _etaEmaSecPerZone : (n > 0 ? elapsed / n : 0f);
+                                        eta = spz * (toCarve.Count - n);
+                                    }
+                                    Log.LogInfo($"[ProceduralTerrain] bake: {n}/{toCarve.Count} zones — {FmtMMSS(eta)} remaining ({FmtMMSS(elapsed)} elapsed)");
                                     var prog = new ZPackage();
                                     prog.Write(n); prog.Write(toCarve.Count);
                                     ZRoutedRpc.instance?.InvokeRoutedRPC(ZRoutedRpc.Everybody, "PTBakeProgress", prog);
@@ -953,6 +982,7 @@ namespace ProceduralTerrain
                 catch (Exception e) { var inner = e.InnerException ?? e; Log.LogWarning($"[ProceduralTerrain] Hot-reload zone {key}: {inner.GetType().Name}: {inner.Message}\n{inner.StackTrace}"); }
             }
         }
+
     }
 
 // ── Bake download progress UI ─────────────────────────────────────────────────
@@ -1036,7 +1066,7 @@ public class BakeProgressUI : MonoBehaviour
             long elS = (Plugin._bakeDownloadTimer?.ElapsedMilliseconds ?? 0) / 1000;
             float eta = pct > 0.01f ? elS / pct * (1f - pct) : 0f;
             label    = $"Downloading world terrain…  {pct * 100f:F0}%";
-            sublabel = eta > 0 ? $"ETA {eta:F0}s  ·  {elS / 60}:{elS % 60:00} elapsed" : "Connecting…";
+            sublabel = eta > 0 ? $"ETA {Plugin.FmtMMSS(eta)}  ·  {Plugin.FmtMMSS(elS)} elapsed" : "Connecting…";
         }
         else
         {
@@ -1044,7 +1074,7 @@ public class BakeProgressUI : MonoBehaviour
             long elS = (Plugin._bakeProgressTimer?.ElapsedMilliseconds ?? 0) / 1000;
             float eta = pct > 0.01f ? elS / pct * (1f - pct) : 0f;
             label    = $"Baking terrain…  {pct * 100f:F0}%";
-            sublabel = eta > 0 ? $"ETA {eta:F0}s  ·  {elS / 60}:{elS % 60:00} elapsed  ({Plugin._bakeProgressDone}/{Plugin._bakeProgressTotal} zones)" : "Starting…";
+            sublabel = eta > 0 ? $"ETA {Plugin.FmtMMSS(eta)}  ·  {Plugin.FmtMMSS(elS)} elapsed  ({Plugin._bakeProgressDone}/{Plugin._bakeProgressTotal} zones)" : "Starting…";
         }
 
         float w = 420f, h = 90f;

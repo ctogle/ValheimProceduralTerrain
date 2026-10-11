@@ -137,6 +137,21 @@ namespace ProceduralTerrain
                 // "floor". Creatures handle slopes fine, so this gate is objects-only (gating spawners here blocked
                 // wolves on sloped cave floors).
                 if (p.Kind == PlacementKind.Object && p.FloorOnly && CaveFloorNormal(e, ix, iz, width, cyY, s).y < 0.6f) return false;
+                // Rock-cover check: the terrain surface (surfH — the SAME field vegetation-conform uses, not a
+                // reinvented one) must sit >= Cover metres above the deposit across its lateral footprint, so it's
+                // buried and only exposed where a tunnel cuts it. Samples the own column + 4 laterals at radius Cover.
+                if (p.Cover > 0f)
+                {
+                    float c = p.Cover, minClear = float.PositiveInfinity;
+                    float[] dxs = { 0f, c, -c, 0f, 0f };
+                    float[] dzs = { 0f, 0f, 0f, c, -c };
+                    int hits = 0;
+                    for (int d = 0; d < 5; d++)
+                        if (Plugin.TrySampleSurfaceY(worldX + dxs[d], worldZ + dzs[d], out float sh))
+                        { hits++; float clr = sh - cyY; if (clr < minClear) minClear = clr; }
+                    if (hits == 0 || minClear < c) return false;   // exposed (or no surface data) → don't place
+                    if (_ccLogged < 60) { _ccLogged++; Log.LogInfo($"[PT-cover] {p.Name} placed depth-clearance={minClear:F1}m (cover={c:F0}, hits={hits}) at ({worldX:F0},{cyY:F0},{worldZ:F0})"); }
+                }
 
                 Vector3 pos = anchor; Quaternion rot;
                 if (p.Kind == PlacementKind.Spawner) rot = Quaternion.Euler(0f, yaw, 0f);

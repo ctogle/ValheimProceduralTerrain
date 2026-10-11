@@ -32,6 +32,9 @@ namespace ProceduralTerrain
         // object-only placement shaping
         public bool  FloorOnly = false; // only on floor crossings (solid below, air above)
         public float Embed     = 0f;    // sink this far (m) into the floor
+        public float Cover     = 0f;    // require the terrain's outer surface this far (m) above the deposit across
+                                        // its lateral footprint (keeps it buried in rock, exposed only where a
+                                        // tunnel cuts it — not poking out the mountainside). 0 = no check.
         public float Lift      = 0f;    // raise this far (m) off the crossing into the air side (flying spawners)
         public bool  Upright   = false; // force world-up orientation instead of tilting to the floor normal
 
@@ -67,9 +70,9 @@ namespace ProceduralTerrain
         internal static List<Placement> BuildBuiltinPlacements()
         {
             var mtn = new HashSet<Heightmap.Biome> { Heightmap.Biome.Mountain };
-            Placement Obj(string name, string[] cands, float weight, float embed, bool floor, float dMin, float dFull) =>
+            Placement Obj(string name, string[] cands, float weight, float embed, bool floor, float dMin, float dFull, float cover) =>
                 new Placement { Name = name, Kind = PlacementKind.Object, Biomes = new(mtn), PrefabCands = cands,
-                                Weight = weight, Embed = embed, FloorOnly = floor, DepthMin = dMin, DepthFull = dFull };
+                                Weight = weight, Embed = embed, FloorOnly = floor, DepthMin = dMin, DepthFull = dFull, Cover = cover };
             Placement Spawner(string name, string[] cands, string? creature, float weight, int cap) =>
                 new Placement { Name = name, Kind = PlacementKind.Spawner, Biomes = new(mtn), PrefabCands = cands,
                                 CreatureOverride = creature, Weight = weight, Cap = cap, FloorOnly = true, DepthFull = 60f };
@@ -77,12 +80,12 @@ namespace ProceduralTerrain
             return new List<Placement>
             {
                 // shared OBJECT pool (ores + rocks) — depthFull=60 gives the surface→deep ramp; embed+floor bury deposits
-                Obj("tin",        new[]{ "MineRock_Tin" },            10f, 0f,   false, 0f,  60f),
-                Obj("flint",      new[]{ "Pickable_Flint" },           7f, 0f,   false, 0f,  60f),
-                Obj("obsidian",   new[]{ "MineRock_Obsidian" },        4f, 0f,   false, 0f,  60f),
-                Obj("copper",     new[]{ "rock4_copper" },            10f, 1f,   true,  0f,  60f),
-                Obj("muddyscrap", new[]{ "mudpile2", "mudpile" },     10f, 4f,   true,  0f,  60f),
-                Obj("silver",     new[]{ "silvervein" },               2f, 4f,   true,  0f,  60f),
+                Obj("tin",        new[]{ "MineRock_Tin" },            10f, 0f,   false, 0f,  60f, 4f),
+                Obj("flint",      new[]{ "Pickable_Flint" },           7f, 0f,   false, 0f,  60f, 4f),
+                Obj("obsidian",   new[]{ "MineRock_Obsidian" },        4f, 0f,   false, 0f,  60f, 4f),
+                Obj("copper",     new[]{ "rock4_copper" },            10f, 1f,   true,  0f,  60f, 6f),
+                Obj("muddyscrap", new[]{ "mudpile2", "mudpile" },     10f, 4f,   true,  0f,  60f, 4f),
+                Obj("silver",     new[]{ "silvervein" },               2f, 4f,   true,  0f,  60f, 4f),
                 // giant-corpse scenery — independent channel: deep, rare, upright, zone-gated
                 new Placement { Name = "giant_sword",  Kind = PlacementKind.Object, Biomes = new(mtn),
                     PrefabCands = new[]{ "giant_sword1", "giant_sword2" }, Weight = 1f, Prob = 0.02f, Cap = 1,
@@ -142,6 +145,7 @@ namespace ProceduralTerrain
                     case "zonechance":p.ZoneChance= F(v, p.ZoneChance); break;
                     case "floor":     p.FloorOnly = !(v == "0" || v.Equals("false", StringComparison.OrdinalIgnoreCase)); break;
                     case "embed":     p.Embed     = F(v, p.Embed); break;
+                    case "cover":     p.Cover     = F(v, p.Cover); break;
                     case "lift":      p.Lift      = F(v, p.Lift); break;
                     case "upright":   p.Upright   = (v == "1" || v.Equals("true", StringComparison.OrdinalIgnoreCase)); break;
                 }
