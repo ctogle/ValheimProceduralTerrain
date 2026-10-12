@@ -420,6 +420,13 @@ namespace ProceduralTerrain
                         ac.negZ[fIdx] = _cb.visitedBuf[cx * stride_x + cy * bw + terNegZ25];
                         ac.posZ[fIdx] = _cb.visitedBuf[cx * stride_x + cy * bw + terPosZ25];
                     }
+                    // Compute THIS zone's percol from the RAW composed field (buf is still pre-island/pre-pocket
+                    // here) and cache it with percolValid=true — so a neighbour's EnsureFixpoint reuses it instead
+                    // of recomposing the whole field (the big bake redundancy). exclude=null (vacuous, see helper).
+                    int pvSz = bw * bh * bw;
+                    if (_cb.percolVisited == null || _cb.percolVisited.Length < pvSz) _cb.percolVisited = new bool[pvSz];
+                    ac.percol      = ComputePercolFaces(buf, null, _cb.percolVisited, _cb.islandQueue!, bw, bh, stride_x, terNegX25, terPosX25, terNegZ25, terPosZ25);
+                    ac.percolValid = true;
                     PutZoneFace((ox, oz), ac);
                 }
 
@@ -974,46 +981,62 @@ namespace ProceduralTerrain
                 cache.posZAir[fIdx] = _cb.visitedBuf[cx * stX + cy * bwZ + terPosZ];
             }
 
-            var percol = new bool[4, 4];
             if (_cb.percolVisited == null || _cb.percolVisited.Length < bufSz2) _cb.percolVisited = new bool[bufSz2];
+            // exclude = the air-connected set, preserving this method's original behaviour exactly (the exclusion
+            // only ever matches air, so it's a no-op for the solid flood — see ComputePercolFaces).
+            cache.percol      = ComputePercolFaces(buf, _cb.visitedBuf, _cb.percolVisited, _cb.islandQueue!, bwZ, bhZ, stX, terNegX, terPosX, terNegZ, terPosZ);
+            cache.percolValid = true;
 
+            PutZoneFace((ox, oz), cache);
+        }
+
+        // Solid-body face-connectivity (percolation): for each of the 4 side faces, flood the SOLID (buf<0) and
+        // record which other faces it reaches. `exclude` (if non-null) blocks voxels — ComputeZoneFaceCache passes
+        // its air-connected set to preserve its exact behaviour, the primary carve passes null. Either way the
+        // exclusion only matches AIR (the flood only ever touches solid), so it's a no-op and the result is a pure
+        // function of `buf`. Must be fed the RAW composed field (pre-island/pre-pocket removal) in both callers.
+        static bool[,] ComputePercolFaces(float[] buf, bool[]? exclude, bool[] percolVisited, int[] queue,
+            int bwD, int bhD, int stX, int terNegX, int terPosX, int terNegZ, int terPosZ)
+        {
+            var percol = new bool[4, 4];
+            int n = bwD * bhD * bwD;
             for (int fromFace = 0; fromFace < 4; fromFace++)
             {
-                Array.Clear(_cb.percolVisited, 0, bufSz2);
-                qHead = 0; qTail = 0;
+                Array.Clear(percolVisited, 0, n);
+                int qHead = 0, qTail = 0;
                 bool hitNX = false, hitPX = false, hitNZ = false, hitPZ = false;
                 int facesLeft = 3;
 
                 if (fromFace <= 1)
                 {
                     int fCx = fromFace == 0 ? terNegX : terPosX;
-                    for (int cy = 0; cy < bhZ; cy++)
+                    for (int cy = 0; cy < bhD; cy++)
                     for (int cz = terNegZ; cz <= terPosZ; cz++)
                     {
-                        int idx = fCx * stX + cy * bwZ + cz;
-                        if (buf[idx] < 0f && !_cb.visitedBuf[idx] && !_cb.percolVisited[idx])
-                        { _cb.percolVisited[idx] = true; _cb.islandQueue![qTail++] = idx; }
+                        int idx = fCx * stX + cy * bwD + cz;
+                        if (buf[idx] < 0f && (exclude == null || !exclude[idx]) && !percolVisited[idx])
+                        { percolVisited[idx] = true; queue[qTail++] = idx; }
                     }
                 }
                 else
                 {
                     int fCz = fromFace == 2 ? terNegZ : terPosZ;
-                    for (int cy = 0; cy < bhZ; cy++)
+                    for (int cy = 0; cy < bhD; cy++)
                     for (int cx = terNegX; cx <= terPosX; cx++)
                     {
-                        int idx = cx * stX + cy * bwZ + fCz;
-                        if (buf[idx] < 0f && !_cb.visitedBuf[idx] && !_cb.percolVisited[idx])
-                        { _cb.percolVisited[idx] = true; _cb.islandQueue![qTail++] = idx; }
+                        int idx = cx * stX + cy * bwD + fCz;
+                        if (buf[idx] < 0f && (exclude == null || !exclude[idx]) && !percolVisited[idx])
+                        { percolVisited[idx] = true; queue[qTail++] = idx; }
                     }
                 }
 
                 while (qHead < qTail && facesLeft > 0)
                 {
-                    int idx = _cb.islandQueue![qHead++];
+                    int idx = queue[qHead++];
                     int pcx = idx / stX;
                     int rem = idx % stX;
-                    int pcy = rem / bwZ;
-                    int pcz = rem % bwZ;
+                    int pcy = rem / bwD;
+                    int pcz = rem % bwD;
 
                     if (pcx == terNegX && fromFace != 0 && !hitNX) { hitNX = true; facesLeft--; }
                     if (pcx == terPosX && fromFace != 1 && !hitPX) { hitPX = true; facesLeft--; }
@@ -1021,12 +1044,12 @@ namespace ProceduralTerrain
                     if (pcz == terPosZ && fromFace != 3 && !hitPZ) { hitPZ = true; facesLeft--; }
 
                     int ni;
-                    if (pcx > terNegX) { ni = idx - stX; if (!_cb.percolVisited[ni] && buf[ni] < 0f && !_cb.visitedBuf[ni]) { _cb.percolVisited[ni] = true; _cb.islandQueue[qTail++] = ni; } }
-                    if (pcx < terPosX) { ni = idx + stX; if (!_cb.percolVisited[ni] && buf[ni] < 0f && !_cb.visitedBuf[ni]) { _cb.percolVisited[ni] = true; _cb.islandQueue[qTail++] = ni; } }
-                    if (pcy > 0)       { ni = idx - bwZ; if (!_cb.percolVisited[ni] && buf[ni] < 0f && !_cb.visitedBuf[ni]) { _cb.percolVisited[ni] = true; _cb.islandQueue[qTail++] = ni; } }
-                    if (pcy < bhZ-1)   { ni = idx + bwZ; if (!_cb.percolVisited[ni] && buf[ni] < 0f && !_cb.visitedBuf[ni]) { _cb.percolVisited[ni] = true; _cb.islandQueue[qTail++] = ni; } }
-                    if (pcz > terNegZ) { ni = idx - 1;   if (!_cb.percolVisited[ni] && buf[ni] < 0f && !_cb.visitedBuf[ni]) { _cb.percolVisited[ni] = true; _cb.islandQueue[qTail++] = ni; } }
-                    if (pcz < terPosZ) { ni = idx + 1;   if (!_cb.percolVisited[ni] && buf[ni] < 0f && !_cb.visitedBuf[ni]) { _cb.percolVisited[ni] = true; _cb.islandQueue[qTail++] = ni; } }
+                    if (pcx > terNegX) { ni = idx - stX; if (!percolVisited[ni] && buf[ni] < 0f && (exclude == null || !exclude[ni])) { percolVisited[ni] = true; queue[qTail++] = ni; } }
+                    if (pcx < terPosX) { ni = idx + stX; if (!percolVisited[ni] && buf[ni] < 0f && (exclude == null || !exclude[ni])) { percolVisited[ni] = true; queue[qTail++] = ni; } }
+                    if (pcy > 0)       { ni = idx - bwD; if (!percolVisited[ni] && buf[ni] < 0f && (exclude == null || !exclude[ni])) { percolVisited[ni] = true; queue[qTail++] = ni; } }
+                    if (pcy < bhD-1)   { ni = idx + bwD; if (!percolVisited[ni] && buf[ni] < 0f && (exclude == null || !exclude[ni])) { percolVisited[ni] = true; queue[qTail++] = ni; } }
+                    if (pcz > terNegZ) { ni = idx - 1;   if (!percolVisited[ni] && buf[ni] < 0f && (exclude == null || !exclude[ni])) { percolVisited[ni] = true; queue[qTail++] = ni; } }
+                    if (pcz < terPosZ) { ni = idx + 1;   if (!percolVisited[ni] && buf[ni] < 0f && (exclude == null || !exclude[ni])) { percolVisited[ni] = true; queue[qTail++] = ni; } }
                 }
 
                 percol[fromFace, 0] = hitNX;
@@ -1034,10 +1057,7 @@ namespace ProceduralTerrain
                 percol[fromFace, 2] = hitNZ;
                 percol[fromFace, 3] = hitPZ;
             }
-            cache.percol      = percol;
-            cache.percolValid = true;
-
-            PutZoneFace((ox, oz), cache);
+            return percol;
         }
 
         // ── Placement height ──────────────────────────────────────────────────────────
