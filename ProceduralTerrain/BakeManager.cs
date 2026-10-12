@@ -295,11 +295,19 @@ namespace ProceduralTerrain
         }
 
         // Load the bake file once (idempotent) — lets the live generator test IsZoneBaked before carving.
+        static readonly object _bakeLoadLock = new object();
+        // Idempotent + thread-safe: called from the main-thread Generate AND from prefetcher worker threads
+        // (which carve directly, bypassing Generate — on a headless server that's the ONLY path that loads the
+        // bake, so without this the prefetch live-carves everything and the gate thrashes). Double-checked lock.
         internal static void EnsureBakeLoaded()
         {
             if (_bakeLoadAttempted) return;
-            _bakeLoadAttempted = true;
-            LoadBakeFile();
+            lock (_bakeLoadLock)
+            {
+                if (_bakeLoadAttempted) return;
+                _bakeLoadAttempted = true;
+                LoadBakeFile();
+            }
         }
 
         // True when this zone is present in the loaded bake file (its baseline is fully baked).

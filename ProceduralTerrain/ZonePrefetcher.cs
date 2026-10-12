@@ -94,9 +94,11 @@ namespace ProceduralTerrain
                     var wg = WorldGenerator.instance;
                     if (wg != null)
                     {
+                        Plugin.EnsureBakeLoaded();   // headless server never runs Generate, which is the only other
+                                                     // loader — without this the prefetch live-carves and the gate thrashes
                         float s = Plugin.ActiveScale();
                         var (yLo, yHi) = Plugin.ComputeYBoundsPublic(z.ox, z.oz, ZoneW, s, wg);
-                        Plugin.Carve(null, z.ox, z.oz, ZoneW, yLo, yHi);   // purely procedural, same call the bake uses
+                        Plugin.Carve(null, z.ox, z.oz, ZoneW, yLo, yHi);   // bake HIT (fast) if loaded, else live carve
                         Interlocked.Increment(ref _carved);
                     }
                 }
