@@ -642,20 +642,24 @@ namespace ProceduralTerrain
                 int col = xs * nsz + zs;
                 if (xmode)
                 {
-                    // Store the column as its sign-crossing y-positions (sub-voxel, linear-interp to zero).
+                    // Store the column as its sign-crossing y-positions. Compute the crossing fraction from the
+                    // RAW float buf (full sub-voxel precision) — NOT the colV sbytes, which are quantized at the
+                    // coarse 32*s scale and would snap the surface to ~0.25m steps (killing the inter-column
+                    // variation that gives near-horizontal faces a real normal → black faces).
                     // Count (low 7 bits) + sign-of-below (high bit: 1 = solid/negative below).
                     int nc = 0;
                     for (int ys = 1; ys < nsy && nc < 127; ys++)
                     {
-                        int a = colV[ys - 1], b = colV[ys];
-                        if ((a < 0) != (b < 0))
+                        float a = buf[(cx * bh + Math.Min((ys - 1) * step, bh - 1)) * bw + cz];
+                        float b = buf[(cx * bh + Math.Min(ys * step, bh - 1)) * bw + cz];
+                        if ((a < 0f) != (b < 0f))
                         {
-                            float t = (a != b) ? a / (float)(a - b) : 0.5f;
+                            float t = (a != b) ? a / (a - b) : 0.5f;
                             crossPacked!.Add((ys - 1) + t);
                             nc++;
                         }
                     }
-                    colNCross![col] = (byte)(nc | (colV[0] < 0 ? 0x80 : 0));
+                    colNCross![col] = (byte)(nc | (buf[(cx * bh + 0) * bw + cz] < 0f ? 0x80 : 0));
                     continue;
                 }
                 // Active band: non-saturated or straddling a sign change; the rest is constant fill.
@@ -686,7 +690,9 @@ namespace ProceduralTerrain
                 colBelow = colBelow, colAbove = colAbove, samples = packed.ToArray(),
                 colCross = xmode ? crossPacked!.ToArray() : null,
                 colNCross = colNCross,
-                crossSlope = 127f / 32f   // bytes per Y-sample for a vertical surface; hydrate ramp (surface is exact at any slope)
+                crossSlope = 127f   // scale s: ±1 voxel across 127 (matches the live path's fine surface precision;
+                                    // 127/32 was 32x coarser and snapped near-horizontal faces flat → black normals).
+                                    // Per-zone stored, so pre-existing bakes keep their own slope and still hydrate.
             };
             // Bake in progress: a BAKE WORKER (off the main thread — WriteBakeFile runs under Task.Run) compresses
             // (off-lock, parallel) and appends straight to disk → RAM stays flat regardless of radius. A MAIN-THREAD

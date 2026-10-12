@@ -537,7 +537,7 @@ namespace ProceduralTerrain
         // blended per-biome frequencies interpolate correctly across biome boundaries.
         // Surface-shell micro-dither (anti-degenerate-normal). Amplitude in metres; 0 = off. Hashed (affects
         // baked geometry). _ditherNoise is a low-frequency OpenSimplex so flats get a smooth tilt, not roughness.
-        internal static float _surfaceDither = 0.3f;
+        internal static float _surfaceDither = 0f;   // off by default; fine-scale v6 crossings fix the flat-face normals at the source
         internal static FastNoiseLite? _ditherNoise;
         internal static int _ditherLogCount;   // diagnostic: cap the one-time [PT-dither] exec logs
 
