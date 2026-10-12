@@ -30,7 +30,7 @@ namespace ProceduralTerrain
         // the seed (captured in the bake filename's seed field). Exact-match so param names can't collide.
         static readonly HashSet<string> _hashExcludedKeys = new(StringComparer.OrdinalIgnoreCase)
         {
-            "coarsexz", "coarsey", "bakeradius", "debugviz", "debugvizocclude", "hidelodmeshes",
+            "coarsexz", "coarsey", "bakeradius", "debugviz", "debugvizocclude", "vegviz", "vegvizradius", "hidelodmeshes",
             "disablevegetation", "applygroundwork", "protectlocations", "flatplanelocations",
             "vegetationconform", "vegmaxtilt", "seed",
             "prefetch", "prefetchradius", "prefetchthreads", "cavecontent", "lodunderground",
@@ -90,11 +90,12 @@ namespace ProceduralTerrain
             var wg = WorldGenerator.instance;
             CloseBakeStream();
             _bakeData = null;
-            if (wg == null) return;
+            if (wg == null) { Log.LogWarning("[PT-bakeload] WorldGenerator null — cannot resolve seed; skipping bake load."); return; }
             int seed = Plugin.WorldSeed();
             uint cfgHash = ComputeCfgHash();
             string path = BakeFilePath(seed, cfgHash);
-            if (!File.Exists(path)) return;
+            Log.LogInfo($"[PT-bakeload] seed={(uint)seed:X8} cfgHash={cfgHash:X8} → {System.IO.Path.GetFileName(path)} exists={File.Exists(path)} (serverCfgHash={(_serverCfgHash.HasValue ? _serverCfgHash.Value.ToString("X8") : "none")})");
+            if (!File.Exists(path)) { Log.LogWarning($"[PT-bakeload] no bake file at {path} — will live-carve. (Check the server world's seed/cfg-hash vs the bake filename.)"); return; }
             try
             {
                 var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);

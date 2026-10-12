@@ -75,6 +75,8 @@ namespace ProceduralTerrain
                         else if (k == "conform") _vegetationConform = !(v == "0" || v == "false");
                         else if (k == "maxtilt" && float.TryParse(v, System.Globalization.NumberStyles.Float, inv, out float vmt))
                             _vegMaxTilt = Mathf.Clamp(vmt, 0f, 90f);
+                        else if (k == "supportradius" && float.TryParse(v, System.Globalization.NumberStyles.Float, inv, out float vsr))
+                            _vegSupportRadius = Mathf.Clamp(vsr, 0.5f, 8f);
                     }
                 }
             }

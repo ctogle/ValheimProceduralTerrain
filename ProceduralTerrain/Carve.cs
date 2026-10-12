@@ -504,9 +504,21 @@ namespace ProceduralTerrain
                     float sh = float.NaN;
                     for (int cy = bh - 1; cy >= 0; cy--)
                     {
-                        if (buf[(cx * bh + cy) * bw + cz] < 0f)
+                        float below = buf[(cx * bh + cy) * bw + cz];
+                        if (below < 0f)
                         {
-                            sh = (extLo + cy) * s;
+                            // Sub-voxel surface: interpolate the SDF zero-crossing between this solid voxel (cy)
+                            // and the air voxel above it (cy+1), instead of snapping to the integer row. The
+                            // integer snap stair-steps surfH to s-metre plateaus → zero-gradient normals on
+                            // smooth slopes (trees read "flat" and dangle on ridges).
+                            float t = 0f;
+                            if (cy + 1 < bh)
+                            {
+                                float above = buf[(cx * bh + (cy + 1)) * bw + cz];   // >= 0 (air)
+                                float denom = below - above;
+                                if (denom != 0f) t = Mathf.Clamp01(below / denom);   // fraction from cy up toward cy+1
+                            }
+                            sh = (extLo + cy + t) * s;
                             break;
                         }
                     }
@@ -1071,17 +1083,73 @@ namespace ProceduralTerrain
             sh = 0f;
             float s = ActiveScale();
             int overlap = _overlap;
-            int gx = Mathf.RoundToInt(worldX / s);
-            int gz = Mathf.RoundToInt(worldZ / s);
             var (ox, oz) = ZoneOriginFromWorld(worldX, worldZ, s);
             (int bw, int extLo, float zs, float[] surfH) entry;
             lock (_surfHCache)
                 if (!_surfHCache.TryGetValue((ox, oz), out entry)) return false;
-            int cx = Mathf.Clamp(gx - (ox - overlap), 0, entry.bw - 1);
-            int cz = Mathf.Clamp(gz - (oz - overlap), 0, entry.bw - 1);
-            float v2 = entry.surfH[cx * entry.bw + cz];
-            if (float.IsNaN(v2)) return false;
-            sh = v2;
+            // Fractional column coordinate within the zone buffer, then bilinear-blend the 4 surrounding columns
+            // (nearest-neighbor rounding snapped trees to a column and read a neighbour's Y on slopes).
+            float fx = worldX / s - (ox - overlap);
+            float fz = worldZ / s - (oz - overlap);
+            int x0 = Mathf.Clamp(Mathf.FloorToInt(fx), 0, entry.bw - 1), x1 = Mathf.Clamp(x0 + 1, 0, entry.bw - 1);
+            int z0 = Mathf.Clamp(Mathf.FloorToInt(fz), 0, entry.bw - 1), z1 = Mathf.Clamp(z0 + 1, 0, entry.bw - 1);
+            float tx = Mathf.Clamp01(fx - x0), tz = Mathf.Clamp01(fz - z0);
+            float v00 = entry.surfH[x0 * entry.bw + z0], v10 = entry.surfH[x1 * entry.bw + z0];
+            float v01 = entry.surfH[x0 * entry.bw + z1], v11 = entry.surfH[x1 * entry.bw + z1];
+            // Any NaN among the 4 (unset column) → can't interpolate cleanly; fall back to nearest valid corner.
+            if (float.IsNaN(v00) || float.IsNaN(v10) || float.IsNaN(v01) || float.IsNaN(v11))
+            {
+                float nn = !float.IsNaN(v00) ? v00 : !float.IsNaN(v10) ? v10 : !float.IsNaN(v01) ? v01 : v11;
+                if (float.IsNaN(nn)) return false;
+                sh = nn;
+                return true;
+            }
+            sh = Mathf.Lerp(Mathf.Lerp(v00, v10, tx), Mathf.Lerp(v01, v11, tx), tz);
+            return true;
+        }
+
+        // Surface probe shared by the veg conform gate AND the debug viz, so they can never disagree.
+        // Returns false if the centre column is unknown (surfH miss). Otherwise fills sh (bilinear surface Y),
+        // normal (central-difference, for tree tilt orientation), and reject. Reject fires on EITHER:
+        //   (a) averaged tilt too steep (normal.y < cos maxTilt), or
+        //   (b) footprint support: the ground drops away faster than maxTilt in ANY of the 4 directions under
+        //       the base — this catches cliff edges the central-difference normal averages into looking flat,
+        //       the "trunk dangling over a void" case.
+        // 8 unit directions (axes + diagonals) for the footprint support ring.
+        static readonly (float dx, float dz)[] _ringDirs =
+        {
+            (1,0),(-1,0),(0,1),(0,-1),
+            (0.7071f,0.7071f),(0.7071f,-0.7071f),(-0.7071f,0.7071f),(-0.7071f,-0.7071f),
+        };
+
+        internal static bool TrySurfaceConform(float x, float z, float maxTiltDeg, out float sh, out Vector3 normal, out bool reject)
+        {
+            normal = Vector3.up; reject = false;
+            if (!TrySampleSurfaceY(x, z, out sh)) return false;
+            // Axis samples for the tilt-orientation normal (central difference).
+            const float d = 2f;
+            bool gpx = TrySampleSurfaceY(x + d, z, out float hpx), gmx = TrySampleSurfaceY(x - d, z, out float hmx);
+            bool gpz = TrySampleSurfaceY(x, z + d, out float hpz), gmz = TrySampleSurfaceY(x, z - d, out float hmz);
+            bool axisOk = gpx && gmx && gpz && gmz;
+            if (axisOk)
+                normal = new Vector3(-(hpx - hmx) / (2f * d), 1f, -(hpz - hmz) / (2f * d)).normalized;
+
+            float cosT = Mathf.Cos(maxTiltDeg * Mathf.Deg2Rad);
+            float tanT = Mathf.Tan(maxTiltDeg * Mathf.Deg2Rad);
+
+            // Footprint support: sample an 8-direction ring at the base radius. The ground must not fall away
+            // faster than maxTilt in ANY direction — this catches thin/diagonal ridges the 4-axis normal misses.
+            float r = _vegSupportRadius;
+            int valid = 0; float maxDrop = 0f;
+            foreach (var (ux, uz) in _ringDirs)
+                if (TrySampleSurfaceY(x + ux * r, z + uz * r, out float hr))
+                { valid++; maxDrop = Mathf.Max(maxDrop, sh - hr); }
+
+            bool tiltBad = axisOk && normal.y < cosT;
+            // Need a quorum of valid ring samples before trusting the support verdict (avoid over-rejecting at
+            // uncarved zone borders where most samples miss).
+            bool supportBad = valid >= 5 && maxDrop > r * tanT;
+            reject = tiltBad || supportBad;
             return true;
         }
 
@@ -1400,7 +1468,7 @@ namespace ProceduralTerrain
                         // Debug overlay (Tier viz). Only the live/main-thread path captures (not parallel bake), and
                         // only seeds OWNED by this zone draw — so a chain tiled into N zones is drawn once, by its
                         // owner. TODO: multi SurfaceBlobs modes/zone will clobber (BeginZone clears); fine for 1 mode.
-                        bool viz = DebugViz.Enabled && !_parallelBakeActive;
+                        bool viz = Plugin._debugViz && !_parallelBakeActive;   // carve capture: debugViz only, NOT vegViz (which shares the zone store)
                         if (viz) DebugViz.BeginZone(ox, oz);
                         int ownW = bw - 2 * overlap;
                         float ownXLo = ox * s, ownXHi = (ox + ownW) * s, ownZLo = oz * s, ownZHi = (oz + ownW) * s;
@@ -2587,8 +2655,10 @@ namespace ProceduralTerrain
             typeof(ZoneSystem).GetMethod("PlaceVegetation",
                 BindingFlags.NonPublic | BindingFlags.Instance);
 
-        static bool Prefix()
+        static int _vegLog;
+        static bool Prefix(Vector3 zoneCenterPos)
         {
+            if (_vegLog < 20) { _vegLog++; Plugin.Log.LogInfo($"[PT-veg] PlaceVegetation zone({zoneCenterPos.x:F0},{zoneCenterPos.z:F0}) disableVeg={Plugin._disableVegetation} conform={Plugin._vegetationConform} maxTilt={Plugin._vegMaxTilt:F0} surfHcache={Plugin._surfHCache.Count}zones"); }
             if (Plugin._disableVegetation) return false;   // skip entirely
             Plugin._inVegPlacement = true;                 // scope the GetGroundData postfix to this call
             return true;
@@ -2599,6 +2669,38 @@ namespace ProceduralTerrain
             Plugin._inVegPlacement = false;
             try { Plugin.PlaceCaveContent(zoneCenterPos, mode, spawnedObjects); }
             catch (Exception e) { Plugin.Log.LogWarning($"[PT-cave] PlaceCaveContent threw: {e.Message}"); }
+            if (Plugin._vegViz && spawnedObjects != null)
+                try { VegVizRealTrees(spawnedObjects); } catch { }
+        }
+
+        // Draw one line per ACTUALLY-placed object, coloured by how far its trunk sits from the SDF surface —
+        // this IS the clip metric. green=on-surface, blue=floating, red=buried(overhang clip), grey=surfH miss.
+        static void VegVizRealTrees(List<GameObject> objs)
+        {
+            float s = Plugin.ActiveScale();
+            var cleared = new HashSet<(int, int)>();
+            foreach (var go in objs)
+            {
+                if (go == null) continue;
+                // Only trees — skip rocks/bushes/pickables so lines correspond to the big visible items.
+                if (go.GetComponentInChildren<TreeBase>() == null) continue;
+                Vector3 p = go.transform.position;
+                var (ox, oz) = Plugin.ZoneOriginFromWorld(p.x, p.z, s);
+                if (cleared.Add((ox, oz))) DebugViz.BeginZone(ox, oz);   // replace stale lines when a zone re-places veg
+                // Same probe the real gate uses → viz and placement can never disagree.
+                Color col; Vector3 nrm = Vector3.up;
+                if (!Plugin.TrySurfaceConform(p.x, p.z, Plugin._vegMaxTilt, out float sh, out Vector3 n, out bool reject))
+                    col = Color.grey;                                        // surfH miss (zone not carved)
+                else
+                {
+                    nrm = n;
+                    float dy = p.y - sh;
+                    col = reject ? Color.red                                 // tilt/support fail → gate drops it
+                        : (Mathf.Abs(dy) <= 0.5f ? Color.green               // on surface
+                        : (dy > 0f ? Color.cyan : Color.yellow));            // cyan=floating, yellow=buried
+                }
+                DebugViz.AddToZone(ox, oz, new[] { p, p + nrm * 1.3f }, col, 0.15f);
+            }
         }
     }
 
@@ -2617,31 +2719,24 @@ namespace ProceduralTerrain
         static int _diag;
         static void Postfix(ref Vector3 p, ref Vector3 normal)
         {
-            if (!Plugin._inVegPlacement || !Plugin._vegetationConform) return;
-            bool diag = _diag < 40;
-            if (!Plugin.TrySampleSurfaceY(p.x, p.z, out float sh))
+            if (!Plugin._inVegPlacement) return;                             // only instrument/act during veg placement
+            bool diag = _diag < 60;
+            if (!Plugin._vegetationConform)
             {
-                if (diag) { _diag++; Plugin.Log.LogDebug($"[PT-veg] ({p.x:F0},{p.z:F0}) surfH MISS → vanilla normal.y={normal.y:F2}  [cache={Plugin._surfHCache.Count} zones, want key={Plugin.SurfKeyFor(p.x, p.z)}]"); }
+                if (diag) { _diag++; Plugin.Log.LogInfo($"[PT-veg] CONFORM-DISABLED (vegetationConform=false) at ({p.x:F0},{p.z:F0}) — vanilla placement"); }
+                return;
+            }
+            if (!Plugin.TrySurfaceConform(p.x, p.z, Plugin._vegMaxTilt, out float sh, out Vector3 n, out bool reject))
+            {
+                if (diag) { _diag++; Plugin.Log.LogInfo($"[PT-veg] surfH MISS ({p.x:F0},{p.z:F0}) → vanilla (no conform)  [cache={Plugin._surfHCache.Count} zones, want key={Plugin.SurfKeyFor(p.x, p.z)}]"); }
                 return;   // zone not carved yet → leave vanilla
             }
             float oldY = p.y;
             p.y = sh;                                                        // snap to the voxel surface (highest solid)
-
-            // Finite-diff voxel normal from the surfH field. A sheer wall or overhang edge produces a huge
-            // gradient → near-horizontal normal → vanilla's `normal.y < cos(maxTilt)` gate rejects it.
-            const float d = 2f;
-            if (Plugin.TrySampleSurfaceY(p.x + d, p.z, out float hpx) && Plugin.TrySampleSurfaceY(p.x - d, p.z, out float hmx) &&
-                Plugin.TrySampleSurfaceY(p.x, p.z + d, out float hpz) && Plugin.TrySampleSurfaceY(p.x, p.z - d, out float hmz))
-            {
-                float dydx = (hpx - hmx) / (2f * d), dydz = (hpz - hmz) / (2f * d);
-                Vector3 n = new Vector3(-dydx, 1f, -dydz).normalized;
-                normal = n;
-                bool reject = n.y < Mathf.Cos(Mathf.Deg2Rad * Plugin._vegMaxTilt);
-                // Stricter-than-vanilla cutoff: force horizontal (y=0) so the existing tilt gate drops it.
-                if (reject) normal = new Vector3(1f, 0f, 0f);
-                if (diag) { _diag++; Plugin.Log.LogDebug($"[PT-veg] ({p.x:F0},{p.z:F0}) snapY {oldY:F1}→{sh:F1} n.y={n.y:F2} {(reject ? "REJECT" : "keep")} (surfH {hmx:F1}/{hpx:F1}/{hmz:F1}/{hpz:F1})"); }
-            }
-            else if (diag) { _diag++; Plugin.Log.LogDebug($"[PT-veg] ({p.x:F0},{p.z:F0}) snapY {oldY:F1}→{sh:F1} but neighbor surfH MISS → normal untouched"); }
+            // Reject = either averaged tilt too steep OR footprint drops away under the base (cliff-edge dangle).
+            // Force a horizontal normal so vanilla's own tilt gate drops the tree; otherwise orient to the slope.
+            normal = reject ? new Vector3(1f, 0f, 0f) : n;
+            if (diag) { _diag++; Plugin.Log.LogInfo($"[PT-veg] CONFORM ({p.x:F0},{p.z:F0}) snapY {oldY:F1}→{sh:F1} n.y={n.y:F2} {(reject ? "REJECT" : "keep")}"); }
         }
     }
 

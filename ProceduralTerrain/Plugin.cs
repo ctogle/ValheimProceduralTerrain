@@ -712,6 +712,7 @@ namespace ProceduralTerrain
         internal static volatile bool _disableVegetation;
         internal static bool  _vegetationConform = true;   // snap vegetation to the voxel surface + reject steep/overhung spots (vanilla placement rides the 2.5D heightmap, blind to our 3D terrain)
         internal static float _vegMaxTilt        = 30f;    // reject vegetation where the voxel surface is steeper than this (degrees); covers "flat enough to hide the trunk base"
+        internal static float _vegSupportRadius   = 2.5f;   // footprint radius (m) for the 8-direction support ring; ground must not fall away past maxTilt within this of the trunk base
         [System.ThreadStatic] internal static bool _inVegPlacement;   // set only while ZoneSystem.PlaceVegetation runs, so the GetGroundData postfix scopes to vegetation
         internal static string? _forcedSeed;   // if set (cfg [Debug] seed=), every world is forced to this seed string (testing aid); null = normal
         internal static bool _compressBake = false;
@@ -745,6 +746,7 @@ namespace ProceduralTerrain
         internal static volatile bool _playerUnderground;    // updated each Update from player Y vs the carved surface
         const float LOD_UndergroundMargin = 4f;              // metres below surface before we consider the player "underground"
         internal static bool  _debugViz            = false;  // DEBUG: draw see-through overlay lines for brush seeds/paths (tunnels now, spines later)
+        internal static bool  _vegViz              = false;  // DEBUG: per-tree conform line — green=kept, red=rejected, grey=vanilla(surfH miss)
         internal static int   _overlap             = 4;      // running-field margin (voxels) shared with neighbour zones; caps seam-free feature reach
         internal static float _fieldDepthLo        = 0f;     // min world-metres the carvable field extends BELOW terrain min (0=default). Raise so deep tunnels stay in-field
         internal static bool  _bakeTrilinear       = false;  // step>1 rehydration interp: false=Catmull-Rom (C1, smooth), true=trilinear (C0, cheap). A/B on the same bake file

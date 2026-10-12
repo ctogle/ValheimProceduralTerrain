@@ -324,6 +324,13 @@ namespace ProceduralTerrain
                             _lodUnderground = !(v == "0" || v == "false");
                         if (k == "debugviz")
                             DebugViz.Enabled = _debugViz = (v == "1" || v == "true");
+                        if (k == "vegviz")
+                        {
+                            _vegViz = (v == "1" || v == "true");
+                            if (_vegViz) DebugViz.Enabled = true;   // vegViz needs the renderer live even without debugViz
+                        }
+                        if (k == "vegvizradius" && float.TryParse(v, out float vvr))
+                            DebugViz.Radius = vvr;
                         if (k == "debugvizocclude")
                             DebugViz.Occlude = (v == "1" || v == "true");
                         if (k == "overlap" && int.TryParse(v, out int ov))

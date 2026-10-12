@@ -13,6 +13,7 @@ namespace ProceduralTerrain
     {
         internal static bool Enabled = false;
         internal static bool Occlude = false;   // true = terrain mesh hides lines behind it (ZTest LessEqual); false = draw through everything (Always)
+        internal static float Radius = 40f;     // only polys whose zone is within this many metres of the local player are shown (0 = no cull)
 
         internal struct Poly { public Vector3[] pts; public Color col; public float width; }
 
@@ -44,6 +45,22 @@ namespace ProceduralTerrain
             {
                 if (_cur is (int, int) k && _zones.TryGetValue(k, out var lst))
                     lst.Add(new Poly { pts = arr, col = col, width = width });
+            }
+        }
+
+        // Add a polyline to an EXPLICIT zone (no thread-static _cur) — used by vegetation-conform viz, which
+        // runs during PlaceVegetation, outside the Carve capture scope. Ensures the zone list + bumps version.
+        internal static void AddToZone(int ox, int oz, IReadOnlyList<Vector3> pts, Color col, float width)
+        {
+            if (pts == null || pts.Count < 2) return;
+            var arr = new Vector3[pts.Count];
+            for (int i = 0; i < pts.Count; i++) arr[i] = pts[i];
+            var key = (ox, oz);
+            lock (_lk)
+            {
+                if (!_zones.TryGetValue(key, out var lst)) { lst = new List<Poly>(64); _zones[key] = lst; }
+                lst.Add(new Poly { pts = arr, col = col, width = width });
+                _zoneVer[key] = (_zoneVer.TryGetValue(key, out int v) ? v : 0) + 1;
             }
         }
 
@@ -129,6 +146,32 @@ namespace ProceduralTerrain
                 }
                 _go[key] = root;
                 _built[key] = ver;
+            }
+
+            // Per-frame radius cull: show only lines within Radius of the CAMERA, so the overlay is a small
+            // bubble around what you're looking at rather than a wall of lines. Per-line (each tree), not per-zone.
+            if (DebugViz.Radius > 0f)
+            {
+                var cam = Utils.GetMainCamera();
+                if (cam != null)
+                {
+                    Vector3 cp = cam.transform.position;
+                    float r2 = DebugViz.Radius * DebugViz.Radius;
+                    foreach (var kv in _go)
+                    {
+                        if (kv.Value == null) continue;
+                        var t = kv.Value.transform;
+                        int n = t.childCount;
+                        for (int i = 0; i < n; i++)
+                        {
+                            var child = t.GetChild(i);
+                            var lr = child.GetComponent<LineRenderer>();
+                            if (lr == null || lr.positionCount == 0) continue;
+                            bool near = (lr.GetPosition(0) - cp).sqrMagnitude <= r2;
+                            if (child.gameObject.activeSelf != near) child.gameObject.SetActive(near);
+                        }
+                    }
+                }
             }
         }
     }
