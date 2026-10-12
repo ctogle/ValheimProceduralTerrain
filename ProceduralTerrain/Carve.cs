@@ -2460,6 +2460,25 @@ namespace ProceduralTerrain
             }
         }
 
+        // River protection as a direct per-column crossfade toward vanilla (not a biome-weight injection, which
+        // seamed at zone boundaries). Returns 1 away from rivers, →0 inside the corridor, so the column write
+        // `baseSDF + (combined-baseSDF)*riverFac` collapses our deviation back to the vanilla river bed
+        // (GetHeight already carries vanilla's own AddRivers bed). riverCore = knee plateau; riverProtect =
+        // shoulder sharpness/width (saturates the suppression). Both hashed (change the baked SDF → rebake).
+        static float RiverFac(float worldX, float worldZ, WorldGenerator? wg)
+        {
+            if (Plugin._riverProtect <= 0f || wg == null) return 1f;
+            var rf = RiverWeightFn(wg);
+            if (rf == null) return 1f;
+            rf(worldX, worldZ, out float rw, out float _);
+            float edge = Plugin._riverEdge, core = Mathf.Max(Plugin._riverCore, edge + 0.001f);
+            if (rw <= edge) return 1f;                                        // outside the (tightened) outer radius → untouched
+            // Remap [edge..core] → [0..1]: 0 protection at the outer edge, full at the core plateau.
+            float shaped   = Mathf.Clamp01((rw - edge) / (core - edge));
+            float suppress = Mathf.Clamp01(shaped * Plugin._riverProtect);   // gain sharpens the shoulder (1 = pure vanilla)
+            return 1f - suppress;
+        }
+
         static void FillPhase1(float[] buf, int bw, int bh, int extLo, float s,
             int ox, int oz, int overlap, WorldGenerator? wg, int cw4,
             List<(Vector2 pos, float extR)> nearbyLocs, Voxheim.Core.HeightGrid? heightGrid = null)
@@ -2503,6 +2522,7 @@ namespace ProceduralTerrain
                     }
                 }
                 float locFac     = 1f;
+                float riverFac   = RiverFac(worldX, worldZ, wg);   // 1 = full carve, →0 inside river corridor (crossfade to vanilla)
                 float effectiveH = h;
                 if ((_protectLocations || _flatPlaneLocations) && nearbyLocs.Count > 0)
                 {
@@ -2575,7 +2595,7 @@ namespace ProceduralTerrain
                         foreach (var mode in pipeline) mode.ComputeVoxel(ref combined, in vox);
                     }
                     float _fade = profFlFade > 0f ? Mathf.Clamp01((worldY - floorY) / profFlFade) : 1f;
-                    buf[(cx * bh + cy) * bw + cz] = baseSDF + (combined - baseSDF) * locFac * _fade;
+                    buf[(cx * bh + cy) * bw + cz] = baseSDF + (combined - baseSDF) * locFac * riverFac * _fade;
                 }
             }
         }

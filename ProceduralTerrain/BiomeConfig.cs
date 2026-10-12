@@ -349,6 +349,12 @@ namespace ProceduralTerrain
                             _fixpointMaxZones = Mathf.Max(1, fmz);
                         if (k == "coastfade" && float.TryParse(v, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float cf))
                             _coastFade = Mathf.Max(0f, cf);
+                        if (k == "riverprotect" && float.TryParse(v, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float rp))
+                            _riverProtect = Mathf.Max(0f, rp);
+                        if (k == "rivercore" && float.TryParse(v, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float rc))
+                            _riverCore = Mathf.Clamp(rc, 0.01f, 1f);
+                        if (k == "riveredge" && float.TryParse(v, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float re))
+                            _riverEdge = Mathf.Clamp(re, 0f, 0.99f);
                         if (k == "blendmode")
                             _blendMode = (v == "sdf" || v == "1") ? 1 : 0;
                         if (k == "composemode")
@@ -867,6 +873,23 @@ namespace ProceduralTerrain
         // distance.  Weight = max(0, 1 - dist/blendRadius), normalized so all biome
         // weights sum to 1.  This gives exact 50/50 at any biome boundary, pure 1.0
         // far inside a biome, and a predictable linear falloff of width blendRadius.
+        // WorldGenerator.GetRiverWeight is private; bind a typed open delegate once via reflection (bake-time
+        // only, so the reflection cost is trivial). Rebuilt if the WorldGenerator instance changes (new world).
+        delegate void RiverWeightDel(float wx, float wy, out float weight, out float width);
+        static RiverWeightDel? _riverWeightFn;
+        static WorldGenerator? _riverWeightWg;
+        static RiverWeightDel? RiverWeightFn(WorldGenerator wg)
+        {
+            if (wg == null) return null;
+            if (_riverWeightFn != null && ReferenceEquals(_riverWeightWg, wg)) return _riverWeightFn;
+            var mi = typeof(WorldGenerator).GetMethod("GetRiverWeight",
+                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+            if (mi == null) { Log.LogWarning("[ProceduralTerrain] riverProtect: WorldGenerator.GetRiverWeight not found — river protection disabled."); return null; }
+            _riverWeightFn = (RiverWeightDel)System.Delegate.CreateDelegate(typeof(RiverWeightDel), wg, mi);
+            _riverWeightWg = wg;
+            return _riverWeightFn;
+        }
+
         static void BakeBlendedProfiles(int cw4, int ox, int oz, int overlap, float s, WorldGenerator wg)
         {
             var profs = _biomeProfiles;
@@ -1071,6 +1094,10 @@ namespace ProceduralTerrain
                     }
                 }
             }
+
+            // (River protection is NOT done here — injecting biome weight interacts with per-zone biome
+            // sampling + normalization and seams at zone boundaries. It's applied directly in FillPhase1 as a
+            // per-column crossfade of our deviation back toward vanilla, keyed on GetRiverWeight. See RiverFac.)
 
             // ── Step 3: Normalize ─────────────────────────────────────────────────────
             // NOTE: these scratch spans are allocated ONCE here, not inside the loops below.
