@@ -150,7 +150,7 @@ namespace ProceduralTerrain
                         if (Plugin.TrySampleSurfaceY(worldX + dxs[d], worldZ + dzs[d], out float sh))
                         { hits++; float clr = sh - cyY; if (clr < minClear) minClear = clr; }
                     if (hits == 0 || minClear < c) return false;   // exposed (or no surface data) → don't place
-                    if (_ccLogged < 60) { _ccLogged++; Log.LogInfo($"[PT-cover] {p.Name} placed depth-clearance={minClear:F1}m (cover={c:F0}, hits={hits}) at ({worldX:F0},{cyY:F0},{worldZ:F0})"); }
+                    if (_ccLogged < 60) { _ccLogged++; Log.LogDebug($"[PT-cover] {p.Name} placed depth-clearance={minClear:F1}m (cover={c:F0}, hits={hits}) at ({worldX:F0},{cyY:F0},{worldZ:F0})"); }
                 }
 
                 Vector3 pos = anchor; Quaternion rot;

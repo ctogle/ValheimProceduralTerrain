@@ -132,7 +132,7 @@ namespace ProceduralTerrain
                         _bakeIndex = idx;
                         _bakeStream = fs;             // KEEP OPEN for per-zone seeks
                         _bakeFileStep = _bakeStep;    // v4 treated as current
-                        Log.LogInfo($"[ProceduralTerrain] Bake streamed: {cnt} zones (v5), index-only, from {path}");
+                        Log.LogInfo($"[ProceduralTerrain] Bake streamed: {cnt} zones (v{(Plugin._bakeFileV6 ? 6 : 5)}), index-only, from {path}");
                         return;                       // deliberately do NOT dispose fs
                     }
                     fs.Seek(0, SeekOrigin.Begin);     // not v4 → fall through to v3 raw load-all

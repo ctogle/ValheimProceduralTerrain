@@ -490,40 +490,6 @@ namespace ProceduralTerrain
             }
             _phPocket = System.Diagnostics.Stopwatch.GetTimestamp();
 
-            // Micro-dither the surface shell so no face is perfectly axis-flat. Voxheim's mesher degenerates
-            // the normal of a perfectly flat axis-aligned face to +Y regardless of the solid side, so flat
-            // ceilings/walls render black; a sub-visual tilt gives it a real, correctly-oriented normal.
-            // Deterministic from world position + seed → bake and live agree (and bakes stay portable).
-            if (Plugin._surfaceDither > 0f && Plugin._ditherNoise != null)
-            {
-                float A = Plugin._surfaceDither, thr = 1.5f * s;
-                var dn = Plugin._ditherNoise;
-                int dcount = 0; float maxd = 0f;
-                for (int cx = 0; cx < bw; cx++)
-                {
-                    float wx = (ox + cx - overlap) * s;
-                    for (int cz = 0; cz < bw; cz++)
-                    {
-                        float wz = (oz + cz - overlap) * s;
-                        for (int cy = 0; cy < bh; cy++)
-                        {
-                            int idx = (cx * bh + cy) * bw + cz;
-                            float v = buf[idx];
-                            if (v > -thr && v < thr)
-                            {
-                                float d = A * dn.GetNoise(wx, (extLo + cy) * s, wz);
-                                buf[idx] = v + d;
-                                dcount++; float ad = d < 0f ? -d : d; if (ad > maxd) maxd = ad;
-                            }
-                        }
-                    }
-                }
-                if (System.Threading.Interlocked.Increment(ref _ditherLogCount) <= 4)
-                    Log.LogInfo($"[PT-dither] zone ({ox},{oz}) dithered {dcount} voxels maxδ={maxd:F2}m (A={A}, thr={thr:F2}, bh={bh})");
-            }
-            else if (System.Threading.Interlocked.Increment(ref _ditherLogCount) <= 4)
-                Log.LogInfo($"[PT-dither] zone ({ox},{oz}) SKIPPED (surfaceDither={Plugin._surfaceDither}, ditherNoise={(Plugin._ditherNoise != null)})");
-
             } // end if (!fromBake)
 
             if (!fromBake && _bakeWriteStream != null && (_bakeVanilla || anyPipelineActive))   // stage only during an actual bake; by default skip unmodified zones (carve live, keep them out of the bake file)
