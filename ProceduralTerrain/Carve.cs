@@ -2482,28 +2482,33 @@ namespace ProceduralTerrain
         // `baseSDF + (combined-baseSDF)*riverFac` collapses our deviation back to the vanilla river bed
         // (GetHeight already carries vanilla's own AddRivers bed). riverCore = knee plateau; riverProtect =
         // shoulder sharpness/width (saturates the suppression). Both hashed (change the baked SDF → rebake).
-        // Per-COLUMN river suppression strength in [0,1] (0 = away from rivers, 1 = fully protect toward vanilla).
-        // The vertical BAND (applied per-voxel at the write via _riverBandTop) decides WHICH y's get suppressed,
-        // so overhangs/arches can encroach over the water above the band while the channel+bed stay navigable.
-        static float RiverSuppress(float worldX, float worldZ, WorldGenerator? wg)
+        const float RiverWaterLevel = 30f;   // Valheim sea level (matches coastFade's SeaLevel)
+
+        // Per-COLUMN river protection: suppress strength in [0,1] AND a DOME TOP (absolute Y). The river field is
+        // 2D (GetRiverWeight), so we fake a 3D vault: the protection shell rises highest over the channel centre
+        // (weight≈1) and tapers to the waterline at the banks → an arch/dome cross-section instead of a flat slab
+        // with shelves. The per-voxel band factor then fades protection out above that per-column dome top.
+        static void RiverColumn(float worldX, float worldZ, WorldGenerator? wg, out float suppress, out float domeTop)
         {
-            if (Plugin._riverProtect <= 0f || wg == null) return 0f;
+            suppress = 0f; domeTop = RiverWaterLevel;
+            if (Plugin._riverProtect <= 0f || wg == null) return;
             var rf = RiverWeightFn(wg);
-            if (rf == null) return 0f;
+            if (rf == null) return;
             rf(worldX, worldZ, out float rw, out float _);
             float edge = Plugin._riverEdge, core = Mathf.Max(Plugin._riverCore, edge + 0.001f);
-            if (rw <= edge) return 0f;                                        // outside the (tightened) outer radius → untouched
+            if (rw <= edge) return;                                           // outside the outer radius → untouched
             float shaped = Mathf.Clamp01((rw - edge) / (core - edge));       // remap [edge..core] → [0..1]
-            return Mathf.Clamp01(shaped * Plugin._riverProtect);             // gain sharpens the shoulder (1 = full protect)
+            suppress = Mathf.Clamp01(shaped * Plugin._riverProtect);         // gain sharpens the shoulder (1 = full protect)
+            // Rounded dome profile: height ∝ sqrt(shaped·(2−shaped)) ≈ a semicircle → full domeHeight at centre,
+            // bulging smoothly, tapering to 0 at the bank. domeHeight = 0 → flat at water; huge → ~full column.
+            float domeShape = Mathf.Sqrt(Mathf.Clamp01(shaped * (2f - shaped)));
+            domeTop = RiverWaterLevel + Plugin._riverDomeHeight * domeShape;
         }
 
-        // Vertical band factor for the river protection at a given voxel Y: 1 at/below _riverBandTop, fading to 0
-        // over _riverBandFade above it. Above the band → 0 → no protection → overhangs free to form over the water.
-        static float RiverBandFactor(float worldY)
-        {
-            if (Plugin._riverBandTop >= 9000f) return 1f;   // off → full-column protection
-            return 1f - Mathf.Clamp01((worldY - Plugin._riverBandTop) / Mathf.Max(Plugin._riverBandFade, 0.001f));
-        }
+        // Per-voxel dome band factor: 1 at/below the (per-column) dome top, fading to 0 over `fade` above it.
+        // Above the dome → 0 → no protection → terrain/overhangs free to arch over. Shared by rivers + locations.
+        static float DomeBandFactor(float worldY, float domeTop, float fade)
+            => 1f - Mathf.Clamp01((worldY - domeTop) / Mathf.Max(fade, 0.001f));
 
         static void FillPhase1(float[] buf, int bw, int bh, int extLo, float s,
             int ox, int oz, int overlap, WorldGenerator? wg, int cw4,
@@ -2549,7 +2554,8 @@ namespace ProceduralTerrain
                     }
                 }
                 float locFac     = 1f;
-                float riverSuppress = RiverSuppress(worldX, worldZ, wg);   // per-column strength; the vertical band is applied per-voxel below
+                float locSuppress = 0f, locDomeTop = 1e9f;   // dome over the location (1e9 = full column / off)
+                RiverColumn(worldX, worldZ, wg, out float riverSuppress, out float riverDomeTop);   // per-column strength + dome top; band applied per-voxel below
                 float effectiveH = h;
                 if ((_protectLocations || _flatPlaneLocations) && nearbyLocs.Count > 0)
                 {
@@ -2563,7 +2569,19 @@ namespace ProceduralTerrain
                             flatH  = wg != null ? wg.GetHeight(nearbyLocs[li].pos.x, nearbyLocs[li].pos.y) : h;
                         }
                     }
-                    if (_protectLocations)   locFac     = minFac;
+                    if (_protectLocations)
+                    {
+                        locFac = minFac;
+                        // Dome recipe (same as rivers): protection strength (1−minFac) is tallest over the location
+                        // centre, tapering to its edge → a hemispherical bubble above the pad (ground = flatH). The
+                        // per-voxel band then frees terrain above the dome. _locDomeHeight=0 → full column (off).
+                        locSuppress = 1f - minFac;
+                        if (Plugin._locDomeHeight > 0f)
+                        {
+                            float domeShape = Mathf.Sqrt(Mathf.Clamp01(locSuppress * (2f - locSuppress)));
+                            locDomeTop = flatH + Plugin._locDomeHeight * domeShape;
+                        }
+                    }
                     if (_flatPlaneLocations) effectiveH = Mathf.Lerp(flatH, h, minFac);
                 }
 
@@ -2625,8 +2643,11 @@ namespace ProceduralTerrain
                         foreach (var mode in pipeline) mode.ComputeVoxel(ref combined, in vox);
                     }
                     float _fade = profFlFade > 0f ? Mathf.Clamp01((worldY - floorY) / profFlFade) : 1f;
-                    float riverFac = 1f - riverSuppress * RiverBandFactor(worldY);   // per-voxel: band limits protection to the navigable channel; overhangs free above
-                    buf[(cx * bh + cy) * bw + cz] = baseSDF + (combined - baseSDF) * locFac * riverFac * _fade;
+                    float riverFac = 1f - riverSuppress * DomeBandFactor(worldY, riverDomeTop, Plugin._riverBandFade);   // per-voxel river dome vault
+                    float locFacV  = Plugin._locDomeHeight > 0f                                   // per-voxel location dome (else full-column locFac)
+                                   ? 1f - locSuppress * DomeBandFactor(worldY, locDomeTop, Plugin._locBandFade)
+                                   : locFac;
+                    buf[(cx * bh + cy) * bw + cz] = baseSDF + (combined - baseSDF) * locFacV * riverFac * _fade;
                 }
             }
         }

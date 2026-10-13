@@ -312,6 +312,10 @@ namespace ProceduralTerrain
                             ZonePrefetcher.ThreadCount = Mathf.Clamp(prt, 0, 32);
                         if (k == "protectlocations")
                             _protectLocations = !(v == "0" || v == "false");
+                        if (k == "locdomeheight" && float.TryParse(v, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float ldh))
+                            _locDomeHeight = Mathf.Max(0f, ldh);
+                        if (k == "locbandfade" && float.TryParse(v, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float lbf))
+                            _locBandFade = Mathf.Max(0.001f, lbf);
                         if (k == "applygroundwork")
                             _applyGroundwork = !(v == "0" || v == "false");
                         if (k == "flatplanelocations")
@@ -357,8 +361,8 @@ namespace ProceduralTerrain
                             _riverCore = Mathf.Clamp(rc, 0.01f, 1f);
                         if (k == "riveredge" && float.TryParse(v, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float re))
                             _riverEdge = Mathf.Clamp(re, 0f, 0.99f);
-                        if (k == "riverbandtop" && float.TryParse(v, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float rbt))
-                            _riverBandTop = rbt;
+                        if (k == "riverdomeheight" && float.TryParse(v, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float rdh))
+                            _riverDomeHeight = Mathf.Max(0f, rdh);
                         if (k == "riverbandfade" && float.TryParse(v, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float rbf))
                             _riverBandFade = Mathf.Max(0.001f, rbf);
                         if (k == "blendmode")

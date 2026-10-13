@@ -742,6 +742,8 @@ namespace ProceduralTerrain
         internal static readonly List<(Vector2 pos, float extR)> _locationPositions = new();
         internal static bool _locationsCached;
         internal static bool  _protectLocations    = true;
+        internal static float _locDomeHeight       = 0f;     // metres the location protection DOME rises over the pad centre (hemisphere bubble, terrain free above). 0 = full-column protect (guaranteed open to sky — spawn/altars)
+        internal static float _locBandFade         = 8f;     // metres the location protection tapers out above the dome top
         internal static bool  _applyGroundwork     = true;   // bake location terrain modifiers into the baseline
         internal static bool  _flatPlaneLocations  = true;
         internal static bool  _islandRemoval       = true;
@@ -763,8 +765,8 @@ namespace ProceduralTerrain
         internal static float _riverProtect        = 0f;     // gain on river-weight Ocean inflation: suppress carving inside river corridors + banks (0=off; >1 widens/strengthens)
         internal static float _riverCore           = 1f;     // river-weight fraction above which protection is FULL (plateau); lower = fatter fully-protected core + harsher shoulder, same outer radius. 1=linear
         internal static float _riverEdge           = 0f;     // river-weight fraction below which NO protection — pulls the OUTER radius inward (raise to tighten the protected band). 0=protect out to the river's full weight edge
-        internal static float _riverBandTop        = 10000f; // ABSOLUTE world-Y above which river protection fades out → overhangs/arches may encroach over the water while the channel+bed below stay navigable. 10000 = off (full-column protect)
-        internal static float _riverBandFade       = 4f;     // metres over which the river band tapers out above _riverBandTop
+        internal static float _riverDomeHeight     = 0f;     // metres the protection DOME rises above water at the channel centre (tapering to the banks → arch cross-section). 0 = flat at water; large (~500) ≈ full-column protect
+        internal static float _riverBandFade       = 4f;     // metres over which the river protection tapers out above the dome top
         internal static int   _blendMode           = 1;      // default sdf: bake each present biome, crossfade output columns (correct at dissimilar-profile boundaries). 0=param (one blended bake; chirps at differing-frequency borders — ablation/compat only)
         internal static int   _composeMode         = 0;      // 0=legacy (per-voxel blend in FillPhase1); 1=sequential (Path B: compose modes into a running coarse SDF in pipeline order, then interpolate)
         internal static bool  _eikonal             = false;   // Path B: redistance the running field to true distance after each mode. OFF by default — current modes read zero-crossing elevation/normal (don't need |grad|=1). Enable only for distance-metric modes; it's a per-mode cost that explodes at fine coarseXZ.
