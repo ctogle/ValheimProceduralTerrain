@@ -163,6 +163,7 @@ namespace ProceduralTerrain
                                 parentModes.AddRange(incl.ModeNames);
                                 tp.FloorDepth   = incl.FloorDepth;
                                 tp.FloorFade    = incl.FloorFade;
+                                tp.FloorLevel   = incl.FloorLevel;
                                 tp.BlurPasses   = incl.BlurPasses;
                                 tp.PeronaK      = incl.PeronaK;
                                 tp.PeronaLambda = incl.PeronaLambda;
@@ -182,6 +183,7 @@ namespace ProceduralTerrain
                         switch (k) {
                             case "floordepth":    tp.FloorDepth   = fv; break;
                             case "floorfade":     tp.FloorFade    = fv; break;
+                            case "floorlevel":    tp.FloorLevel   = fv; break;
                             case "blur_passes":   tp.BlurPasses   = fv; break;
                             case "perona_k":      tp.PeronaK      = fv; break;
                             case "perona_lambda": tp.PeronaLambda = fv; break;
@@ -355,6 +357,10 @@ namespace ProceduralTerrain
                             _riverCore = Mathf.Clamp(rc, 0.01f, 1f);
                         if (k == "riveredge" && float.TryParse(v, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float re))
                             _riverEdge = Mathf.Clamp(re, 0f, 0.99f);
+                        if (k == "riverbandtop" && float.TryParse(v, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float rbt))
+                            _riverBandTop = rbt;
+                        if (k == "riverbandfade" && float.TryParse(v, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float rbf))
+                            _riverBandFade = Mathf.Max(0.001f, rbf);
                         if (k == "blendmode")
                             _blendMode = (v == "sdf" || v == "1") ? 1 : 0;
                         if (k == "composemode")
@@ -626,6 +632,7 @@ namespace ProceduralTerrain
             acc.perona_lambda += w * prof.perona_lambda;
             acc.floorDepth    += w * prof.floorDepth;
             acc.floorFade     += w * prof.floorFade;
+            acc.floorLevel    += w * prof.floorLevel;
             acc.extendUp      += w * prof.extendUp;
         }
 
@@ -638,6 +645,7 @@ namespace ProceduralTerrain
             p.perona_lambda *= rcp;
             p.floorDepth    *= rcp;
             p.floorFade      = Mathf.Min(p.floorFade * rcp, p.floorDepth);
+            p.floorLevel    *= rcp;
             p.extendUp      *= rcp;
         }
 

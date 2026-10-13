@@ -448,6 +448,7 @@ namespace ProceduralTerrain
             ("biomemajority",0f), // >0: only seed where THIS mode's biome is the dominant biome at the point (global GetBiome gate) AND use a CONSTANT radius (no biome-blend fade) → features stay full-size inside their biome and cut off at the edge
             ("skyopen",     1f),  // 1 = only seed on sky-exposed OUTER surfaces (default); 0 = allow INTERNAL surfaces (cave ceilings/walls) → stalactites etc.
             ("concaveratio",0f),  // >0: place only on anisotropic CONCAVE surfaces (|min curvature| >= ratio*|max|, concave) — the inverse of ridgeratio; for stalactites on tube/cave undersides
+            ("chainhorizontal",0f), // >0: launch the chain HORIZONTALLY (flatten dir.y) regardless of surface normal — for flat biomes (Plains) where −N points straight down and would dive. Mountains leave 0.
         };
         protected override (string name, float def)[] ParamSpec => _spec;
         public override void BakeColumn(ref CarveBuffers cb, in BakeCellArgs args)
@@ -648,6 +649,7 @@ namespace ProceduralTerrain
         public List<string> ModeNames    = new();
         public float        FloorDepth   = 8f;
         public float        FloorFade    = 0f;
+        public float        FloorLevel   = -10000f;   // ABSOLUTE world-Y below which carving re-solidifies (floorFade softens it). -10000 = off
         public float        BlurPasses   = 0f;
         public float        PeronaK      = 0f;
         public float        PeronaLambda = 0.1f;
@@ -659,6 +661,7 @@ namespace ProceduralTerrain
             return new CaveProfile {
                 floorDepth   = FloorDepth,
                 floorFade    = FloorFade,
+                floorLevel   = FloorLevel,
                 blur_passes  = BlurPasses,
                 perona_k     = PeronaK,
                 perona_lambda = PeronaLambda,
@@ -677,6 +680,7 @@ namespace ProceduralTerrain
         public float perona_lambda;    // PM diffusion rate per iteration (must be < 1/6; default 0.1)
         public float floorDepth;       // metres below terrain surface where carving stops
         public float floorFade;        // metres above floorY over which carving tapers to zero (0=hard stop)
+        public float floorLevel;       // ABSOLUTE world-Y floor: carving re-solidifies below this (floorFade softens). -10000 = off
         public float extendUp;         // metres above terrain the profile may raise features (bake vertical window)
 
         public static readonly CaveProfile Default = new CaveProfile
@@ -686,6 +690,7 @@ namespace ProceduralTerrain
             perona_lambda = 0.1f,
             floorDepth    = 8f,
             floorFade     = 0f,
+            floorLevel    = -10000f,
             extendUp      = 0f,
         };
     }
@@ -758,6 +763,8 @@ namespace ProceduralTerrain
         internal static float _riverProtect        = 0f;     // gain on river-weight Ocean inflation: suppress carving inside river corridors + banks (0=off; >1 widens/strengthens)
         internal static float _riverCore           = 1f;     // river-weight fraction above which protection is FULL (plateau); lower = fatter fully-protected core + harsher shoulder, same outer radius. 1=linear
         internal static float _riverEdge           = 0f;     // river-weight fraction below which NO protection — pulls the OUTER radius inward (raise to tighten the protected band). 0=protect out to the river's full weight edge
+        internal static float _riverBandTop        = 10000f; // ABSOLUTE world-Y above which river protection fades out → overhangs/arches may encroach over the water while the channel+bed below stay navigable. 10000 = off (full-column protect)
+        internal static float _riverBandFade       = 4f;     // metres over which the river band tapers out above _riverBandTop
         internal static int   _blendMode           = 1;      // default sdf: bake each present biome, crossfade output columns (correct at dissimilar-profile boundaries). 0=param (one blended bake; chirps at differing-frequency borders — ablation/compat only)
         internal static int   _composeMode         = 0;      // 0=legacy (per-voxel blend in FillPhase1); 1=sequential (Path B: compose modes into a running coarse SDF in pipeline order, then interpolate)
         internal static bool  _eikonal             = false;   // Path B: redistance the running field to true distance after each mode. OFF by default — current modes read zero-crossing elevation/normal (don't need |grad|=1). Enable only for distance-metric modes; it's a per-mode cost that explodes at fine coarseXZ.

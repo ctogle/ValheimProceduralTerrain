@@ -35,6 +35,18 @@ namespace ProceduralTerrain
             }
         }
 
+        // Set the current thread's zone WITHOUT clearing it — used by a second+ surface_blobs mode in the
+        // same zone so it appends to (rather than wipes) the first mode's lines. Ensures the zone list exists.
+        internal static void SetZone(int ox, int oz)
+        {
+            var key = (ox, oz);
+            lock (_lk)
+            {
+                if (!_zones.ContainsKey(key)) { _zones[key] = new List<Poly>(64); _zoneVer[key] = (_zoneVer.TryGetValue(key, out int v) ? v : 0) + 1; }
+                _cur = key;
+            }
+        }
+
         // Add a polyline to the current thread's zone. Colors chosen at the call site per tier/tag.
         internal static void Line(IReadOnlyList<Vector3> pts, Color col, float width)
         {

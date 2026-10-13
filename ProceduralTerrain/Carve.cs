@@ -22,7 +22,7 @@ namespace ProceduralTerrain
         public float[]? precomputeBuf;
         // BakeSdfSetup 2D coarse param grids [cw4 × cw4]
         public float[]? bk2dTgX, bk2dTgZ, bk2dBlurH, bk2dGradMag;
-        public float[]? bk2dFlD, bk2dFlFade;
+        public float[]? bk2dFlD, bk2dFlFade, bk2dFlLevel;
         // Full-res Mode B warped heightmap [bw × bw]
         public float[]? bkWarpedH;
         // Island/pocket BFS (bool and int queues)
@@ -1201,12 +1201,14 @@ namespace ProceduralTerrain
             // Floor depth/fade grids
             if (_cb.bk2dFlD     == null || _cb.bk2dFlD.Length     < nb2Size) _cb.bk2dFlD     = new float[nb2Size];
             if (_cb.bk2dFlFade  == null || _cb.bk2dFlFade.Length  < nb2Size) _cb.bk2dFlFade  = new float[nb2Size];
+            if (_cb.bk2dFlLevel == null || _cb.bk2dFlLevel.Length < nb2Size) _cb.bk2dFlLevel = new float[nb2Size];
 
             // Populate floor arrays from blended profiles
             for (int i = 0; i < nb2Size && _blendedProfs != null && i < _blendedProfs.Length; i++)
             {
                 _cb.bk2dFlD!    [i] = _blendedProfs[i].floorDepth;
                 _cb.bk2dFlFade! [i] = _blendedProfs[i].floorFade;
+                _cb.bk2dFlLevel![i] = _blendedProfs[i].floorLevel;
             }
 
             // BakeBegin for each mode
@@ -1310,6 +1312,7 @@ namespace ProceduralTerrain
                 }
 
                 // (2) per mode: [derive incoming] -> bake -> compose -> redistance.
+                bool firstBlobViz = true;   // only the first surface_blobs mode clears the zone overlay; later ones append
                 foreach (var mode in pipeline)
                 {
                     int mi = mode.PipelineIndex;
@@ -1379,6 +1382,7 @@ namespace ProceduralTerrain
                         float keepDepth   = _cb.bkModeParams![mi][38][cc];
                         float chainLevel  = Mathf.Clamp01(_cb.bkModeParams![mi][39][cc]);
                         bool  tile        = _cb.bkModeParams![mi][40][cc] > 0.5f && wg != null;
+                        bool  chainHoriz  = _cb.bkModeParams![mi][45][cc] > 0.5f;   // launch chain horizontally (flat biomes)
                         float chainSlope  = _cb.bkModeParams![mi][41][cc];
                         float biomeMajority = _cb.bkModeParams![mi][42][cc];
                         float skyOpen     = _cb.bkModeParams![mi][43][cc];
@@ -1469,7 +1473,7 @@ namespace ProceduralTerrain
                         // only seeds OWNED by this zone draw — so a chain tiled into N zones is drawn once, by its
                         // owner. TODO: multi SurfaceBlobs modes/zone will clobber (BeginZone clears); fine for 1 mode.
                         bool viz = Plugin._debugViz && !_parallelBakeActive;   // carve capture: debugViz only, NOT vegViz (which shares the zone store)
-                        if (viz) DebugViz.BeginZone(ox, oz);
+                        if (viz) { if (firstBlobViz) DebugViz.BeginZone(ox, oz); else DebugViz.SetZone(ox, oz); firstBlobViz = false; }
                         int ownW = bw - 2 * overlap;
                         float ownXLo = ox * s, ownXHi = (ox + ownW) * s, ownZLo = oz * s, ownZHi = (oz + ownW) * s;
                         var colSeed = new Color(0.7f, 0.2f, 1f);   // purple = accepted seed (drawn along the surface normal)
@@ -1679,11 +1683,24 @@ namespace ProceduralTerrain
                                     if (chainInward > 0f)                                             // aim into the mountainside (horizontal −N)
                                     {
                                         var inwardH = new Vector3(-N.x, 0f, -N.z);
-                                        var aim = inwardH.sqrMagnitude > 1e-4f ? inwardH.normalized : -N;
+                                        // On flat ground −N points straight down → its horizontal projection is ~0. For flat
+                                        // biomes use a hashed horizontal azimuth instead of diving along −N.
+                                        Vector3 aim;
+                                        if (inwardH.sqrMagnitude > 1e-4f) aim = inwardH.normalized;
+                                        else if (chainHoriz) { float a = Hash(li + 53, lj + 91, hk + 17) * 6.2831853f; aim = new Vector3(Mathf.Cos(a), 0f, Mathf.Sin(a)); }
+                                        else aim = -N;
                                         dir0 = Vector3.Lerp(dir0, aim, chainInward);
                                         if (dir0.sqrMagnitude < 1e-6f) dir0 = aim;
                                         dir0 = dir0.normalized;
                                     }
+                                }
+                                // Force a horizontal launch regardless of surface normal (flat biomes like Plains, where
+                                // −N dives straight down). chainslope/chainlevel then govern any gentle descent/leveling.
+                                if (chainHoriz)
+                                {
+                                    dir0.y = 0f;
+                                    if (dir0.sqrMagnitude < 1e-6f) { float a = Hash(li + 59, lj + 83, hk + 23) * 6.2831853f; dir0 = new Vector3(Mathf.Cos(a), 0f, Mathf.Sin(a)); }   // hk (not lk) so tile seeds hash identically across zones
+                                    dir0 = dir0.normalized;
                                 }
                                 // Per-tunnel variety (hashed from the seed → constant for this chain, consistent across
                                 // zones): width class (some narrow tunnels) and slope class (some shallow, some descending).
@@ -2465,18 +2482,27 @@ namespace ProceduralTerrain
         // `baseSDF + (combined-baseSDF)*riverFac` collapses our deviation back to the vanilla river bed
         // (GetHeight already carries vanilla's own AddRivers bed). riverCore = knee plateau; riverProtect =
         // shoulder sharpness/width (saturates the suppression). Both hashed (change the baked SDF → rebake).
-        static float RiverFac(float worldX, float worldZ, WorldGenerator? wg)
+        // Per-COLUMN river suppression strength in [0,1] (0 = away from rivers, 1 = fully protect toward vanilla).
+        // The vertical BAND (applied per-voxel at the write via _riverBandTop) decides WHICH y's get suppressed,
+        // so overhangs/arches can encroach over the water above the band while the channel+bed stay navigable.
+        static float RiverSuppress(float worldX, float worldZ, WorldGenerator? wg)
         {
-            if (Plugin._riverProtect <= 0f || wg == null) return 1f;
+            if (Plugin._riverProtect <= 0f || wg == null) return 0f;
             var rf = RiverWeightFn(wg);
-            if (rf == null) return 1f;
+            if (rf == null) return 0f;
             rf(worldX, worldZ, out float rw, out float _);
             float edge = Plugin._riverEdge, core = Mathf.Max(Plugin._riverCore, edge + 0.001f);
-            if (rw <= edge) return 1f;                                        // outside the (tightened) outer radius → untouched
-            // Remap [edge..core] → [0..1]: 0 protection at the outer edge, full at the core plateau.
-            float shaped   = Mathf.Clamp01((rw - edge) / (core - edge));
-            float suppress = Mathf.Clamp01(shaped * Plugin._riverProtect);   // gain sharpens the shoulder (1 = pure vanilla)
-            return 1f - suppress;
+            if (rw <= edge) return 0f;                                        // outside the (tightened) outer radius → untouched
+            float shaped = Mathf.Clamp01((rw - edge) / (core - edge));       // remap [edge..core] → [0..1]
+            return Mathf.Clamp01(shaped * Plugin._riverProtect);             // gain sharpens the shoulder (1 = full protect)
+        }
+
+        // Vertical band factor for the river protection at a given voxel Y: 1 at/below _riverBandTop, fading to 0
+        // over _riverBandFade above it. Above the band → 0 → no protection → overhangs free to form over the water.
+        static float RiverBandFactor(float worldY)
+        {
+            if (Plugin._riverBandTop >= 9000f) return 1f;   // off → full-column protection
+            return 1f - Mathf.Clamp01((worldY - Plugin._riverBandTop) / Mathf.Max(Plugin._riverBandFade, 0.001f));
         }
 
         static void FillPhase1(float[] buf, int bw, int bh, int extLo, float s,
@@ -2505,6 +2531,7 @@ namespace ProceduralTerrain
 
                 float profFlD    = BL(_cb.bk2dFlD!,    b200, b210, b201, b211, bfx, bfz);
                 float profFlFade = BL(_cb.bk2dFlFade!, b200, b210, b201, b211, bfx, bfz);
+                float profFlLvl  = BL(_cb.bk2dFlLevel!, b200, b210, b201, b211, bfx, bfz);
                 float h;
                 if (heightGrid != null)
                 {
@@ -2522,7 +2549,7 @@ namespace ProceduralTerrain
                     }
                 }
                 float locFac     = 1f;
-                float riverFac   = RiverFac(worldX, worldZ, wg);   // 1 = full carve, →0 inside river corridor (crossfade to vanilla)
+                float riverSuppress = RiverSuppress(worldX, worldZ, wg);   // per-column strength; the vertical band is applied per-voxel below
                 float effectiveH = h;
                 if ((_protectLocations || _flatPlaneLocations) && nearbyLocs.Count > 0)
                 {
@@ -2566,7 +2593,10 @@ namespace ProceduralTerrain
                 if (!compose) foreach (var mode in pipeline) mode.PrepareColumn(ref _cb, in col);
 
                 // Voxel loop
-                float floorY = effectiveH - profFlD;
+                // floorY = where carving re-solidifies. Take the HIGHER of the surface-relative floor and the
+                // ABSOLUTE floorLevel (e.g. sea level), so carving can't go below floorLevel. floorFade softens
+                // the band above it. Per-voxel (the fade below), so it clamps only the bottom — not the whole column.
+                float floorY = Mathf.Max(effectiveH - profFlD, profFlLvl);
                 for (int cy = 0; cy < bh; cy++)
                 {
                     float worldY  = (extLo + cy) * s;
@@ -2595,6 +2625,7 @@ namespace ProceduralTerrain
                         foreach (var mode in pipeline) mode.ComputeVoxel(ref combined, in vox);
                     }
                     float _fade = profFlFade > 0f ? Mathf.Clamp01((worldY - floorY) / profFlFade) : 1f;
+                    float riverFac = 1f - riverSuppress * RiverBandFactor(worldY);   // per-voxel: band limits protection to the navigable channel; overhangs free above
                     buf[(cx * bh + cy) * bw + cz] = baseSDF + (combined - baseSDF) * locFac * riverFac * _fade;
                 }
             }
