@@ -1383,6 +1383,12 @@ namespace ProceduralTerrain
                         float chainLevel  = Mathf.Clamp01(_cb.bkModeParams![mi][39][cc]);
                         bool  tile        = _cb.bkModeParams![mi][40][cc] > 0.5f && wg != null;
                         bool  chainHoriz  = _cb.bkModeParams![mi][45][cc] > 0.5f;   // launch chain horizontally (flat biomes)
+                        float forestLo    = _cb.bkModeParams![mi][46][cc];          // vanilla GetForestFactor band gate
+                        float forestHi    = _cb.bkModeParams![mi][47][cc];
+                        float liftFrac    = _cb.bkModeParams![mi][48][cc];          // lift stamp off the surface by liftfrac·radius
+                        float blobSeaAtt  = _cb.bkModeParams![mi][49][cc];          // sea-level radius attenuation (like isotropic modes)
+                        float blobSeaFade = _cb.bkModeParams![mi][50][cc];
+                        float blobSeaLvl  = _cb.bkModeParams![mi][51][cc];
                         float chainSlope  = _cb.bkModeParams![mi][41][cc];
                         float biomeMajority = _cb.bkModeParams![mi][42][cc];
                         float skyOpen     = _cb.bkModeParams![mi][43][cc];
@@ -1542,6 +1548,13 @@ namespace ProceduralTerrain
                             float smaxR = _cb.bkModeParams![mi][0][scell];
                             if (smaxR <= 0f) continue;
                             float sminR = _cb.bkModeParams![mi][2][scell]; if (sminR < 0f) sminR = 0f; if (sminR > smaxR) sminR = smaxR;
+                            // Sea-level radius attenuation (per-mode, matches the isotropic modes): shrink the stamp
+                            // toward 0 as the SURFACE (ctr.y) approaches sealevel. seafade=0 → off.
+                            if (blobSeaFade > 0f)
+                            {
+                                float seaFac = blobSeaAtt + (1f - blobSeaAtt) * Mathf.Clamp01((ctr.y - blobSeaLvl) / blobSeaFade);
+                                if (seaFac < 1f) { smaxR *= seaFac; sminR *= seaFac; if (smaxR <= 0f) continue; }
+                            }
                             // Biome-MAJORITY gate (global, so it tiles): only keep the seed where THIS mode's biome is the
                             // dominant one at the point, and then use the CONSTANT peak radius (no blend fade → full-size
                             // features that cut off cleanly at the biome edge instead of trailing off into neighbours).
@@ -1625,6 +1638,11 @@ namespace ProceduralTerrain
                                 if (slopeDeg < slopeLo || slopeDeg > slopeHi) continue;
                             }
                             if (ctr.y < altLo || ctr.y > altHi) continue;                            // altitude band
+                            if (forestLo > -9000f || forestHi < 9000f)                               // native vanilla forest-density field (lower = denser trees)
+                            {
+                                float ff = WorldGenerator.GetForestFactor(new Vector3(ctr.x, 0f, ctr.z));
+                                if (ff < forestLo || ff > forestHi) continue;
+                            }
                             if (clusterFreq > 0f &&                                                   // global noise mask → patches
                                 Plugin._noisePool![15].GetNoise(ctr.x * clusterFreq, ctr.z * clusterFreq, 0f) < clusterThr) continue;
                             if (aspectLo > 0f || aspectHi < 360f)                                     // aspect: compass direction the slope faces
@@ -1651,10 +1669,11 @@ namespace ProceduralTerrain
                                 float rr = asp / biasSpacing + biasPhase; rr -= Mathf.Floor(rr);
                                 if (Mathf.Min(rr, 1f - rr) > biasWidth) continue;
                             }
-                            centers.Add(ctr);
-                            normals.Add(N); tangG.Add(G); tangT.Add(T);
                             // uniform radius roll in [minR, maxR] from the lattice index (decorrelated hash seeds)
                             float seedR = sminR > 0f ? sminR + (smaxR - sminR) * Hash(li*2+1, lj*2+1, hk*2+1) : smaxR;
+                            if (liftFrac != 0f) ctr += N * (liftFrac * seedR);   // lift the stamp off the surface by liftfrac·radius → ball sits proud
+                            centers.Add(ctr);
+                            normals.Add(N); tangG.Add(G); tangT.Add(T);
                             radii.Add(seedR);
 
                             bool capSeed = viz && ctr.x >= ownXLo && ctr.x < ownXHi && ctr.z >= ownZLo && ctr.z < ownZHi;
@@ -2727,18 +2746,58 @@ namespace ProceduralTerrain
             typeof(ZoneSystem).GetMethod("PlaceVegetation",
                 BindingFlags.NonPublic | BindingFlags.Instance);
 
-        static int _vegLog;
+        static int _vegLog, _vegDiag;
+        // Per-biome tree-density multiplier: temporarily scale the shared ZoneVegetation m_min/m_max for the
+        // zone's biome during this PlaceVegetation call, then restore. Non-destructive (map unchanged, just more
+        // instances placed). Trees only (TreeBase). Main-thread only.
+        struct VegStash { public ZoneSystem.ZoneVegetation v; public float min, max, fMax, gRad; public bool inForest; public int gMin, gMax; }
+        static readonly List<VegStash> _vegDensityStash = new();
+        static void RestoreVegDensity()
+        {
+            if (_vegDensityStash.Count == 0) return;
+            foreach (var s in _vegDensityStash)
+            {
+                s.v.m_min = s.min; s.v.m_max = s.max; s.v.m_forestTresholdMax = s.fMax;
+                s.v.m_inForest = s.inForest; s.v.m_groupSizeMin = s.gMin; s.v.m_groupSizeMax = s.gMax; s.v.m_groupRadius = s.gRad;
+            }
+            _vegDensityStash.Clear();
+        }
         static bool Prefix(Vector3 zoneCenterPos)
         {
             if (_vegLog < 20) { _vegLog++; Plugin.Log.LogInfo($"[PT-veg] PlaceVegetation zone({zoneCenterPos.x:F0},{zoneCenterPos.z:F0}) disableVeg={Plugin._disableVegetation} conform={Plugin._vegetationConform} maxTilt={Plugin._vegMaxTilt:F0} surfHcache={Plugin._surfHCache.Count}zones"); }
             if (Plugin._disableVegetation) return false;   // skip entirely
             Plugin._inVegPlacement = true;                 // scope the GetGroundData postfix to this call
+            RestoreVegDensity();                           // guard: undo any leftover from a missed postfix
+            var wg = WorldGenerator.instance; var zs = ZoneSystem.instance;
+            if (wg != null && zs != null && zs.m_vegetation != null && Plugin._vegByBiome.Count > 0)
+            {
+                var biome = wg.GetBiome(zoneCenterPos.x, zoneCenterPos.z);
+                if (Plugin._vegByBiome.TryGetValue(biome, out var ov))
+                {
+                    float mult = ov.density <= 0f ? 1f : ov.density;
+                    foreach (var veg in zs.m_vegetation)
+                    {
+                        if (veg == null || !veg.m_enable || (veg.m_biome & biome) == 0) continue;
+                        if (veg.m_prefab == null || veg.m_prefab.GetComponentInChildren<TreeBase>() == null) continue;  // trees only
+                        if (_vegDiag < 40) { _vegDiag++; Plugin.Log.LogInfo($"[PT-veg] biome={biome} tree='{veg.m_name}' inForest={veg.m_inForest} forestThr=[{veg.m_forestTresholdMin:F2},{veg.m_forestTresholdMax:F2}] min/max={veg.m_min:F0}/{veg.m_max:F0} grp={veg.m_groupSizeMin}-{veg.m_groupSizeMax}"); }
+                        _vegDensityStash.Add(new VegStash { v = veg, min = veg.m_min, max = veg.m_max, fMax = veg.m_forestTresholdMax,
+                                                            inForest = veg.m_inForest, gMin = veg.m_groupSizeMin, gMax = veg.m_groupSizeMax, gRad = veg.m_groupRadius });
+                        veg.m_min *= mult; veg.m_max *= mult;
+                        if (ov.inForest)         veg.m_inForest = true;                        // force forest-gated → clusters by GetForestFactor
+                        if (ov.forestMax >= 0f)  veg.m_forestTresholdMax = ov.forestMax;        // tight band → dense cores only
+                        else if (ov.widen != 0f && veg.m_inForest) veg.m_forestTresholdMax += ov.widen;
+                        if (ov.groupSize > 0)    { veg.m_groupSizeMin = ov.groupSize; veg.m_groupSizeMax = ov.groupSize; }  // fat clumps
+                        if (ov.groupRadius >= 0f) veg.m_groupRadius = ov.groupRadius;
+                    }
+                }
+            }
             return true;
         }
         // runs once per zone at generation, SDF ready (gate) → place additional cave content (rung 2 POC)
         static void Postfix(Vector3 zoneCenterPos, ZoneSystem.SpawnMode mode, List<GameObject> spawnedObjects)
         {
             Plugin._inVegPlacement = false;
+            RestoreVegDensity();                           // restore the scaled m_min/m_max
             try { Plugin.PlaceCaveContent(zoneCenterPos, mode, spawnedObjects); }
             catch (Exception e) { Plugin.Log.LogWarning($"[PT-cave] PlaceCaveContent threw: {e.Message}"); }
             if (Plugin._vegViz && spawnedObjects != null)

@@ -449,6 +449,12 @@ namespace ProceduralTerrain
             ("skyopen",     1f),  // 1 = only seed on sky-exposed OUTER surfaces (default); 0 = allow INTERNAL surfaces (cave ceilings/walls) → stalactites etc.
             ("concaveratio",0f),  // >0: place only on anisotropic CONCAVE surfaces (|min curvature| >= ratio*|max|, concave) — the inverse of ridgeratio; for stalactites on tube/cave undersides
             ("chainhorizontal",0f), // >0: launch the chain HORIZONTALLY (flatten dir.y) regardless of surface normal — for flat biomes (Plains) where −N points straight down and would dive. Mountains leave 0.
+            ("forestlo", -10000f),  // keep a stamp only where the vanilla WorldGenerator.GetForestFactor >= forestlo ...
+            ("foresthi",  10000f),  // ... and <= foresthi. Lower factor = DENSER trees (vanilla in-forest = <1.15). Latch features onto the native forest field.
+            ("liftfrac",      0f),  // offset the stamp centre UP the surface normal by liftfrac·radius (0 = centred on surface; 0.25 = sits proud by r/4; negative = buries deeper)
+            ("seaatten",      1f),  // sea-level amplitude attenuation (same as the isotropic modes): stamp RADIUS → 0 as the surface approaches sealevel. 1 = no atten
+            ("seafade",       0f),  // metres above sealevel over which the atten ramps in (0 = OFF)
+            ("sealevel",     30f),  // sea level reference
         };
         protected override (string name, float def)[] ParamSpec => _spec;
         public override void BakeColumn(ref CarveBuffers cb, in BakeCellArgs args)
@@ -654,6 +660,12 @@ namespace ProceduralTerrain
         public float        PeronaK      = 0f;
         public float        PeronaLambda = 0.1f;
         public float        ExtendUp     = 0f;
+        public float        VegDensity   = 1f;    // per-biome multiplier on vanilla tree count (m_min/m_max) at placement — non-destructive (restored after the zone). 1 = vanilla
+        public float        VegForestWiden = 0f;  // per-biome widen of the vanilla forest band (m_forestTresholdMax += this) → trees spill into more-open ground. 0 = vanilla
+        public bool         VegInForest  = false; // force tree items to be forest-gated (m_inForest=true) so they CLUSTER by GetForestFactor (vanilla swamp trees are uniform)
+        public float        VegForestMax = -1f;   // if >=0, SET m_forestTresholdMax → trees only where factor <= this (low = dense cores). -1 = leave
+        public int          VegGroupSize = 0;     // if >0, SET m_groupSizeMin=m_groupSizeMax → N trees per clump (fat clusters). 0 = leave
+        public float        VegGroupRadius = -1f; // if >=0, SET m_groupRadius → clump spread. -1 = leave
 
         // Build the internal CaveProfile from profile-level params only.
         public CaveProfile ToCaveProfile(Dictionary<string, ModeDefinition> modes)
@@ -737,6 +749,9 @@ namespace ProceduralTerrain
         static volatile ModeDefinition[] _pipeline = Array.Empty<ModeDefinition>();
         // _biomeParams[biome][pipelineIdx][paramIdx] — blendable params per biome per mode
         static volatile Dictionary<Heightmap.Biome, float[][]> _biomeParams = new Dictionary<Heightmap.Biome, float[][]>();
+        // Per-biome vegetation interpretation overrides (applied live at PlaceVegetation, restored after — never baked).
+        internal struct VegOverride { public float density, widen, forestMax, groupRadius; public bool inForest; public int groupSize; }
+        internal static volatile Dictionary<Heightmap.Biome, VegOverride> _vegByBiome = new Dictionary<Heightmap.Biome, VegOverride>();
 
         // ── Location protection ───────────────────────────────────────────────────
         internal static readonly List<(Vector2 pos, float extR)> _locationPositions = new();
@@ -761,7 +776,8 @@ namespace ProceduralTerrain
         internal static bool  _biomeBlendSmooth    = true;   // false=linear, true=smoothstep
         internal static int   _transitionBlurPasses = 3;     // min blur passes for any active zone
         internal static int   _fixpointMaxZones     = 8;     // EnsureFixpoint hop cap
-        internal static float _coastFade           = 0f;     // world units above sea level over which Ocean inflates into blend (0=off)
+        internal static float _coastFade           = 0f;     // world units from the OCEAN BIOME (coastline distance, NOT height) over which Ocean inflates into the blend → suppress carving near the real coast, leave low inland biomes alone (0=off)
+        internal static float _coastStrength       = 1f;     // gain on the coastFade Ocean weight — >1 lets Ocean dominate the blend (harder suppression) past the 50/50 a weight of 1 gives
         internal static float _riverProtect        = 0f;     // gain on river-weight Ocean inflation: suppress carving inside river corridors + banks (0=off; >1 widens/strengthens)
         internal static float _riverCore           = 1f;     // river-weight fraction above which protection is FULL (plateau); lower = fatter fully-protected core + harsher shoulder, same outer radius. 1=linear
         internal static float _riverEdge           = 0f;     // river-weight fraction below which NO protection — pulls the OUTER radius inward (raise to tighten the protected band). 0=protect out to the river's full weight edge
@@ -903,6 +919,7 @@ namespace ProceduralTerrain
         // each get their own copies without allocation conflicts.
         [ThreadStatic] static float[]?       _biomeFrac;
         [ThreadStatic] static int[]?         _biomeDist;
+        [ThreadStatic] static float[]?       _oceanDistCells;   // world-unit distance to the Ocean biome per coarse cell (coastFade keys on this, not height)
         [ThreadStatic] static int[]?         _biomeBfsQ;
         [ThreadStatic] static float[]?       _biomeTotW;
         [ThreadStatic] static CaveProfile[]? _blendedProfs;
@@ -1141,6 +1158,48 @@ namespace ProceduralTerrain
                     UnityEngine.Object.Destroy(texGrad); UnityEngine.Object.Destroy(texSdf);
                 }
                 catch (Exception e) { Log.LogError($"[PT] noisemap exception: {e}"); }
+            });
+            new Terminal.ConsoleCommand("pt_forestmap", "pt_forestmap [radius] [gate] — write the REAL GetForestFactor field + pedestal-gate mask PNGs (+ value range) to BepInEx/config folder", args =>
+            {
+                try
+                {
+                    var player = Player.m_localPlayer;
+                    if (player == null) { Log.LogWarning("[PT] forestmap: no player."); return; }
+                    var pos = player.transform.position;
+                    float cx = pos.x, cz = pos.z, range = 1000f, gate = 0.85f;
+                    if (args.Length >= 2 && float.TryParse(args[1], out float r)) range = r;
+                    if (args.Length >= 3 && float.TryParse(args[2], out float g)) gate = g;
+                    int res = 512; float step = range * 2f / res;
+                    var vals = new float[res * res];
+                    float mn = 9999f, mx = -9999f, sum = 0f; int inGate = 0, inVanilla = 0;
+                    for (int i = 0; i < res * res; i++)
+                    {
+                        int ix = i % res, iz = i / res;
+                        float wx = cx + (ix - res / 2) * step, wz = cz + (iz - res / 2) * step;
+                        float ff = WorldGenerator.GetForestFactor(new Vector3(wx, 0f, wz));
+                        vals[i] = ff; sum += ff; if (ff < mn) mn = ff; if (ff > mx) mx = ff;
+                        if (ff <= gate) inGate++; if (ff < 1.15f) inVanilla++;
+                    }
+                    float mean = sum / (res * res);
+                    var texRaw = new Texture2D(res, res, TextureFormat.RGBA32, false);
+                    var texMask = new Texture2D(res, res, TextureFormat.RGBA32, false);
+                    for (int i = 0; i < res * res; i++)
+                    {
+                        int ix = i % res, iz = i / res; float ff = vals[i];
+                        float v = Mathf.Clamp01((mx - ff) / Mathf.Max(mx - mn, 1e-4f));   // invert: DENSE (low factor) = BRIGHT
+                        texRaw.SetPixel(ix, iz, new Color(v, v, v));
+                        // mask: green = inside the pedestal gate (ff<=gate); grey = vanilla in-forest (<1.15); black = open
+                        texMask.SetPixel(ix, iz, ff <= gate ? new Color(0.1f, 1f, 0.1f)
+                                               : (ff < 1.15f ? new Color(0.25f, 0.25f, 0.25f) : Color.black));
+                    }
+                    string dir = System.IO.Path.GetDirectoryName(ConfigPath)!;
+                    System.IO.File.WriteAllBytes(System.IO.Path.Combine(dir, "pt_forest_raw.png"),  texRaw.EncodeToPNG());
+                    System.IO.File.WriteAllBytes(System.IO.Path.Combine(dir, "pt_forest_mask.png"), texMask.EncodeToPNG());
+                    UnityEngine.Object.Destroy(texRaw); UnityEngine.Object.Destroy(texMask);
+                    var msg = $"[PT] forestmap: range [{mn:F2}..{mx:F2}] mean {mean:F2} | gate(≤{gate:F2}) covers {100f*inGate/(res*res):F0}% | vanilla-forest(<1.15) {100f*inVanilla/(res*res):F0}% | written to {dir}";
+                    Log.LogInfo(msg); Console.instance?.Print(msg);
+                }
+                catch (Exception e) { Log.LogError($"[PT] forestmap exception: {e}"); }
             });
             new Terminal.ConsoleCommand("pt_dumpprefabs", "pt_dumpprefabs — write every ZNetScene prefab name (sorted) to BepInEx/config/ProceduralTerrain/prefab_names.txt", _ =>
             {

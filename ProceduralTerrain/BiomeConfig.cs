@@ -164,6 +164,12 @@ namespace ProceduralTerrain
                                 tp.FloorDepth   = incl.FloorDepth;
                                 tp.FloorFade    = incl.FloorFade;
                                 tp.FloorLevel   = incl.FloorLevel;
+                                tp.VegDensity   = incl.VegDensity;
+                                tp.VegForestWiden = incl.VegForestWiden;
+                                tp.VegInForest  = incl.VegInForest;
+                                tp.VegForestMax = incl.VegForestMax;
+                                tp.VegGroupSize = incl.VegGroupSize;
+                                tp.VegGroupRadius = incl.VegGroupRadius;
                                 tp.BlurPasses   = incl.BlurPasses;
                                 tp.PeronaK      = incl.PeronaK;
                                 tp.PeronaLambda = incl.PeronaLambda;
@@ -184,6 +190,12 @@ namespace ProceduralTerrain
                             case "floordepth":    tp.FloorDepth   = fv; break;
                             case "floorfade":     tp.FloorFade    = fv; break;
                             case "floorlevel":    tp.FloorLevel   = fv; break;
+                            case "vegdensity":    tp.VegDensity   = fv; break;
+                            case "vegforestwiden": tp.VegForestWiden = fv; break;
+                            case "veginforest":   tp.VegInForest   = fv > 0.5f; break;
+                            case "vegforestmax":  tp.VegForestMax  = fv; break;
+                            case "veggroupsize":  tp.VegGroupSize  = Mathf.RoundToInt(fv); break;
+                            case "veggroupradius": tp.VegGroupRadius = fv; break;
                             case "blur_passes":   tp.BlurPasses   = fv; break;
                             case "perona_k":      tp.PeronaK      = fv; break;
                             case "perona_lambda": tp.PeronaLambda = fv; break;
@@ -355,6 +367,8 @@ namespace ProceduralTerrain
                             _fixpointMaxZones = Mathf.Max(1, fmz);
                         if (k == "coastfade" && float.TryParse(v, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float cf))
                             _coastFade = Mathf.Max(0f, cf);
+                        if (k == "coaststrength" && float.TryParse(v, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float cst))
+                            _coastStrength = Mathf.Max(0f, cst);
                         if (k == "riverprotect" && float.TryParse(v, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float rp))
                             _riverProtect = Mathf.Max(0f, rp);
                         if (k == "rivercore" && float.TryParse(v, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float rc))
@@ -484,6 +498,18 @@ namespace ProceduralTerrain
             Plugin._modifiedBiomes = modified;
 
             WarnNyquistFrequencies();
+
+            // Persist per-biome veg density for the PlaceVegetation patch (non-terrain, live interpretation).
+            var vegMap = new Dictionary<Heightmap.Biome, Plugin.VegOverride>();
+            foreach (var (b3, tp3) in biomeProfileMap)
+            {
+                bool any = tp3.VegDensity != 1f || tp3.VegForestWiden != 0f || tp3.VegInForest
+                         || tp3.VegForestMax >= 0f || tp3.VegGroupSize > 0 || tp3.VegGroupRadius >= 0f;
+                if (any) vegMap[b3] = new Plugin.VegOverride {
+                    density = tp3.VegDensity, widen = tp3.VegForestWiden, inForest = tp3.VegInForest,
+                    forestMax = tp3.VegForestMax, groupSize = tp3.VegGroupSize, groupRadius = tp3.VegGroupRadius };
+            }
+            Plugin._vegByBiome = vegMap;
 
             _modeDefinitions = modeDefs;
             _namedProfiles   = namedProfiles;
@@ -961,6 +987,8 @@ namespace ProceduralTerrain
             if (_biomeTotW == null || _biomeTotW.Length < cellCount)
                 _biomeTotW = new float[cellCount];
             for (int i = 0; i < cellCount; i++) { _blendedProfs[i] = new CaveProfile(); _biomeTotW[i] = 0f; }
+            if (_oceanDistCells == null || _oceanDistCells.Length < cellCount) _oceanDistCells = new float[cellCount];
+            for (int i = 0; i < cellCount; i++) _oceanDistCells[i] = 1e9f;   // default: no Ocean nearby (coastFade won't fire inland)
 
             // SDF-blend: retain per-cell biome contributions (biome + weight) so BakeColumnSdfBlend
             // can bake each present biome's own params and crossfade the output columns (no param chirp).
@@ -1013,6 +1041,17 @@ namespace ProceduralTerrain
 
                 // Multi-source BFS: seed from every cell that has any fraction of this biome.
                 RunBiomeBFS(slot, pcw, pgSize, maxHops);
+
+                // Capture Ocean's distance (world units) per carve cell → coastFade keys on this (coastline proximity).
+                if ((Heightmap.Biome)biomeInt == Heightmap.Biome.Ocean && _coastFade > 0f)
+                    for (int cx4 = 0; cx4 < cw4; cx4++)
+                    for (int cz4 = 0; cz4 < cw4; cz4++)
+                    {
+                        int obx = (int)((cx4 * cellVox) / (float)bCell + 0.5f) + pad; if (obx >= pcw) obx = pcw - 1;
+                        int obz = (int)((cz4 * cellVox) / (float)bCell + 0.5f) + pad; if (obz >= pcw) obz = pcw - 1;
+                        int dc = _biomeDist![obx * pcw + obz];
+                        _oceanDistCells![cx4 * cw4 + cz4] = dc >= int.MaxValue ? 1e9f : dc * coarseStep;
+                    }
 
                 float[][]? bParams = biomeParams.TryGetValue((Heightmap.Biome)biomeInt, out var bp) ? bp : null;
 
@@ -1070,24 +1109,20 @@ namespace ProceduralTerrain
                 }
             }
 
-            // ── Step 2b: Height-based Ocean inflation ─────────────────────────────────
-            // Injects extra Ocean-profile weight wherever the heightmap is within coastFade
-            // world units of sea level (30f).  This suppresses carving in shallow coastal
-            // areas regardless of what biome label the map assigns there.
+            // ── Step 2b: Coastline Ocean inflation (distance-to-Ocean, NOT height) ─────
+            // Injects extra Ocean-profile weight within coastFade world units of the actual OCEAN BIOME
+            // (from the Step-2 BFS distance). Suppresses carving near the real coastline — altitude-independent,
+            // so a low inland biome (the swamp) is left alone. Replaces the old height-from-sealevel cutoff.
             if (_coastFade > 0f)
             {
-                const float SeaLevel = 30f;
                 var oceanProf = GetP(Heightmap.Biome.Ocean);
                 float[][]? oceanBP = biomeParams.TryGetValue(Heightmap.Biome.Ocean, out var obp) ? obp : null;
                 for (int cx4 = 0; cx4 < cw4; cx4++)
                 for (int cz4 = 0; cz4 < cw4; cz4++)
                 {
-                    float wx = (ox - overlap + cx4 * cellVox + cellVox / 2) * s;
-                    float wz = (oz - overlap + cz4 * cellVox + cellVox / 2) * s;
-                    float h  = GroundHeight(wx, wz, wg);
-                    float coastW = 1f - Mathf.Clamp01((h - SeaLevel) / _coastFade);
-                    if (coastW <= 0f) continue;
                     int idx = cx4 * cw4 + cz4;
+                    float coastW = _coastStrength * (1f - Mathf.Clamp01(_oceanDistCells![idx] / _coastFade));
+                    if (coastW <= 0f) continue;
                     ref var acc = ref _blendedProfs![idx];
                     AccumulateProfile(ref acc, ref _biomeTotW![idx], in oceanProf, coastW);
                     for (int mi = 0; mi < pLen; mi++)
