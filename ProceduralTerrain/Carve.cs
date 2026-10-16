@@ -1139,7 +1139,7 @@ namespace ProceduralTerrain
 
             // Footprint support: sample an 8-direction ring at the base radius. The ground must not fall away
             // faster than maxTilt in ANY direction — this catches thin/diagonal ridges the 4-axis normal misses.
-            float r = _vegSupportRadius;
+            float r = _vegSupportRadiusEff;
             int valid = 0; float maxDrop = 0f;
             foreach (var (ux, uz) in _ringDirs)
                 if (TrySampleSurfaceY(x + ux * r, z + uz * r, out float hr))
@@ -1389,6 +1389,10 @@ namespace ProceduralTerrain
                         float blobSeaAtt  = _cb.bkModeParams![mi][49][cc];          // sea-level radius attenuation (like isotropic modes)
                         float blobSeaFade = _cb.bkModeParams![mi][50][cc];
                         float blobSeaLvl  = _cb.bkModeParams![mi][51][cc];
+                        bool  taperFlip   = _cb.bkModeParams![mi][52][cc] > 0.5f;   // taper the −N base (bell opens up) instead of the +N tip
+                        bool  flatCap     = _cb.bkModeParams![mi][53][cc] > 0.5f;   // cylinder form: round cross-section + flat caps
+                        float coastSeed   = _cb.bkModeParams![mi][54][cc];          // >0: seed only within this of the Ocean biome + aim inland
+                        float chainRoute  = _cb.bkModeParams![mi][55][cc];          // >0: Voronoi-corridor route instead of hashed walk
                         float chainSlope  = _cb.bkModeParams![mi][41][cc];
                         float biomeMajority = _cb.bkModeParams![mi][42][cc];
                         float skyOpen     = _cb.bkModeParams![mi][43][cc];
@@ -1478,7 +1482,8 @@ namespace ProceduralTerrain
                         // Debug overlay (Tier viz). Only the live/main-thread path captures (not parallel bake), and
                         // only seeds OWNED by this zone draw — so a chain tiled into N zones is drawn once, by its
                         // owner. TODO: multi SurfaceBlobs modes/zone will clobber (BeginZone clears); fine for 1 mode.
-                        bool viz = Plugin._debugViz && !_parallelBakeActive;   // carve capture: debugViz only, NOT vegViz (which shares the zone store)
+                        bool viz = Plugin._debugViz && !_parallelBakeActive                                   // per-mode isolation: if vizMode is set, ONLY that mode draws
+                                   && (string.IsNullOrEmpty(Plugin._vizMode) || mode.Name == Plugin._vizMode);
                         if (viz) { if (firstBlobViz) DebugViz.BeginZone(ox, oz); else DebugViz.SetZone(ox, oz); firstBlobViz = false; }
                         int ownW = bw - 2 * overlap;
                         float ownXLo = ox * s, ownXHi = (ox + ownW) * s, ownZLo = oz * s, ownZHi = (oz + ownW) * s;
@@ -1638,6 +1643,12 @@ namespace ProceduralTerrain
                                 if (slopeDeg < slopeLo || slopeDeg > slopeHi) continue;
                             }
                             if (ctr.y < altLo || ctr.y > altHi) continue;                            // altitude band
+                            Vector3 coastInland = Vector3.zero; float coastOceanD = 0f;               // inland direction + ocean distance for coast-seeded canals
+                            if (coastSeed > 0f)                                                      // seed ONLY where the Ocean biome is within coastSeed (the shoreline) — deterministic ring scan
+                            {
+                                if (wg == null || !NearestOcean(wg, ctr.x, ctr.z, coastSeed, out coastInland, out coastOceanD)) continue;
+                                if (_canalDiag < 40) { _canalDiag++; Log.LogInfo($"[PT-canal] seed ({ctr.x:F0},{ctr.z:F0}) y={ctr.y:F0} oceanD={coastOceanD:F0} inland=({coastInland.x:F2},{coastInland.z:F2})"); }
+                            }
                             if (forestLo > -9000f || forestHi < 9000f)                               // native vanilla forest-density field (lower = denser trees)
                             {
                                 float ff = WorldGenerator.GetForestFactor(new Vector3(ctr.x, 0f, ctr.z));
@@ -1682,10 +1693,56 @@ namespace ProceduralTerrain
                             // tier: spines will use the same call with their own color at their accept site.
                             if (capSeed) DebugViz.Line(new[] { ctr - N * 2f, ctr + N * 6f }, colSeed, 0.7f);
 
+                            // Voronoi-corridor route (chainroute>0): instead of the hashed walk, fetch the canal's
+                            // routed polyline (CanalRouter over the deterministic location set, cached per seed) and
+                            // emit stamps along it. Same downstream stamping + native coverage blend. Seam-free: the
+                            // route is a pure function of (seed pos, global location set), identical in every zone.
+                            // Routed canals are routed-ONLY: never fall back to the hashed walk (it would carve a
+                            // DIFFERENT, mismatched canal). And only route with the COMPLETE location set — routing
+                            // over a partial set (or caching a null from one) would be wrong for every later zone.
+                            if (chainRoute > 0.5f && coastSeed > 0f && coastInland.sqrMagnitude > 1e-6f && wg != null && Plugin._locationsCached)
+                            {
+                                var rpoly = GetCanalRoute(ctr, coastInland, chainN * Mathf.Abs(chainStep));
+                                if (rpoly != null && rpoly.Count >= 2)
+                                {
+                                    float tScale = 0.5f + 0.5f * Hash(li * 7 + 3, lj * 7 + 9, hk * 7 + 1);
+                                    float stepLen = Mathf.Max(1f, Mathf.Abs(chainStep));
+                                    var runPts = capSeed ? new List<Vector3> { rpoly[0] } : null;
+                                    for (int pi = 1; pi < rpoly.Count; pi++)
+                                    {
+                                        Vector3 a = rpoly[pi - 1], b = rpoly[pi];
+                                        float segLen = Vector3.Distance(a, b);
+                                        int nst = Mathf.Max(1, Mathf.RoundToInt(segLen / stepLen));
+                                        Vector3 dir = (b - a); dir.y = 0f;
+                                        if (dir.sqrMagnitude < 1e-6f) dir = new Vector3(1f, 0f, 0f);
+                                        dir = dir.normalized;
+                                        var pG = dir;
+                                        var pN = Vector3.up - Vector3.Dot(Vector3.up, pG) * pG;
+                                        if (pN.sqrMagnitude < 1e-5f) pN = Vector3.Cross(pG, Vector3.right);
+                                        pN = pN.normalized;
+                                        var pT = Vector3.Cross(pN, pG).normalized;
+                                        for (int st = 1; st <= nst; st++)
+                                        {
+                                            var pos = Vector3.Lerp(a, b, (float)st / nst);
+                                            runPts?.Add(pos);
+                                            float dr = (pos - ctr).magnitude; if (dr > maxChainReach) maxChainReach = dr;
+                                            float swell = 0.5f + 0.5f * Plugin._noisePool![11].GetNoise(pos.x * 0.07f, pos.y * 0.07f, pos.z * 0.07f);
+                                            float cr = (sminR + (smaxR - sminR) * Mathf.Clamp01(swell)) * tScale;
+                                            // lift the stamp center UP by liftfrac·radius → with more stretchn the channel
+                                            // grows taller upward while a matching lift keeps the floor from dropping deeper.
+                                            var cpos = pos + pN * (liftFrac * cr);
+                                            centers.Add(cpos); normals.Add(pN); tangG.Add(pG); tangT.Add(pT); radii.Add(cr);
+                                        }
+                                    }
+                                    if (runPts != null && runPts.Count >= 2) DebugViz.Line(runPts, colPath, 0.8f);
+                                }
+                            }
+
                             // Tier 4 — chain propagation: walk child stamps from this seed. The walk is derived
                             // ONLY from the global lattice index (li,lj,lk), so every zone within totalReach of
                             // the seed regenerates the IDENTICAL chain → tunnels tile seam-free across zones.
-                            if (chainN > 0 && chainStep != 0f)
+                            // Skipped entirely when chainroute is on (routed canals are routed-only, no fallback).
+                            if (chainRoute <= 0.5f && chainN > 0 && chainStep != 0f)
                             {
                                 Vector3 dir0;
                                 if (tile)
@@ -1721,6 +1778,9 @@ namespace ProceduralTerrain
                                     if (dir0.sqrMagnitude < 1e-6f) { float a = Hash(li + 59, lj + 83, hk + 23) * 6.2831853f; dir0 = new Vector3(Mathf.Cos(a), 0f, Mathf.Sin(a)); }   // hk (not lk) so tile seeds hash identically across zones
                                     dir0 = dir0.normalized;
                                 }
+                                // Coast-seeded canals: launch INLAND = away from the nearest ocean (deterministic ring scan,
+                                // captured at the gate). Pure function of world position → identical in every zone → seam-free.
+                                if (coastSeed > 0f && coastInland.sqrMagnitude > 1e-6f) dir0 = coastInland;
                                 // Per-tunnel variety (hashed from the seed → constant for this chain, consistent across
                                 // zones): width class (some narrow tunnels) and slope class (some shallow, some descending).
                                 float tScale = 0.5f + 0.5f * Hash(li*7+3, lj*7+9, hk*7+1);               // overall width multiplier
@@ -1729,7 +1789,12 @@ namespace ProceduralTerrain
                                 // hashed from (li,lj,lk, seg, step) → the whole tree is a pure function of the seed,
                                 // so it tiles across zones. Capped at maxEmit stamps / branchDepth to bound cost.
                                 work.Clear();
-                                work.Add((ctr, dir0, chainN, 0, 0));
+                                // Coast-seeded canals: START the chain OUT in the ocean (seaward of the seed by the ocean
+                                // distance + a buffer) so the mouth is continuous open water a ship can sail straight into.
+                                Vector3 chainStart = ctr;
+                                if (coastSeed > 0f && coastInland.sqrMagnitude > 1e-6f)   // start seaward in the ocean, pinned to SEA LEVEL (chainlevel holds it there)
+                                    chainStart = new Vector3(ctr.x - coastInland.x * (coastOceanD + 24f), RiverWaterLevel, ctr.z - coastInland.z * (coastOceanD + 24f));
+                                work.Add((chainStart, dir0, chainN, 0, 0));
                                 int segCounter = 0, emitted = 0, maxEmit = chainN * 4;
                                 while (work.Count > 0 && emitted < maxEmit)
                                 {
@@ -1877,12 +1942,16 @@ namespace ProceduralTerrain
                                     float dG = dx*G.x + dy*G.y + dz*G.z;
                                     float dT = dx*T.x + dy*T.y + dz*T.z;
                                     float RN = rr*stretchN, RG = rr*stretchG, RT = rr*stretchT;
-                                    float tn = dN > 0f ? dN / RN : 0f; if (tn > 1f) tn = 1f;    // 0 at base → 1 at tip
+                                    float dNt = taperFlip ? -dN : dN;                          // flip → taper the −N base (bell opens up)
+                                    float tn = dNt > 0f ? dNt / RN : 0f; if (tn > 1f) tn = 1f;  // 0 at un-tapered end → 1 at tapered end
                                     float shrink = taper * (taperPow == 1f ? tn : Mathf.Pow(tn, taperPow));
                                     float tf = 1f - shrink; if (tf < 0.02f) tf = 0.02f;         // tangential taper factor
                                     float uN = dN / RN, uG = dG / (RG*tf), uT = dT / (RT*tf);
+                                    float radial = pnorm == 2f ? Mathf.Sqrt(uG*uG + uT*uT)
+                                                 : Mathf.Pow(Mathf.Pow(Mathf.Abs(uG),pnorm) + Mathf.Pow(Mathf.Abs(uT),pnorm), 1f/pnorm);
                                     float comb;
-                                    if (pnorm == 2f) comb = Mathf.Sqrt(uN*uN + uG*uG + uT*uT);
+                                    if (flatCap) comb = Mathf.Max(radial, Mathf.Abs(uN));            // cylinder: round side × flat caps
+                                    else if (pnorm == 2f) comb = Mathf.Sqrt(uN*uN + uG*uG + uT*uT);  // rounded ellipsoid
                                     else comb = Mathf.Pow(Mathf.Pow(Mathf.Abs(uN),pnorm) + Mathf.Pow(Mathf.Abs(uG),pnorm) + Mathf.Pow(Mathf.Abs(uT),pnorm), 1f/pnorm);
                                     float dd = (comb - 1f) * rr;
                                     if (dd < best) best = dd;
@@ -2529,6 +2598,70 @@ namespace ProceduralTerrain
         static float DomeBandFactor(float worldY, float domeTop, float fade)
             => 1f - Mathf.Clamp01((worldY - domeTop) / Mathf.Max(fade, 0.001f));
 
+        static int _canalDiag;   // one-shot diag: log the first N coast-seeded canal mouths
+        // Deterministic nearest-Ocean scan: a PURE function of (wx,wz) — rings of GetBiome samples (globally
+        // deterministic, seed-based) out to maxR. Returns true if Ocean is within maxR, with awayDir = the
+        // horizontal direction AWAY from the nearest ocean point (= inland). Same answer in every zone → no seams.
+        static bool NearestOcean(WorldGenerator wg, float wx, float wz, float maxR, out Vector3 awayDir, out float oceanDist)
+        {
+            awayDir = Vector3.zero; oceanDist = maxR;
+            for (float r = 8f; r <= maxR; r += 8f)
+            {
+                int n = Mathf.Max(8, Mathf.RoundToInt(r / 4f));   // more angular samples at larger radius
+                float bestD2 = float.MaxValue; Vector3 toOcean = Vector3.zero; bool hit = false;
+                for (int a = 0; a < n; a++)
+                {
+                    float ang = a * 6.2831853f / n;
+                    float sx = wx + r * Mathf.Cos(ang), sz = wz + r * Mathf.Sin(ang);
+                    if (wg.GetBiome(sx, sz) == Heightmap.Biome.Ocean)
+                    {
+                        float d2 = (sx - wx) * (sx - wx) + (sz - wz) * (sz - wz);
+                        if (d2 < bestD2) { bestD2 = d2; toOcean = new Vector3(sx - wx, 0f, sz - wz); hit = true; }
+                    }
+                }
+                if (hit) { awayDir = (-toOcean).normalized; oceanDist = Mathf.Sqrt(bestD2); return true; }   // nearest ring with ocean wins
+            }
+            return false;
+        }
+
+        // Per-seed canal route cache. Keyed by the seed's quantized position; the route is a pure function of
+        // (seed pos, inland dir, global location set), so every zone that touches a canal recomputes/reuses the
+        // IDENTICAL polyline → seam-free. Built lazily once the deterministic location set is available.
+        static readonly Dictionary<long, List<Vector3>?> _canalRouteCache = new();
+        static readonly object _canalRouteLock = new();
+        internal static void ClearCanalRouteCache() { lock (_canalRouteLock) _canalRouteCache.Clear(); }
+
+        static List<Vector3>? GetCanalRoute(Vector3 ctr, Vector3 inland, float inlandGoal)
+        {
+            long key = ((long)Mathf.RoundToInt(ctr.x / 4f) * 73856093L) ^ ((long)Mathf.RoundToInt(ctr.z / 4f) * 19349663L);
+            lock (_canalRouteLock) { if (_canalRouteCache.TryGetValue(key, out var cached)) return cached; }
+
+            List<Vector3>? result = null;
+            var locs = Plugin._locationPositions;      // deterministic, complete once ZoneSystem.LocationsGenerated
+            if (locs.Count >= 3)
+            {
+                float gather = inlandGoal + 300f, g2 = gather * gather;
+                var sites = new List<CanalRouter.Site>();
+                for (int i = 0; i < locs.Count; i++)
+                {
+                    float dx = locs[i].pos.x - ctr.x, dz = locs[i].pos.y - ctr.z;
+                    if (dx * dx + dz * dz > g2) continue;
+                    float rad = Mathf.Max(locs[i].extR, Plugin.LocProtectR);   // deterministic radius (NOT the transient GetAllInstances inflation)
+                    sites.Add(new CanalRouter.Site(locs[i].pos.x, locs[i].pos.y, rad));
+                }
+                var seeds = new List<(Vector2, Vector2)> { (new Vector2(ctr.x, ctr.z), new Vector2(inland.x, inland.z)) };
+                var pr = new CanalRouter.Params { InlandGoal = inlandGoal };
+                var polys = CanalRouter.Route(sites, seeds, pr, out _, out _);
+                if (polys.Count > 0 && polys[0] != null && polys[0].Count >= 2)
+                {
+                    result = new List<Vector3>(polys[0].Count);
+                    foreach (var v in polys[0]) result.Add(new Vector3(v.x, RiverWaterLevel, v.y));
+                }
+            }
+            lock (_canalRouteLock) { _canalRouteCache[key] = result; }
+            return result;
+        }
+
         static void FillPhase1(float[] buf, int bw, int bh, int extLo, float s,
             int ox, int oz, int overlap, WorldGenerator? wg, int cw4,
             List<(Vector2 pos, float extR)> nearbyLocs, Voxheim.Core.HeightGrid? heightGrid = null)
@@ -2750,7 +2883,7 @@ namespace ProceduralTerrain
         // Per-biome tree-density multiplier: temporarily scale the shared ZoneVegetation m_min/m_max for the
         // zone's biome during this PlaceVegetation call, then restore. Non-destructive (map unchanged, just more
         // instances placed). Trees only (TreeBase). Main-thread only.
-        struct VegStash { public ZoneSystem.ZoneVegetation v; public float min, max, fMax, gRad; public bool inForest; public int gMin, gMax; }
+        struct VegStash { public ZoneSystem.ZoneVegetation v; public float min, max, fMax, gRad, tilt, rtilt, mtilt; public bool inForest; public int gMin, gMax; }
         static readonly List<VegStash> _vegDensityStash = new();
         static void RestoreVegDensity()
         {
@@ -2758,7 +2891,7 @@ namespace ProceduralTerrain
             foreach (var s in _vegDensityStash)
             {
                 s.v.m_min = s.min; s.v.m_max = s.max; s.v.m_forestTresholdMax = s.fMax;
-                s.v.m_inForest = s.inForest; s.v.m_groupSizeMin = s.gMin; s.v.m_groupSizeMax = s.gMax; s.v.m_groupRadius = s.gRad;
+                s.v.m_inForest = s.inForest; s.v.m_groupSizeMin = s.gMin; s.v.m_groupSizeMax = s.gMax; s.v.m_groupRadius = s.gRad; s.v.m_chanceToUseGroundTilt = s.tilt; s.v.m_randTilt = s.rtilt; s.v.m_maxTilt = s.mtilt;
             }
             _vegDensityStash.Clear();
         }
@@ -2768,12 +2901,16 @@ namespace ProceduralTerrain
             if (Plugin._disableVegetation) return false;   // skip entirely
             Plugin._inVegPlacement = true;                 // scope the GetGroundData postfix to this call
             RestoreVegDensity();                           // guard: undo any leftover from a missed postfix
+            Plugin._vegMaxTiltEff = Plugin._vegMaxTilt;            // default conform params to the globals; per-biome override below
+            Plugin._vegSupportRadiusEff = Plugin._vegSupportRadius;
             var wg = WorldGenerator.instance; var zs = ZoneSystem.instance;
             if (wg != null && zs != null && zs.m_vegetation != null && Plugin._vegByBiome.Count > 0)
             {
                 var biome = wg.GetBiome(zoneCenterPos.x, zoneCenterPos.z);
                 if (Plugin._vegByBiome.TryGetValue(biome, out var ov))
                 {
+                    if (ov.conformMaxTilt >= 0f) Plugin._vegMaxTiltEff = ov.conformMaxTilt;        // per-biome conform slope-reject
+                    if (ov.supportRadius  >= 0f) Plugin._vegSupportRadiusEff = ov.supportRadius;   // per-biome footprint support radius
                     float mult = ov.density <= 0f ? 1f : ov.density;
                     foreach (var veg in zs.m_vegetation)
                     {
@@ -2781,13 +2918,16 @@ namespace ProceduralTerrain
                         if (veg.m_prefab == null || veg.m_prefab.GetComponentInChildren<TreeBase>() == null) continue;  // trees only
                         if (_vegDiag < 40) { _vegDiag++; Plugin.Log.LogInfo($"[PT-veg] biome={biome} tree='{veg.m_name}' inForest={veg.m_inForest} forestThr=[{veg.m_forestTresholdMin:F2},{veg.m_forestTresholdMax:F2}] min/max={veg.m_min:F0}/{veg.m_max:F0} grp={veg.m_groupSizeMin}-{veg.m_groupSizeMax}"); }
                         _vegDensityStash.Add(new VegStash { v = veg, min = veg.m_min, max = veg.m_max, fMax = veg.m_forestTresholdMax,
-                                                            inForest = veg.m_inForest, gMin = veg.m_groupSizeMin, gMax = veg.m_groupSizeMax, gRad = veg.m_groupRadius });
+                                                            inForest = veg.m_inForest, gMin = veg.m_groupSizeMin, gMax = veg.m_groupSizeMax, gRad = veg.m_groupRadius, tilt = veg.m_chanceToUseGroundTilt, rtilt = veg.m_randTilt, mtilt = veg.m_maxTilt });
                         veg.m_min *= mult; veg.m_max *= mult;
                         if (ov.inForest)         veg.m_inForest = true;                        // force forest-gated → clusters by GetForestFactor
                         if (ov.forestMax >= 0f)  veg.m_forestTresholdMax = ov.forestMax;        // tight band → dense cores only
                         else if (ov.widen != 0f && veg.m_inForest) veg.m_forestTresholdMax += ov.widen;
                         if (ov.groupSize > 0)    { veg.m_groupSizeMin = ov.groupSize; veg.m_groupSizeMax = ov.groupSize; }  // fat clumps
                         if (ov.groupRadius >= 0f) veg.m_groupRadius = ov.groupRadius;
+                        if (ov.tiltInherit >= 0f) veg.m_chanceToUseGroundTilt = ov.tiltInherit;   // trees lean to the conform normal
+                        if (ov.randTilt >= 0f)    veg.m_randTilt = ov.randTilt;                   // random extra lean (deg) regardless of ground
+                        if (ov.maxTilt  >= 0f)    veg.m_maxTilt  = ov.maxTilt;                    // raise so ground-tilt isn't clamped short
                     }
                 }
             }
@@ -2820,7 +2960,7 @@ namespace ProceduralTerrain
                 if (cleared.Add((ox, oz))) DebugViz.BeginZone(ox, oz);   // replace stale lines when a zone re-places veg
                 // Same probe the real gate uses → viz and placement can never disagree.
                 Color col; Vector3 nrm = Vector3.up;
-                if (!Plugin.TrySurfaceConform(p.x, p.z, Plugin._vegMaxTilt, out float sh, out Vector3 n, out bool reject))
+                if (!Plugin.TrySurfaceConform(p.x, p.z, Plugin._vegMaxTiltEff, out float sh, out Vector3 n, out bool reject))
                     col = Color.grey;                                        // surfH miss (zone not carved)
                 else
                 {
@@ -2857,7 +2997,7 @@ namespace ProceduralTerrain
                 if (diag) { _diag++; Plugin.Log.LogInfo($"[PT-veg] CONFORM-DISABLED (vegetationConform=false) at ({p.x:F0},{p.z:F0}) — vanilla placement"); }
                 return;
             }
-            if (!Plugin.TrySurfaceConform(p.x, p.z, Plugin._vegMaxTilt, out float sh, out Vector3 n, out bool reject))
+            if (!Plugin.TrySurfaceConform(p.x, p.z, Plugin._vegMaxTiltEff, out float sh, out Vector3 n, out bool reject))
             {
                 if (diag) { _diag++; Plugin.Log.LogInfo($"[PT-veg] surfH MISS ({p.x:F0},{p.z:F0}) → vanilla (no conform)  [cache={Plugin._surfHCache.Count} zones, want key={Plugin.SurfKeyFor(p.x, p.z)}]"); }
                 return;   // zone not carved yet → leave vanilla

@@ -37,9 +37,14 @@ namespace ProceduralTerrain
                                         // tunnel cuts it — not poking out the mountainside). 0 = no check.
         public float Lift      = 0f;    // raise this far (m) off the crossing into the air side (flying spawners)
         public bool  Upright   = false; // force world-up orientation instead of tilting to the floor normal
+        public bool  Surface   = false; // opt in to the TOP (surface) crossing — ground scatter, not cave-only
+        public float MinY       = float.NegativeInfinity; // world-Y floor: skip crossings below this (e.g. keep scatter above sea level → raised hammocks)
+        public float MinNormalY = 0.6f;  // floor-prop flatness gate; lower = allow steeper slopes (hammock flanks). only used for FloorOnly objects
+        public float RandTilt   = 0f;    // extra random tilt (deg) about a random horizontal axis → varied X/Z orientation (roots don't all lie the same way). Y-yaw is always random.
 
-        // resolved at runtime (needs ZNetScene)
-        public GameObject? Resolved;
+        // resolved at runtime (needs ZNetScene). ALL candidates that resolve → one is picked uniformly per
+        // placement (comma list = a random pool, not a first-wins fallback). Empty = none resolved.
+        public GameObject[] Resolved = System.Array.Empty<GameObject>();
         public int CreatureHash;        // 0 = no override
 
         // ramp(depth): 0 below DepthMin, linear to 1 across [DepthMin, DepthFull], hard step if DepthFull<=DepthMin.
@@ -148,6 +153,10 @@ namespace ProceduralTerrain
                     case "cover":     p.Cover     = F(v, p.Cover); break;
                     case "lift":      p.Lift      = F(v, p.Lift); break;
                     case "upright":   p.Upright   = (v == "1" || v.Equals("true", StringComparison.OrdinalIgnoreCase)); break;
+                    case "surface":   p.Surface   = !(v == "0" || v.Equals("false", StringComparison.OrdinalIgnoreCase)); break;
+                    case "miny":      p.MinY      = F(v, p.MinY); break;
+                    case "minnormaly":p.MinNormalY= F(v, p.MinNormalY); break;
+                    case "randtilt":  p.RandTilt  = F(v, p.RandTilt); break;
                 }
             }
             if (!haveKind) { Log.LogWarning($"[PT-cave] placement '{name}': missing kind= (object|spawner)."); return null; }
@@ -162,11 +171,13 @@ namespace ProceduralTerrain
             var zs = ZNetScene.instance; if (zs == null) return;
             foreach (var p in _placements)
             {
-                p.Resolved = null;
-                foreach (var n in p.PrefabCands) { var go = zs.GetPrefab(n); if (go != null) { p.Resolved = go; break; } }
+                var hits = new List<GameObject>(); var misses = new List<string>();
+                foreach (var n in p.PrefabCands) { var go = zs.GetPrefab(n); if (go != null) hits.Add(go); else misses.Add(n); }
+                p.Resolved = hits.ToArray();
                 p.CreatureHash = string.IsNullOrEmpty(p.CreatureOverride) ? 0 : StringExtensionMethods.GetStableHashCode(p.CreatureOverride);
                 string ov = p.CreatureHash != 0 ? $" → {p.CreatureOverride}" : "";
-                Log.LogInfo($"[PT-cave] resolve {p.Name} ({p.Kind}): {(p.Resolved ? p.Resolved!.name : "NONE of [" + string.Join(",", p.PrefabCands) + "]")}{ov}");
+                string missTxt = misses.Count > 0 ? $"  MISSING (won't resolve): [{string.Join(",", misses)}]" : "";
+                Log.LogInfo($"[PT-cave] resolve {p.Name} ({p.Kind}): pool={hits.Count}/{p.PrefabCands.Length} [{string.Join(",", hits.ConvertAll(g => g.name))}]{ov}{missTxt}");
             }
             _placementsResolved = true;
         }
