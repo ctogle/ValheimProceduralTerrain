@@ -112,7 +112,7 @@ namespace ProceduralTerrain
             var objPool = new List<Placement>(); var spwPool = new List<Placement>(); var channels = new List<Placement>();
             foreach (var p in _placements)
             {
-                if (p.Resolved == null || !p.Biomes.Contains(biome)) continue;
+                if (p.Resolved.Length == 0 || !p.Biomes.Contains(biome)) continue;
                 if (p.Prob >= 0f) channels.Add(p);
                 else if (p.Kind == PlacementKind.Spawner) spwPool.Add(p);
                 else objPool.Add(p);
@@ -164,11 +164,14 @@ namespace ProceduralTerrain
 
                 Vector3 pos = anchor; Quaternion rot;
                 // orientation: spawners/upright = world-up + yaw; floor objects tilt to the floor normal (any
-                // orientation). Embed is a SEPARATE position sink (below), so tilted props can still bury their base.
+                // orientation). Embed sinks ALONG that same normal (below), so a tilted prop buries its base into
+                // the slope instead of floating — straight-down embed only works on flat ground.
+                Vector3 fnormal = (isFloor && p.Kind == PlacementKind.Object && !p.Upright)
+                                  ? CaveFloorNormal(e, ix, iz, width, cyY, s) : Vector3.up;
                 if (p.Kind == PlacementKind.Spawner || p.Upright) rot = Quaternion.Euler(0f, yaw, 0f);
-                else if (isFloor) rot = Quaternion.FromToRotation(Vector3.up, CaveFloorNormal(e, ix, iz, width, cyY, s)) * Quaternion.Euler(0f, yaw, 0f);
+                else if (isFloor) rot = Quaternion.FromToRotation(Vector3.up, fnormal) * Quaternion.Euler(0f, yaw, 0f);
                 else rot = Quaternion.Euler(0f, yaw, 0f);
-                if (p.Embed > 0f) pos = new Vector3(worldX, cyY - p.Embed, worldZ);   // sink to guarantee ground contact
+                if (p.Embed > 0f) pos = anchor - fnormal * p.Embed;   // sink along the surface normal → tilted props bury their base
                 if (p.RandTilt > 0f)   // extra random X/Z tilt about a random horizontal axis → varied orientation (roots don't all lie identically)
                 {
                     float ta = CCRand(ox + ix, oz + iz, ci, 31) * p.RandTilt;
@@ -179,7 +182,10 @@ namespace ProceduralTerrain
                 // Voxheim "unburies" them every tick). Air is up on a floor crossing, down on a ceiling crossing.
                 if (p.Lift != 0f) pos += (isFloor ? Vector3.up : Vector3.down) * p.Lift;
 
-                if (!SpawnCave(p.Resolved!, pos, rot, ghost, spawnedObjects, p.CreatureHash)) return false;
+                // uniform pick from the resolved pool (deterministic per crossing)
+                var prefab = p.Resolved.Length == 1 ? p.Resolved[0]
+                           : p.Resolved[Math.Min(p.Resolved.Length - 1, (int)(CCRand(ox + ix, oz + iz, ci, 43) * p.Resolved.Length))];
+                if (!SpawnCave(prefab, pos, rot, ghost, spawnedObjects, p.CreatureHash)) return false;
                 ps.count++; ps.pts.Add(anchor);
                 return true;
             }

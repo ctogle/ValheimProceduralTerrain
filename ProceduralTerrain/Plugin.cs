@@ -1375,6 +1375,40 @@ namespace ProceduralTerrain
                 }
                 catch (Exception e) { Log.LogError($"[PT] dumpprefabs: {e}"); }
             });
+            new Terminal.ConsoleCommand("pt_vegdump", "pt_vegdump [biome] — write the FULL ZoneSystem vegetation table (every spawn incl. pickables/berries, with biomes + rates) to BepInEx/config/ProceduralTerrain/pt_vegdump.txt. Optional biome filter (e.g. Swamp).", args =>
+            {
+                try
+                {
+                    var zs = ZoneSystem.instance;
+                    if (zs == null || zs.m_vegetation == null) { Console.instance?.Print("[PT] ZoneSystem/vegetation not ready (load a world)."); return; }
+                    string filter = args.Length >= 2 ? args[1].Trim() : "";
+                    var lines = new System.Collections.Generic.List<string>
+                    { "name\tprefab\tkind\tbiome\tenable\tmin\tmax\tgrpMin\tgrpMax\tgrpRadius\tinForest\tforestThr\taltMin\taltMax\ttiltMin\ttiltMax\tscaleMin\tscaleMax\tsnapWater" };
+                    int n = 0;
+                    foreach (var v in zs.m_vegetation)
+                    {
+                        if (v == null) continue;
+                        string biome = v.m_biome.ToString();
+                        if (filter.Length > 0 && biome.IndexOf(filter, StringComparison.OrdinalIgnoreCase) < 0) continue;
+                        string pf = v.m_prefab != null ? v.m_prefab.name : "(null)";
+                        string kind = "Other";
+                        if (v.m_prefab != null)
+                        {
+                            if (v.m_prefab.GetComponentInChildren<TreeBase>() != null) kind = "Tree";
+                            else if (v.m_prefab.GetComponentInChildren<Pickable>() != null) kind = "Pickable";
+                            else if (v.m_prefab.GetComponentInChildren<Destructible>() != null) kind = "Destructible";
+                        }
+                        lines.Add($"{v.m_name}\t{pf}\t{kind}\t{biome}\t{v.m_enable}\t{v.m_min:F2}\t{v.m_max:F2}\t{v.m_groupSizeMin}\t{v.m_groupSizeMax}\t{v.m_groupRadius:F0}\t{v.m_inForest}\t[{v.m_forestTresholdMin:F2},{v.m_forestTresholdMax:F2}]\t{v.m_minAltitude:F0}\t{v.m_maxAltitude:F0}\t{v.m_minTilt:F0}\t{v.m_maxTilt:F0}\t{v.m_scaleMin:F2}\t{v.m_scaleMax:F2}\t{v.m_snapToWater}");
+                        n++;
+                    }
+                    System.IO.Directory.CreateDirectory(PTConfigDir);
+                    string path = System.IO.Path.Combine(PTConfigDir, "pt_vegdump.txt");
+                    System.IO.File.WriteAllLines(path, lines);
+                    var msg = $"[PT] vegdump: {n} vegetation entr{(n == 1 ? "y" : "ies")}{(filter.Length > 0 ? $" matching '{filter}'" : "")} → {path}";
+                    Log.LogInfo(msg); Console.instance?.Print(msg);
+                }
+                catch (Exception e) { Log.LogError($"[PT] vegdump: {e}"); }
+            });
             new Terminal.ConsoleCommand("pt_bake", "pt_bake [radius] — bake terrain SDF for a radius in meters; runs on server (admin only)", args =>
             {
                 float radius = _bakeRadius;

@@ -42,8 +42,9 @@ namespace ProceduralTerrain
         public float MinNormalY = 0.6f;  // floor-prop flatness gate; lower = allow steeper slopes (hammock flanks). only used for FloorOnly objects
         public float RandTilt   = 0f;    // extra random tilt (deg) about a random horizontal axis → varied X/Z orientation (roots don't all lie the same way). Y-yaw is always random.
 
-        // resolved at runtime (needs ZNetScene)
-        public GameObject? Resolved;
+        // resolved at runtime (needs ZNetScene). ALL candidates that resolve → one is picked uniformly per
+        // placement (comma list = a random pool, not a first-wins fallback). Empty = none resolved.
+        public GameObject[] Resolved = System.Array.Empty<GameObject>();
         public int CreatureHash;        // 0 = no override
 
         // ramp(depth): 0 below DepthMin, linear to 1 across [DepthMin, DepthFull], hard step if DepthFull<=DepthMin.
@@ -170,11 +171,13 @@ namespace ProceduralTerrain
             var zs = ZNetScene.instance; if (zs == null) return;
             foreach (var p in _placements)
             {
-                p.Resolved = null;
-                foreach (var n in p.PrefabCands) { var go = zs.GetPrefab(n); if (go != null) { p.Resolved = go; break; } }
+                var hits = new List<GameObject>(); var misses = new List<string>();
+                foreach (var n in p.PrefabCands) { var go = zs.GetPrefab(n); if (go != null) hits.Add(go); else misses.Add(n); }
+                p.Resolved = hits.ToArray();
                 p.CreatureHash = string.IsNullOrEmpty(p.CreatureOverride) ? 0 : StringExtensionMethods.GetStableHashCode(p.CreatureOverride);
                 string ov = p.CreatureHash != 0 ? $" → {p.CreatureOverride}" : "";
-                Log.LogInfo($"[PT-cave] resolve {p.Name} ({p.Kind}): {(p.Resolved ? p.Resolved!.name : "NONE of [" + string.Join(",", p.PrefabCands) + "]")}{ov}");
+                string missTxt = misses.Count > 0 ? $"  MISSING (won't resolve): [{string.Join(",", misses)}]" : "";
+                Log.LogInfo($"[PT-cave] resolve {p.Name} ({p.Kind}): pool={hits.Count}/{p.PrefabCands.Length} [{string.Join(",", hits.ConvertAll(g => g.name))}]{ov}{missTxt}");
             }
             _placementsResolved = true;
         }
