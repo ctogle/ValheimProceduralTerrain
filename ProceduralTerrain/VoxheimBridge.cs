@@ -349,7 +349,11 @@ namespace ProceduralTerrain
             }
             nmods = mods.Count;
             if (mods.Count == 0) return null;
-            mods.Sort(Voxheim.Core.ModifierDescriptor.CompareVanilla);
+            // Guard: a vanilla modifier with an inconsistent/NaN key makes List.Sort throw "Failed to compare two
+            // elements", which otherwise aborts the ENTIRE zone carve (no terrain, no canals, no viz). Fall back to
+            // unsorted rather than lose the zone.
+            try { mods.Sort(Voxheim.Core.ModifierDescriptor.CompareVanilla); }
+            catch (InvalidOperationException e) { Plugin.Log.LogWarning($"[PT] groundwork modifier sort failed ({e.Message}) — proceeding unsorted for this zone."); }
 
             // Vanilla base heights + corner biomes for this zone (same inputs Voxheim's authority uses).
             var hmb = HeightmapBuilder.instance;

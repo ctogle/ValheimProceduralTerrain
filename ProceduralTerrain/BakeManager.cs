@@ -31,7 +31,7 @@ namespace ProceduralTerrain
         static readonly HashSet<string> _hashExcludedKeys = new(StringComparer.OrdinalIgnoreCase)
         {
             "coarsexz", "coarsey", "bakeradius", "debugviz", "debugvizocclude", "vegviz", "vegvizradius", "hidelodmeshes",
-            "disablevegetation", "applygroundwork", "protectlocations", "flatplanelocations", "locdomeheight", "locbandfade", "vegdensity", "vegforestwiden", "veginforest", "vegforestmax", "veggroupsize", "veggroupradius",
+            "disablevegetation", "applygroundwork", "protectlocations", "flatplanelocations", "locdomeheight", "locbandfade", "vegdensity", "vegforestwiden", "veginforest", "vegforestmax", "veggroupsize", "veggroupradius", "vegtiltinherit", "vegrandtilt", "vegmaxtilt", "vegconformmaxtilt", "vegsupportradius",
             "vegetationconform", "vegmaxtilt", "seed",
             "prefetch", "prefetchradius", "prefetchthreads", "cavecontent", "lodunderground",
         };

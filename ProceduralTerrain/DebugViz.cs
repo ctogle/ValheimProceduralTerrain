@@ -179,7 +179,9 @@ namespace ProceduralTerrain
                             var child = t.GetChild(i);
                             var lr = child.GetComponent<LineRenderer>();
                             if (lr == null || lr.positionCount == 0) continue;
-                            bool near = (lr.GetPosition(0) - cp).sqrMagnitude <= r2;
+                            bool near = false;                                    // nearest-point cull: show if ANY vertex is within radius (long paths don't vanish by their anchor)
+                            for (int p = 0; p < lr.positionCount; p++)
+                                if ((lr.GetPosition(p) - cp).sqrMagnitude <= r2) { near = true; break; }
                             if (child.gameObject.activeSelf != near) child.gameObject.SetActive(near);
                         }
                     }

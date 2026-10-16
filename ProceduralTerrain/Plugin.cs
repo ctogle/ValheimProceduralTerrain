@@ -455,6 +455,10 @@ namespace ProceduralTerrain
             ("seaatten",      1f),  // sea-level amplitude attenuation (same as the isotropic modes): stamp RADIUS → 0 as the surface approaches sealevel. 1 = no atten
             ("seafade",       0f),  // metres above sealevel over which the atten ramps in (0 = OFF)
             ("sealevel",     30f),  // sea level reference
+            ("taperflip",     0f),  // >0: taper toward the −N BASE instead of the +N tip → narrow bottom, wide top (mushroom/trumpet bell opening UP). pairs with liftfrac to raise the cap off the ground
+            ("flatcap",       0f),  // >0: CYLINDER form — round cross-section (G,T) with FLAT caps along N (comb = max(radial, |uN|)) instead of the rounded ellipsoid. tapered+flatcap = truncated cone / sharp-rimmed bell
+            ("coastseed",     0f),  // >0: only seed within this many world-units of the OCEAN biome, AND aim the chain INLAND (up the ocean-distance gradient). For canals that start at the shoreline and run in. 0 = off
+            ("chainroute",    0f),  // >0: route the canal through the Voronoi location-corridor graph (CanalRouter) instead of the hashed random walk — snakes AROUND protected locations. needs coastseed + generated locations. 0 = hashed walk (default)
         };
         protected override (string name, float def)[] ParamSpec => _spec;
         public override void BakeColumn(ref CarveBuffers cb, in BakeCellArgs args)
@@ -666,6 +670,11 @@ namespace ProceduralTerrain
         public float        VegForestMax = -1f;   // if >=0, SET m_forestTresholdMax → trees only where factor <= this (low = dense cores). -1 = leave
         public int          VegGroupSize = 0;     // if >0, SET m_groupSizeMin=m_groupSizeMax → N trees per clump (fat clusters). 0 = leave
         public float        VegGroupRadius = -1f; // if >=0, SET m_groupRadius → clump spread. -1 = leave
+        public float        VegTiltInherit = -1f; // if >=0, SET m_chanceToUseGroundTilt → trees LEAN to the ground normal (our conform normal) this fraction of the time. 1 = always lean. -1 = leave vanilla (≈upright)
+        public float        VegRandTilt    = -1f; // if >=0, SET m_randTilt → random extra lean (deg) applied regardless of ground. -1 = leave vanilla
+        public float        VegMaxTilt     = -1f; // if >=0, SET m_maxTilt → cap on ground-tilt (deg); raise so leaning trees aren't clamped upright. -1 = leave vanilla
+        public float        VegConformMaxTilt = -1f; // if >=0, per-biome override of the CONFORM slope-reject threshold (global [Vegetation] maxTilt). -1 = use global
+        public float        VegSupportRadius  = -1f; // if >=0, per-biome override of the conform footprint support radius (global [Vegetation] supportRadius). -1 = use global
 
         // Build the internal CaveProfile from profile-level params only.
         public CaveProfile ToCaveProfile(Dictionary<string, ModeDefinition> modes)
@@ -730,6 +739,10 @@ namespace ProceduralTerrain
         internal static bool  _vegetationConform = true;   // snap vegetation to the voxel surface + reject steep/overhung spots (vanilla placement rides the 2.5D heightmap, blind to our 3D terrain)
         internal static float _vegMaxTilt        = 30f;    // reject vegetation where the voxel surface is steeper than this (degrees); covers "flat enough to hide the trunk base"
         internal static float _vegSupportRadius   = 2.5f;   // footprint radius (m) for the 8-direction support ring; ground must not fall away past maxTilt within this of the trunk base
+        // Per-zone EFFECTIVE conform params: default to the globals above, overridden per-biome in the veg Prefix
+        // (vegConformMaxTilt / vegSupportRadius profile keys). TrySurfaceConform + its callers read these.
+        internal static float _vegMaxTiltEff      = 30f;
+        internal static float _vegSupportRadiusEff = 2.5f;
         [System.ThreadStatic] internal static bool _inVegPlacement;   // set only while ZoneSystem.PlaceVegetation runs, so the GetGroundData postfix scopes to vegetation
         internal static string? _forcedSeed;   // if set (cfg [Debug] seed=), every world is forced to this seed string (testing aid); null = normal
         internal static bool _compressBake = false;
@@ -750,7 +763,7 @@ namespace ProceduralTerrain
         // _biomeParams[biome][pipelineIdx][paramIdx] — blendable params per biome per mode
         static volatile Dictionary<Heightmap.Biome, float[][]> _biomeParams = new Dictionary<Heightmap.Biome, float[][]>();
         // Per-biome vegetation interpretation overrides (applied live at PlaceVegetation, restored after — never baked).
-        internal struct VegOverride { public float density, widen, forestMax, groupRadius; public bool inForest; public int groupSize; }
+        internal struct VegOverride { public float density, widen, forestMax, groupRadius, tiltInherit, randTilt, maxTilt, conformMaxTilt, supportRadius; public bool inForest; public int groupSize; }
         internal static volatile Dictionary<Heightmap.Biome, VegOverride> _vegByBiome = new Dictionary<Heightmap.Biome, VegOverride>();
 
         // ── Location protection ───────────────────────────────────────────────────
@@ -769,6 +782,7 @@ namespace ProceduralTerrain
         const float LOD_UndergroundMargin = 4f;              // metres below surface before we consider the player "underground"
         internal static bool  _debugViz            = false;  // DEBUG: draw see-through overlay lines for brush seeds/paths (tunnels now, spines later)
         internal static bool  _vegViz              = false;  // DEBUG: per-tree conform line — green=kept, red=rejected, grey=vanilla(surfH miss)
+        internal static string _vizMode            = "";     // if set (cfg [Debug] vizMode=<modename>), ONLY that mode emits carve debug-viz lines; empty = all modes
         internal static int   _overlap             = 4;      // running-field margin (voxels) shared with neighbour zones; caps seam-free feature reach
         internal static float _fieldDepthLo        = 0f;     // min world-metres the carvable field extends BELOW terrain min (0=default). Raise so deep tunnels stay in-field
         internal static bool  _bakeTrilinear       = false;  // step>1 rehydration interp: false=Catmull-Rom (C1, smooth), true=trilinear (C0, cheap). A/B on the same bake file
@@ -852,7 +866,7 @@ namespace ProceduralTerrain
         internal static bool _bakeFileV6 = false;   // loaded bake file uses the v6 crossings layout
         static bool _bakeLoadAttempted = false;
 
-        const float LocProtectR = 10f; // minimum protection radius when exteriorRadius is unavailable
+        internal const float LocProtectR = 10f; // minimum protection radius when exteriorRadius is unavailable
 
         // ── Zone tracking for hot-reload ──────────────────────────────────────────
         internal static MethodInfo? _skinMethod;          // 0.1.7: static Skin(Heightmap) — re-adds VoxelZone + queues worker
@@ -1024,6 +1038,26 @@ namespace ProceduralTerrain
         // ─────────────────────────────────────────────────────────────────────────
 
         internal static int _mainThreadId = -1;
+
+        // Ring-scan for the nearest Ocean biome within maxR; returns the INLAND direction (unit, away from ocean).
+        // Deterministic pure function of (wx,wz). Mirrors Carve.NearestOcean; used by the pt_canalmap debug command.
+        static bool CanalNearestOcean(WorldGenerator wg, float wx, float wz, float maxR, out Vector2 inland)
+        {
+            inland = Vector2.zero;
+            for (float r = 8f; r <= maxR; r += 8f)
+            {
+                int n = Mathf.Max(8, Mathf.RoundToInt(r / 4f));
+                float bestD2 = float.MaxValue; Vector2 toOcean = Vector2.zero; bool hit = false;
+                for (int a = 0; a < n; a++)
+                {
+                    float ang = a * 6.2831853f / n, sx = wx + r * Mathf.Cos(ang), sz = wz + r * Mathf.Sin(ang);
+                    if (wg.GetBiome(sx, sz) == Heightmap.Biome.Ocean)
+                    { float d2 = (sx - wx) * (sx - wx) + (sz - wz) * (sz - wz); if (d2 < bestD2) { bestD2 = d2; toOcean = new Vector2(sx - wx, sz - wz); hit = true; } }
+                }
+                if (hit) { inland = (-toOcean).normalized; return true; }
+            }
+            return false;
+        }
 
         void Awake()
         {
@@ -1200,6 +1234,127 @@ namespace ProceduralTerrain
                     Log.LogInfo(msg); Console.instance?.Print(msg);
                 }
                 catch (Exception e) { Log.LogError($"[PT] forestmap exception: {e}"); }
+            });
+            new Terminal.ConsoleCommand("pt_locmap", "pt_locmap [radius] — write the location-protection field PNG (black=protected/no-carve, white=free) to BepInEx/config/ProceduralTerrain/pt_locmap.png", args =>
+            {
+                try
+                {
+                    var player = Player.m_localPlayer;
+                    if (player == null) { Log.LogWarning("[PT] locmap: no player."); return; }
+                    var pos = player.transform.position;
+                    float cx = pos.x, cz = pos.z, range = 1000f;
+                    if (args.Length >= 2 && float.TryParse(args[1], out float r)) range = r;
+                    // Gather every location whose dome could reach the imaged area (mirror of Carve's nearbyLocs build).
+                    // NOTE: LocProtectRadius calls TerrainModifier.GetAllInstances() (transient) — fine for a visual
+                    // snapshot, but routing logic must use the deterministic gather, not this.
+                    var nearbyLocs = new List<(Vector2 pos, float extR)>();
+                    float imgR = range * 1.5f + 500f;
+                    foreach (var loc in _locationPositions)
+                    {
+                        float dx = loc.pos.x - cx, dz = loc.pos.y - cz;
+                        if (dx * dx + dz * dz < imgR * imgR)
+                            nearbyLocs.Add((loc.pos, LocProtectRadius(loc.pos, loc.extR)));
+                    }
+                    int res = 512; float step = range * 2f / res;
+                    var tex = new Texture2D(res, res, TextureFormat.RGBA32, false);
+                    int protPix = 0;
+                    for (int i = 0; i < res * res; i++)
+                    {
+                        int ix = i % res, iz = i / res;
+                        float wx = cx + (ix - res / 2) * step, wz = cz + (iz - res / 2) * step;
+                        float f = LocationFactor(wx, wz, nearbyLocs);   // 0 = fully protected, 1 = free
+                        if (f < 0.999f) protPix++;
+                        // grayscale free→protected; tint the hard core (fully damped) red so domes pop
+                        Color c = f <= 0.001f ? new Color(0.8f, 0.1f, 0.1f) : new Color(f, f, f);
+                        tex.SetPixel(ix, iz, c);
+                    }
+                    string dir = System.IO.Path.GetDirectoryName(ConfigPath)!;
+                    System.IO.File.WriteAllBytes(System.IO.Path.Combine(dir, "pt_locmap.png"), tex.EncodeToPNG());
+                    UnityEngine.Object.Destroy(tex);
+                    var msg = $"[PT] locmap: {nearbyLocs.Count} location(s) in range, protectLocations={_protectLocations}, {100f * protPix / (res * res):F0}% of a {range * 2f:F0}m window protected → {dir}\\pt_locmap.png";
+                    Log.LogInfo(msg); Console.instance?.Print(msg);
+                }
+                catch (Exception e) { Log.LogError($"[PT] locmap exception: {e}"); }
+            });
+            new Terminal.ConsoleCommand("pt_canalmap", "pt_canalmap [radius] [coastDist] — seed from the real ocean coastline, route canals through the location-corridor graph, and render a PNG (no carving). -> BepInEx/config/ProceduralTerrain/pt_canalmap.png", args =>
+            {
+                try
+                {
+                    var player = Player.m_localPlayer; var wg = WorldGenerator.instance;
+                    if (player == null || wg == null) { Log.LogWarning("[PT] canalmap: no player/worldgen."); return; }
+                    var pp = player.transform.position;
+                    float cx = pp.x, cz = pp.z, range = 1000f, coastDist = 150f;
+                    if (args.Length >= 2 && float.TryParse(args[1], out float r)) range = r;
+                    if (args.Length >= 3 && float.TryParse(args[2], out float cd)) coastDist = cd;
+
+                    // sites = nearby locations (transient cache — fine for a debug snapshot, NOT for carve routing)
+                    var sites = new List<CanalRouter.Site>();
+                    float gatherR = range * 1.5f + 500f;
+                    foreach (var loc in _locationPositions)
+                    {
+                        float dx = loc.pos.x - cx, dz = loc.pos.y - cz;
+                        if (dx * dx + dz * dz >= gatherR * gatherR) continue;
+                        sites.Add(new CanalRouter.Site(loc.pos.x, loc.pos.y, LocProtectRadius(loc.pos, loc.extR)));
+                    }
+                    // coastline seeds: lattice over the window; keep swamp/land cells within coastDist of Ocean, aim inland
+                    var seeds = new List<(Vector2 start, Vector2 dir)>();
+                    float spacing = 120f;
+                    for (float x = cx - range; x <= cx + range; x += spacing)
+                    for (float z = cz - range; z <= cz + range; z += spacing)
+                    {
+                        if (wg.GetBiome(x, z) == Heightmap.Biome.Ocean) continue;
+                        if (!CanalNearestOcean(wg, x, z, coastDist, out Vector2 inland)) continue;
+                        seeds.Add((new Vector2(x, z), inland));
+                    }
+
+                    var pr = new CanalRouter.Params { InlandGoal = range * 0.9f };
+                    var polys = CanalRouter.Route(sites, seeds, pr, out int reached, out int terminated);
+
+                    // render
+                    int res = 640; float step = range * 2f / res;
+                    var tex = new Texture2D(res, res, TextureFormat.RGBA32, false);
+                    var px = new Color[res * res]; for (int i = 0; i < px.Length; i++) px[i] = Color.white;
+                    int PX(float wx) => Mathf.RoundToInt((wx - (cx - range)) / step);
+                    int PZ(float wz) => Mathf.RoundToInt(((cz + range) - wz) / step);
+                    void Dot(int x, int y, float rad, Color c) { int ri = Mathf.CeilToInt(rad); for (int b = -ri; b <= ri; b++) for (int a = -ri; a <= ri; a++) if (a * a + b * b <= rad * rad) { int xx = x + a, yy = y + b; if (xx >= 0 && yy >= 0 && xx < res && yy < res) px[yy * res + xx] = c; } }
+                    void Line(float x0, float y0, float x1, float y1, float th, Color c) { float len = Mathf.Sqrt((x1 - x0) * (x1 - x0) + (y1 - y0) * (y1 - y0)); int n = (int)len + 1; for (int i = 0; i <= n; i++) { float t = (float)i / n; Dot((int)(x0 + (x1 - x0) * t), (int)(y0 + (y1 - y0) * t), th, c); } }
+                    foreach (var s in sites) { Dot(PX((float)s.x), PZ((float)s.z), (float)(s.r + 10) / step, new Color(0.93f, 0.93f, 0.93f)); Dot(PX((float)s.x), PZ((float)s.z), (float)s.r / step, new Color(0.82f, 0.2f, 0.2f)); }
+                    foreach (var poly in polys) if (poly != null) for (int i = 0; i < poly.Count - 1; i++) Line(PX(poly[i].x), PZ(poly[i].y), PX(poly[i + 1].x), PZ(poly[i + 1].y), 2.2f, new Color(0f, 0.35f, 0.8f));
+                    for (int i = 0; i < seeds.Count; i++) Dot(PX(seeds[i].start.x), PZ(seeds[i].start.y), 3.5f, polys[i] != null ? new Color(0f, 0.6f, 0f) : new Color(0.6f, 0.6f, 0.6f));
+                    tex.SetPixels(px); tex.Apply();
+                    string dir = System.IO.Path.GetDirectoryName(ConfigPath)!;
+                    System.IO.File.WriteAllBytes(System.IO.Path.Combine(dir, "pt_canalmap.png"), tex.EncodeToPNG());
+                    UnityEngine.Object.Destroy(tex);
+                    var msg = $"[PT] canalmap: {sites.Count} sites, {seeds.Count} coast seeds, routed {reached} / terminated {terminated} → {dir}\\pt_canalmap.png";
+                    Log.LogInfo(msg); Console.instance?.Print(msg);
+                }
+                catch (Exception e) { Log.LogError($"[PT] canalmap exception: {e}"); }
+            });
+            new Terminal.ConsoleCommand("pt_dumplocs", "pt_dumplocs [radius] — write location sites (worldX,worldZ,protectRadius CSV) around the player to BepInEx/config/ProceduralTerrain/pt_locs.csv (for offline canal-path prototyping)", args =>
+            {
+                try
+                {
+                    var player = Player.m_localPlayer;
+                    if (player == null) { Log.LogWarning("[PT] dumplocs: no player."); return; }
+                    var pos = player.transform.position;
+                    float cx = pos.x, cz = pos.z, range = 1000f;
+                    if (args.Length >= 2 && float.TryParse(args[1], out float r)) range = r;
+                    var sb = new System.Text.StringBuilder();
+                    sb.AppendLine("# worldX,worldZ,protectRadius ; center=" + $"{cx:F1},{cz:F1}" + " range=" + range.ToString("F0") + " fade=" + "10");
+                    int n = 0; float imgR = range * 1.5f + 500f;
+                    foreach (var loc in _locationPositions)
+                    {
+                        float dx = loc.pos.x - cx, dz = loc.pos.y - cz;
+                        if (dx * dx + dz * dz >= imgR * imgR) continue;
+                        float pr = LocProtectRadius(loc.pos, loc.extR);
+                        sb.AppendLine($"{loc.pos.x:F2},{loc.pos.y:F2},{pr:F2}"); n++;
+                    }
+                    string dir = System.IO.Path.GetDirectoryName(ConfigPath)!;
+                    System.IO.File.WriteAllText(System.IO.Path.Combine(dir, "pt_locs.csv"), sb.ToString());
+                    var msg = $"[PT] dumplocs: wrote {n} site(s) to {dir}\\pt_locs.csv (center {cx:F0},{cz:F0})";
+                    Log.LogInfo(msg); Console.instance?.Print(msg);
+                }
+                catch (Exception e) { Log.LogError($"[PT] dumplocs exception: {e}"); }
             });
             new Terminal.ConsoleCommand("pt_dumpprefabs", "pt_dumpprefabs — write every ZNetScene prefab name (sorted) to BepInEx/config/ProceduralTerrain/prefab_names.txt", _ =>
             {

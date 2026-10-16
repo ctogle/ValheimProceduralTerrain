@@ -170,6 +170,11 @@ namespace ProceduralTerrain
                                 tp.VegForestMax = incl.VegForestMax;
                                 tp.VegGroupSize = incl.VegGroupSize;
                                 tp.VegGroupRadius = incl.VegGroupRadius;
+                                tp.VegTiltInherit = incl.VegTiltInherit;
+                                tp.VegRandTilt  = incl.VegRandTilt;
+                                tp.VegMaxTilt   = incl.VegMaxTilt;
+                                tp.VegConformMaxTilt = incl.VegConformMaxTilt;
+                                tp.VegSupportRadius  = incl.VegSupportRadius;
                                 tp.BlurPasses   = incl.BlurPasses;
                                 tp.PeronaK      = incl.PeronaK;
                                 tp.PeronaLambda = incl.PeronaLambda;
@@ -196,6 +201,11 @@ namespace ProceduralTerrain
                             case "vegforestmax":  tp.VegForestMax  = fv; break;
                             case "veggroupsize":  tp.VegGroupSize  = Mathf.RoundToInt(fv); break;
                             case "veggroupradius": tp.VegGroupRadius = fv; break;
+                            case "vegtiltinherit": tp.VegTiltInherit = fv; break;
+                            case "vegrandtilt": tp.VegRandTilt = fv; break;
+                            case "vegmaxtilt": tp.VegMaxTilt = fv; break;
+                            case "vegconformmaxtilt": tp.VegConformMaxTilt = fv; break;
+                            case "vegsupportradius": tp.VegSupportRadius = fv; break;
                             case "blur_passes":   tp.BlurPasses   = fv; break;
                             case "perona_k":      tp.PeronaK      = fv; break;
                             case "perona_lambda": tp.PeronaLambda = fv; break;
@@ -342,6 +352,8 @@ namespace ProceduralTerrain
                             _lodUnderground = !(v == "0" || v == "false");
                         if (k == "debugviz")
                             DebugViz.Enabled = _debugViz = (v == "1" || v == "true");
+                        if (k == "vizmode")
+                            _vizMode = v.Trim();
                         if (k == "vegviz")
                         {
                             _vegViz = (v == "1" || v == "true");
@@ -504,10 +516,12 @@ namespace ProceduralTerrain
             foreach (var (b3, tp3) in biomeProfileMap)
             {
                 bool any = tp3.VegDensity != 1f || tp3.VegForestWiden != 0f || tp3.VegInForest
-                         || tp3.VegForestMax >= 0f || tp3.VegGroupSize > 0 || tp3.VegGroupRadius >= 0f;
+                         || tp3.VegForestMax >= 0f || tp3.VegGroupSize > 0 || tp3.VegGroupRadius >= 0f || tp3.VegTiltInherit >= 0f
+                         || tp3.VegRandTilt >= 0f || tp3.VegMaxTilt >= 0f || tp3.VegConformMaxTilt >= 0f || tp3.VegSupportRadius >= 0f;
                 if (any) vegMap[b3] = new Plugin.VegOverride {
                     density = tp3.VegDensity, widen = tp3.VegForestWiden, inForest = tp3.VegInForest,
-                    forestMax = tp3.VegForestMax, groupSize = tp3.VegGroupSize, groupRadius = tp3.VegGroupRadius };
+                    forestMax = tp3.VegForestMax, groupSize = tp3.VegGroupSize, groupRadius = tp3.VegGroupRadius, tiltInherit = tp3.VegTiltInherit,
+                    randTilt = tp3.VegRandTilt, maxTilt = tp3.VegMaxTilt, conformMaxTilt = tp3.VegConformMaxTilt, supportRadius = tp3.VegSupportRadius };
             }
             Plugin._vegByBiome = vegMap;
 

@@ -37,6 +37,10 @@ namespace ProceduralTerrain
                                         // tunnel cuts it — not poking out the mountainside). 0 = no check.
         public float Lift      = 0f;    // raise this far (m) off the crossing into the air side (flying spawners)
         public bool  Upright   = false; // force world-up orientation instead of tilting to the floor normal
+        public bool  Surface   = false; // opt in to the TOP (surface) crossing — ground scatter, not cave-only
+        public float MinY       = float.NegativeInfinity; // world-Y floor: skip crossings below this (e.g. keep scatter above sea level → raised hammocks)
+        public float MinNormalY = 0.6f;  // floor-prop flatness gate; lower = allow steeper slopes (hammock flanks). only used for FloorOnly objects
+        public float RandTilt   = 0f;    // extra random tilt (deg) about a random horizontal axis → varied X/Z orientation (roots don't all lie the same way). Y-yaw is always random.
 
         // resolved at runtime (needs ZNetScene)
         public GameObject? Resolved;
@@ -148,6 +152,10 @@ namespace ProceduralTerrain
                     case "cover":     p.Cover     = F(v, p.Cover); break;
                     case "lift":      p.Lift      = F(v, p.Lift); break;
                     case "upright":   p.Upright   = (v == "1" || v.Equals("true", StringComparison.OrdinalIgnoreCase)); break;
+                    case "surface":   p.Surface   = !(v == "0" || v.Equals("false", StringComparison.OrdinalIgnoreCase)); break;
+                    case "miny":      p.MinY      = F(v, p.MinY); break;
+                    case "minnormaly":p.MinNormalY= F(v, p.MinNormalY); break;
+                    case "randtilt":  p.RandTilt  = F(v, p.RandTilt); break;
                 }
             }
             if (!haveKind) { Log.LogWarning($"[PT-cave] placement '{name}': missing kind= (object|spawner)."); return null; }

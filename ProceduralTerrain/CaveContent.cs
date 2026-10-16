@@ -84,7 +84,14 @@ namespace ProceduralTerrain
         static float CCRand(int a, int b, int c, int d)
         {
             uint h = 2166136261u;
-            unchecked { h = (h ^ (uint)d) * 16777619u; h = (h ^ (uint)WorldSeed()) * 16777619u; h = (h ^ (uint)a) * 16777619u; h = (h ^ (uint)b) * 16777619u; h = (h ^ (uint)c) * 16777619u; }
+            unchecked
+            {
+                h = (h ^ (uint)d) * 16777619u; h = (h ^ (uint)WorldSeed()) * 16777619u;
+                h = (h ^ (uint)a) * 16777619u; h = (h ^ (uint)b) * 16777619u; h = (h ^ (uint)c) * 16777619u;
+                // avalanche finalizer (murmur3 fmix32). FNV's LOW bits are poorly mixed, so adjacent integer
+                // inputs (ix±1) left the low 24 bits correlated → neighboring props drew near-identical angles.
+                h ^= h >> 16; h *= 0x85ebca6bu; h ^= h >> 13; h *= 0xc2b2ae35u; h ^= h >> 16;
+            }
             return (h & 0xFFFFFF) / (float)0x1000000;
         }
 
@@ -125,8 +132,10 @@ namespace ProceduralTerrain
             int objPlaced = 0, spwPlaced = 0, width = e.width;
 
             // place one rule at a crossing, honoring its cap + spacing + flatness; returns true if placed.
-            bool TryPlace(Placement p, int ix, int iz, int ci, bool isFloor, float cyY, float worldX, float worldZ, float yaw)
+            bool TryPlace(Placement p, int ix, int iz, int ci, bool isFloor, bool isSurface, float cyY, float worldX, float worldZ, float yaw)
             {
+                if (isSurface && !p.Surface) return false;   // only surface-opted rules place at the top crossing
+                if (cyY < p.MinY) return false;              // world-Y floor (e.g. above sea level → raised hammocks only)
                 int cap = p.Cap < 0 ? int.MaxValue : p.Cap;
                 var ps = S(p); if (ps.count >= cap) return false;
                 if (p.FloorOnly && !isFloor) return false;
@@ -136,7 +145,7 @@ namespace ProceduralTerrain
                 // floor PROPS (static objects) need a reasonably flat floor so nothing juts out of a near-vertical
                 // "floor". Creatures handle slopes fine, so this gate is objects-only (gating spawners here blocked
                 // wolves on sloped cave floors).
-                if (p.Kind == PlacementKind.Object && p.FloorOnly && CaveFloorNormal(e, ix, iz, width, cyY, s).y < 0.6f) return false;
+                if (p.Kind == PlacementKind.Object && p.FloorOnly && CaveFloorNormal(e, ix, iz, width, cyY, s).y < p.MinNormalY) return false;
                 // Rock-cover check: the terrain surface (surfH — the SAME field vegetation-conform uses, not a
                 // reinvented one) must sit >= Cover metres above the deposit across its lateral footprint, so it's
                 // buried and only exposed where a tunnel cuts it. Samples the own column + 4 laterals at radius Cover.
@@ -154,11 +163,18 @@ namespace ProceduralTerrain
                 }
 
                 Vector3 pos = anchor; Quaternion rot;
-                if (p.Kind == PlacementKind.Spawner) rot = Quaternion.Euler(0f, yaw, 0f);
-                else if (p.Embed > 0f) { pos = new Vector3(worldX, cyY - p.Embed, worldZ); rot = Quaternion.Euler(0f, yaw, 0f); } // buried: upright
-                else if (p.Upright) rot = Quaternion.Euler(0f, yaw, 0f);
+                // orientation: spawners/upright = world-up + yaw; floor objects tilt to the floor normal (any
+                // orientation). Embed is a SEPARATE position sink (below), so tilted props can still bury their base.
+                if (p.Kind == PlacementKind.Spawner || p.Upright) rot = Quaternion.Euler(0f, yaw, 0f);
                 else if (isFloor) rot = Quaternion.FromToRotation(Vector3.up, CaveFloorNormal(e, ix, iz, width, cyY, s)) * Quaternion.Euler(0f, yaw, 0f);
                 else rot = Quaternion.Euler(0f, yaw, 0f);
+                if (p.Embed > 0f) pos = new Vector3(worldX, cyY - p.Embed, worldZ);   // sink to guarantee ground contact
+                if (p.RandTilt > 0f)   // extra random X/Z tilt about a random horizontal axis → varied orientation (roots don't all lie identically)
+                {
+                    float ta = CCRand(ox + ix, oz + iz, ci, 31) * p.RandTilt;
+                    float aa = CCRand(ox + ix, oz + iz, ci, 37) * 6.2831853f;
+                    rot = Quaternion.AngleAxis(ta, new Vector3(Mathf.Cos(aa), 0f, Mathf.Sin(aa))) * rot;
+                }
                 // lift off the crossing into the air side (flying spawners born on the surface clip into rock →
                 // Voxheim "unburies" them every tick). Air is up on a floor crossing, down on a ceiling crossing.
                 if (p.Lift != 0f) pos += (isFloor ? Vector3.up : Vector3.down) * p.Lift;
@@ -209,7 +225,9 @@ namespace ProceduralTerrain
                     if (aSolid == bSolid) continue;
                     int cy = start + k; ci++;
                     float cyY = (e.extLo + cy) * s;
-                    float depth = surfaceY - cyY; if (depth <= 1f) continue;   // skip the surface crossing itself
+                    float depth = surfaceY - cyY;
+                    bool isSurface = depth <= 1f;         // the top crossing — only surface-opted rules take it
+                    if (isSurface) depth = 0f;            // normalize so DepthMin=0 ramps fire
                     bool isFloor = aSolid && !bSolid;   // solid below, air above = standing floor
                     float yaw = CCRand(ox + ix, oz + iz, ci, 7) * 360f;
 
@@ -217,13 +235,13 @@ namespace ProceduralTerrain
                     if (objPlaced < _ccObjectCap && objPool.Count > 0 && CCRand(ox + ix, oz + iz, ci, 1) < _ccObjectProb)
                     {
                         var p = PickPool(objPool, isFloor, depth, ix, iz, ci, 3);
-                        if (p != null && TryPlace(p, ix, iz, ci, isFloor, cyY, worldX, worldZ, yaw)) objPlaced++;
+                        if (p != null && TryPlace(p, ix, iz, ci, isFloor, isSurface, cyY, worldX, worldZ, yaw)) objPlaced++;
                     }
                     // shared SPAWNER pool
                     if (spwPlaced < _ccSpawnerCap && spwPool.Count > 0 && CCRand(ox + ix, oz + iz, ci, 2) < _ccSpawnerProb)
                     {
                         var p = PickPool(spwPool, isFloor, depth, ix, iz, ci, 10);
-                        if (p != null && TryPlace(p, ix, iz, ci, isFloor, cyY, worldX, worldZ, yaw)) spwPlaced++;
+                        if (p != null && TryPlace(p, ix, iz, ci, isFloor, isSurface, cyY, worldX, worldZ, yaw)) spwPlaced++;
                     }
                     // independent channels (bats, giants, …): own per-crossing prob × depth ramp
                     for (int j = 0; j < channels.Count; j++)
@@ -232,7 +250,7 @@ namespace ProceduralTerrain
                         var p = channels[j];
                         float r = p.Ramp(depth); if (r <= 0f) continue;
                         if (CCRand(ox + ix, oz + iz, ci, 20 + j) >= p.Prob * r) continue;
-                        TryPlace(p, ix, iz, ci, isFloor, cyY, worldX, worldZ, yaw);
+                        TryPlace(p, ix, iz, ci, isFloor, isSurface, cyY, worldX, worldZ, yaw);
                     }
                 }
             }
