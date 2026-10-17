@@ -24,6 +24,18 @@ namespace ProceduralTerrain
         internal static int  RadiusZones = 4;    // prefetch ring radius in zones around the reference position
         internal static int  ThreadCount = 0;    // 0 = auto (cores/2, kept well under the bake's cores-1)
 
+        // A DEDICATED (headless) server must never run the prefetch gate: it holds ZoneSystem.SpawnZone until the
+        // zone is carved, which deadlocks there — and it's redundant now that veg-conform carves its zone on-demand.
+        // So prefetch is auto-disabled on dedicated servers regardless of cfg; local/listen still gets the perf.
+        internal static bool Active => Enabled && !(ZNet.instance != null && ZNet.instance.IsDedicated());
+
+        // Valheim's playable world radius is ~10,500m; DUNGEON INTERIORS generate at world-coord ~1,000,000.
+        // Those far zones are NOT PT surface terrain — if the gate/prefetcher touches them they flood the FIFO
+        // queue with slow live-carves and starve real near-play zones (they time out → vanilla). Exclude them.
+        internal const  int WorldZoneLimit = 20000;
+        internal static int  FarZonesSkipped;    // diagnostic counter
+        internal static bool IsFarZone(int ox, int oz) => Math.Abs(ox) > WorldZoneLimit || Math.Abs(oz) > WorldZoneLimit;
+
         static readonly object _lock = new();
         static readonly Queue<(int ox, int oz)> _queue = new();
         static readonly HashSet<(int, int)> _queued   = new();
@@ -63,7 +75,8 @@ namespace ProceduralTerrain
 
         internal static void Request(int ox, int oz)
         {
-            if (!Enabled) return;
+            if (!Active) return;
+            if (IsFarZone(ox, oz)) return;   // dungeon interiors / out-of-world — never prefetch (would flood + starve real zones)
             if (Plugin._sdfCache.ContainsKey($"{ox},{oz}")) return;
             var key = (ox, oz);
             lock (_lock)

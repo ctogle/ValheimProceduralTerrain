@@ -306,6 +306,8 @@ namespace ProceduralTerrain
             vanillaGrid = null;
             var wg = WorldGenerator.instance;
             if (wg == null) return null;
+            if ((++Plugin._gwCalls) % 50 == 1)
+                Plugin.Log.LogInfo($"[PT-gw] BuildGroundworkedHeights calls={Plugin._gwCalls} | extractorOk={Plugin._gwExtractorOk} extractorEmpty(changed=0)={Plugin._gwExtractorEmpty} transientFallback={Plugin._gwTransientFallbacks}");
 
             // Revisit determinism: the gather below reads live TerrainModifier GameObjects, which are present
             // on first load but NOT on revisit (location already m_placed; objects respawn async after our
@@ -321,6 +323,24 @@ namespace ProceduralTerrain
                 return cached.grid;
             }
 
+            // PREFERENCE: deterministic groundwork from Voxheim's AuthorityHeadlessExtractor — but ONLY when it
+            // actually finds modifiers (changed>0). It's authority-only and returns empty on a client, so an empty
+            // result must NOT short-circuit: we fall through to the LIVE transient gather below, which reads the
+            // real placed TerrainModifier objects (rotation-correct, and the path that works local/server-live).
+            if (TryVoxheimGroundwork(centerX, centerZ, width, scale, out var effDet, out var baseDet, out int changedDet)
+                && effDet != null && baseDet != null && changedDet > 0)
+            {
+                if ((++Plugin._gwExtractorOk) % 25 == 1)
+                    Plugin.Log.LogInfo($"[PT-gw] extractor OK changed={changedDet} at {gwKey} (total ok={Plugin._gwExtractorOk}).");
+                nmods = changedDet;
+                var gGrid = new Voxheim.Core.HeightGrid(width, scale, effDet);
+                var vGrid = new Voxheim.Core.HeightGrid(width, scale, baseDet);
+                vanillaGrid = vGrid;
+                Plugin._groundworkCache[gwKey] = (gGrid, vGrid, nmods);
+                return gGrid;
+            }
+
+            // LIVE transient gather — the workhorse (restored). Reads spawned TerrainModifier objects for this zone.
             var center  = new Vector3(centerX, centerY, centerZ);
             float half  = width * scale * 0.5f;
 
@@ -395,9 +415,9 @@ namespace ProceduralTerrain
         // ZDOs, correct rotation), built the same way every load. Null carrier ⇒ groundwork only (no player
         // edits). Out: EffectiveHeights, and the count of columns that differ from BaseHeights (footprint).
         static bool TryVoxheimGroundwork(float centerX, float centerZ, int width, float scale,
-            out float[]? effective, out int changed)
+            out float[]? effective, out float[]? baseHeights, out int changed)
         {
-            effective = null; changed = 0;
+            effective = null; baseHeights = null; changed = 0;
             if (!_extractorResolved)
             {
                 _extractorResolved = true;
@@ -426,9 +446,11 @@ namespace ProceduralTerrain
             var baseH = baseline.BaseHeights;
             int n = eff.Count;
             effective = new float[n];
+            baseHeights = new float[n];
             for (int i = 0; i < n; i++)
             {
                 effective[i] = eff[i];
+                baseHeights[i] = (i < baseH.Count) ? baseH[i] : eff[i];
                 if (i < baseH.Count && Math.Abs(eff[i] - baseH[i]) > 0.01f) changed++;
             }
             Plugin.Log.LogDebug($"[PT-gw] zone {zoneKey} extractor ok: changed={changed}/{n} (0 ⇒ extractor found no location modifiers here)");

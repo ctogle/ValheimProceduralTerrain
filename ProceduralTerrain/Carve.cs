@@ -2850,11 +2850,20 @@ namespace ProceduralTerrain
                            out GameObject root, ref bool __result)
         {
             root = null;
-            if (!ZonePrefetcher.Enabled) return true;                       // feature off → vanilla
+            if (!ZonePrefetcher.Active) return true;                        // feature off (or dedicated server) → vanilla, no gating
             if (mode != ZoneSystem.SpawnMode.Full && mode != ZoneSystem.SpawnMode.Ghost) return true;
             if (_isGen != null && (bool)_isGen.Invoke(__instance, new object[] { zoneID })!) return true;  // already generated → don't block revisits
 
             var (ox, oz) = ZonePrefetcher.ZoneOrigin(zoneID.x, zoneID.y);
+            // Dungeon interiors / out-of-world zones (world-coord ~1e6) are NOT PT surface terrain. Don't gate or
+            // prefetch them — otherwise they flood the FIFO queue with slow live-carves and starve real near-play
+            // zones until they time out to vanilla (the dedi "no terrain/veg/locations" bug). Pass straight through.
+            if (ZonePrefetcher.IsFarZone(ox, oz))
+            {
+                if ((++ZonePrefetcher.FarZonesSkipped) % 500 == 1)
+                    Plugin.Log.LogInfo($"[PT-prefetch] skipping far/dungeon zone ({ox},{oz}) — not gated/prefetched (total skipped={ZonePrefetcher.FarZonesSkipped}).");
+                return true;
+            }
             var key = (zoneID.x, zoneID.y);
             if (ZonePrefetcher.IsReady(ox, oz)) { _misses.Remove(key); return true; }   // carved → proceed, conform works
 
@@ -2904,6 +2913,30 @@ namespace ProceduralTerrain
             Plugin._vegMaxTiltEff = Plugin._vegMaxTilt;            // default conform params to the globals; per-biome override below
             Plugin._vegSupportRadiusEff = Plugin._vegSupportRadius;
             var wg = WorldGenerator.instance; var zs = ZoneSystem.instance;
+            // ON-DEMAND CARVE: conform reads _surfHCache, populated by the carve. The prefetch gate normally
+            // guarantees that ordering, but with prefetch off (or not yet reached) PlaceVegetation runs before the
+            // carve → surfH MISS → no conform. So carve THIS zone now (grid-less, like the prefetcher; bake-HIT is
+            // fast) if it isn't cached — making conform independent of prefetch. (Carve doesn't re-enter SpawnZone.)
+            if (wg != null && Plugin._vegetationConform)
+            {
+                float vs = Plugin.ActiveScale();
+                var (vox, voz) = Plugin.ZoneOriginFromWorld(zoneCenterPos.x, zoneCenterPos.z, vs);
+                bool haveSurf; lock (Plugin._surfHCache) haveSurf = Plugin._surfHCache.ContainsKey((vox, voz));
+                if (!haveSurf)
+                {
+                    Plugin.EnsureBakeLoaded();
+                    var (vyLo, vyHi) = Plugin.ComputeYBoundsPublic(vox, voz, 64, vs, wg);
+                    // Pass the scale EXPLICITLY: on a headless server Voxheim may never have set s_scale (Generate
+                    // is skipped), so Carve's internal scale resolve would early-return and never carve.
+                    try { Plugin.Carve(null, vox, voz, 64, vyLo, vyHi, vs); }
+                    catch (Exception e) { Plugin.Log.LogWarning($"[PT-veg] on-demand carve ({vox},{voz}) failed: {e.Message}"); }
+                    if (_vegLog <= 20)
+                    {
+                        bool nowHave; lock (Plugin._surfHCache) nowHave = Plugin._surfHCache.ContainsKey((vox, voz));
+                        Plugin.Log.LogInfo($"[PT-veg] on-demand carve ({vox},{voz}) scale={vs:F2} → surfHCached={nowHave} cacheN={Plugin._surfHCache.Count}");
+                    }
+                }
+            }
             if (wg != null && zs != null && zs.m_vegetation != null && Plugin._vegByBiome.Count > 0)
             {
                 var biome = wg.GetBiome(zoneCenterPos.x, zoneCenterPos.z);

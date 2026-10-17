@@ -17,9 +17,9 @@ namespace ProceduralTerrain
         const float LocFadeR = 10f; // fade band outside the exterior radius
 
         // ── Location cache ────────────────────────────────────────────────────────
-        static List<(Vector3 pos, float extR)> ReadLocationInstances()
+        static List<(Vector3 pos, float extR, int hash)> ReadLocationInstances()
         {
-            var result = new List<(Vector3, float)>();
+            var result = new List<(Vector3, float, int)>();
             var zs = ZoneSystem.instance;
             if (zs == null || _locationInstancesField == null) return result;
             var dict = _locationInstancesField.GetValue(zs);
@@ -32,8 +32,10 @@ namespace ProceduralTerrain
                 mPos ??= inst.GetType().GetField("m_position");
                 mLoc ??= inst.GetType().GetField("m_location");
                 if (mPos?.GetValue(inst) is not Vector3 pos) continue;
-                float extR = mLoc?.GetValue(inst) is ZoneSystem.ZoneLocation zloc ? zloc.m_exteriorRadius : 0f;
-                result.Add((pos, extR));
+                var zloc = mLoc?.GetValue(inst) as ZoneSystem.ZoneLocation;
+                float extR = zloc != null ? zloc.m_exteriorRadius : 0f;
+                int hash = zloc != null ? StringExtensionMethods.GetStableHashCode(zloc.m_prefabName) : 0;   // location TYPE key (matches m_locationsByHash) → client re-looks-up the ZoneLocation
+                result.Add((pos, extR, hash));
             }
             return result;
         }
@@ -54,7 +56,7 @@ namespace ProceduralTerrain
             var entries = ReadLocationInstances();
             if (entries.Count == 0) return;
             _locationPositions.Clear();
-            foreach (var (pos, extR) in entries)
+            foreach (var (pos, extR, _) in entries)
                 _locationPositions.Add((new Vector2(pos.x, pos.z), extR));
             _locationsCached  = true;
             _hotReloadPending = true;

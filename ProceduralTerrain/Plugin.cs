@@ -991,6 +991,10 @@ namespace ProceduralTerrain
         // when the transient TerrainModifier objects aren't loaded — keeps the baseline deterministic so
         // Voxheim's authority doesn't rebase to vanilla. Keyed by Valheim zone index "x,z"; survives unload.
         internal static readonly Dictionary<string, (Voxheim.Core.HeightGrid grid, Voxheim.Core.HeightGrid vanilla, int nmods)> _groundworkCache = new();
+        internal static int _gwTransientFallbacks;   // count of zones that fell back to the spawn-dependent TerrainModifier gather (deterministic extractor unavailable/failed)
+        internal static int _gwExtractorOk;          // deterministic extractor succeeded with modifiers (changed>0)
+        internal static int _gwExtractorEmpty;       // deterministic extractor succeeded but found NO modifiers (changed==0)
+        internal static int _gwCalls;                // times BuildGroundworkedHeights was entered at all
 
         // Per-zone surface height cache: filled after Phase 2, queried by GetWorldHeight patch.
         // Layout: surfH[cx * bw + cz] = world-Y of topmost solid voxel (NaN = no solid in column).
@@ -1409,6 +1413,19 @@ namespace ProceduralTerrain
                 }
                 catch (Exception e) { Log.LogError($"[PT] vegdump: {e}"); }
             });
+            new Terminal.ConsoleCommand("pt_bakereload", "pt_bakereload — re-scan and load the bake file without restarting (use after uploading a .bin to a running server), then recarve loaded zones", _ =>
+            {
+                try
+                {
+                    _bakeLoadAttempted = false;   // LoadBakeFile self-closes the old stream + re-checks the file
+                    LoadBakeFile();
+                    _bakeLoadAttempted = true;
+                    _hotReloadPending  = true;    // re-serve loaded zones from the (now present) bake
+                    var msg = $"[PT] bakereload: {(_bakeIndex != null ? _bakeIndex.Count + " zones indexed" : "no bake found — still live-carving")}; scheduling recarve.";
+                    Log.LogInfo(msg); Console.instance?.Print(msg);
+                }
+                catch (Exception e) { Log.LogError($"[PT] bakereload: {e}"); }
+            });
             new Terminal.ConsoleCommand("pt_bake", "pt_bake [radius] — bake terrain SDF for a radius in meters; runs on server (admin only)", args =>
             {
                 float radius = _bakeRadius;
@@ -1657,7 +1674,7 @@ namespace ProceduralTerrain
 
             // Demand-driven carve: the SpawnZone gate (SpawnZonePrefetchGate) requests carves as ZoneSystem
             // asks for zones and makes it retry until ready — no racing ring. Just keep workers alive.
-            if (ZonePrefetcher.Enabled) ZonePrefetcher.Start();   // idempotent
+            if (ZonePrefetcher.Active) ZonePrefetcher.Start();   // idempotent; skipped on dedicated servers
 
             // Track underground state for the LOD-hide toggle: player Y well below the carved surface = in a cave.
             if (_lodUnderground)

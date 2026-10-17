@@ -41,6 +41,7 @@ namespace ProceduralTerrain
         public float MinY       = float.NegativeInfinity; // world-Y floor: skip crossings below this (e.g. keep scatter above sea level → raised hammocks)
         public float MinNormalY = 0.6f;  // floor-prop flatness gate; lower = allow steeper slopes (hammock flanks). only used for FloorOnly objects
         public float RandTilt   = 0f;    // extra random tilt (deg) about a random horizontal axis → varied X/Z orientation (roots don't all lie the same way). Y-yaw is always random.
+        public float BiomePure  = 0f;    // >0: place only in the biome INTERIOR — WorldGenerator.GetBiomeArea != Edge (i.e. the point isn't near a boundary with an adjacent biome). 0 = off
 
         // resolved at runtime (needs ZNetScene). ALL candidates that resolve → one is picked uniformly per
         // placement (comma list = a random pool, not a first-wins fallback). Empty = none resolved.
@@ -157,6 +158,7 @@ namespace ProceduralTerrain
                     case "miny":      p.MinY      = F(v, p.MinY); break;
                     case "minnormaly":p.MinNormalY= F(v, p.MinNormalY); break;
                     case "randtilt":  p.RandTilt  = F(v, p.RandTilt); break;
+                    case "biomepure": p.BiomePure = F(v, p.BiomePure); break;
                 }
             }
             if (!haveKind) { Log.LogWarning($"[PT-cave] placement '{name}': missing kind= (object|spawner)."); return null; }

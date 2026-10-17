@@ -136,6 +136,7 @@ namespace ProceduralTerrain
             {
                 if (isSurface && !p.Surface) return false;   // only surface-opted rules place at the top crossing
                 if (cyY < p.MinY) return false;              // world-Y floor (e.g. above sea level → raised hammocks only)
+                if (p.BiomePure > 0f && wg.GetBiomeArea(new Vector3(worldX, 0f, worldZ)) == Heightmap.BiomeArea.Edge) return false;  // interior only, off the boundary
                 int cap = p.Cap < 0 ? int.MaxValue : p.Cap;
                 var ps = S(p); if (ps.count >= cap) return false;
                 if (p.FloorOnly && !isFloor) return false;

@@ -44,26 +44,91 @@ namespace ProceduralTerrain
             var entries = ReadLocationInstances();
             var pkg = new ZPackage();
             pkg.Write(entries.Count);
-            foreach (var (pos, extR) in entries) { pkg.Write(pos); pkg.Write(extR); }
+            // pos + location-type hash. The client re-looks-up the ZoneLocation (for extR + prefab TerrainModifiers)
+            // and rebuilds m_locationInstances so its AuthorityHeadlessExtractor can groundwork locations locally.
+            foreach (var (pos, _, hash) in entries) { pkg.Write(pos); pkg.Write(hash); }
             ZRoutedRpc.instance.InvokeRoutedRPC(peerID, "PTLocationList", pkg);
-            Log.LogInfo($"[ProceduralTerrain] Sent {entries.Count} location positions to peer {peerID}.");
+            Log.LogInfo($"[ProceduralTerrain] Sent {entries.Count} location instances (pos+hash) to peer {peerID}.");
+        }
+
+        // ── Client-side m_locationInstances rebuild (so the groundwork extractor works off a server-fed registry) ──
+        static Type? _locInstType;
+        static FieldInfo? _liLoc, _liPos, _liPlaced;
+        static FieldInfo? _locByHashField;
+
+        static ZoneSystem.ZoneLocation GetZoneLocationByHash(ZoneSystem zs, int hash)
+        {
+            try
+            {
+                _locByHashField ??= typeof(ZoneSystem).GetField("m_locationsByHash", BindingFlags.NonPublic | BindingFlags.Instance)
+                                 ?? typeof(ZoneSystem).GetField("m_locationsByHash", BindingFlags.Public | BindingFlags.Instance);
+                if (_locByHashField?.GetValue(zs) is System.Collections.IDictionary d && d.Contains(hash))
+                    return d[hash] as ZoneSystem.ZoneLocation;
+            }
+            catch (Exception e) { Log.LogWarning($"[PT] loc-by-hash: {e.Message}"); }
+            return null;
+        }
+
+        static void ClearClientLocationInstances()
+        {
+            try
+            {
+                var zs = ZoneSystem.instance;
+                if (zs == null || _locationInstancesField == null) return;
+                (_locationInstancesField.GetValue(zs) as System.Collections.IDictionary)?.Clear();
+            }
+            catch (Exception e) { Log.LogWarning($"[PT] clear loc instances: {e.Message}"); }
+        }
+
+        static bool AddClientLocationInstance(ZoneSystem zs, ZoneSystem.ZoneLocation zloc, Vector3 pos)
+        {
+            try
+            {
+                if (_locationInstancesField?.GetValue(zs) is not System.Collections.IDictionary dict) return false;
+                if (_locInstType == null)
+                {
+                    var args = dict.GetType().GetGenericArguments();   // [Vector2i, LocationInstance]
+                    if (args.Length != 2) return false;
+                    _locInstType = args[1];
+                    _liLoc    = _locInstType.GetField("m_location");
+                    _liPos    = _locInstType.GetField("m_position");
+                    _liPlaced = _locInstType.GetField("m_placed");
+                }
+                var zone = ZoneSystem.GetZone(pos);         // Vector2i dict key (static)
+                if (dict.Contains(zone)) return false;      // vanilla invariant: one location instance per zone
+                object inst = Activator.CreateInstance(_locInstType);   // boxed default struct
+                _liLoc?.SetValue(inst, zloc);
+                _liPos?.SetValue(inst, pos);
+                _liPlaced?.SetValue(inst, true);            // mark placed so no client-side spawn attempt
+                dict[zone] = inst;
+                return true;
+            }
+            catch (Exception e) { Log.LogWarning($"[PT] add loc instance: {e.Message}"); return false; }
         }
 
         internal static void RPC_ReceiveLocationList(long sender, ZPackage pkg)
         {
             int count = pkg.ReadInt();
             _locationPositions.Clear();
+            var zs = ZoneSystem.instance;
+            int rebuilt = 0, noType = 0;
+            ClearClientLocationInstances();   // start fresh (client's registry is server-fed)
             for (int i = 0; i < count; i++)
             {
-                Vector3 pos = pkg.ReadVector3();
-                float extR  = pkg.ReadSingle();
+                Vector3 pos  = pkg.ReadVector3();
+                int     hash = pkg.ReadInt();
+                var zloc = (zs != null && hash != 0) ? GetZoneLocationByHash(zs, hash) : null;
+                float extR = zloc != null ? zloc.m_exteriorRadius : 0f;
                 _locationPositions.Add((new Vector2(pos.x, pos.z), extR));
+                // Rebuild the client's m_locationInstances so the groundwork extractor (which reads that registry)
+                // works client-side. Rotation is recomputed deterministically from seed+pos, so pos+type suffices.
+                if (zloc != null) { if (AddClientLocationInstance(zs!, zloc, pos)) rebuilt++; } else noType++;
             }
             if (_locationPositions.Count > 0)
             {
                 _locationsCached  = true;
                 _hotReloadPending = true;
-                Log.LogInfo($"[ProceduralTerrain] Received {_locationPositions.Count} location positions from server — scheduling recarve.");
+                Log.LogInfo($"[ProceduralTerrain] Received {_locationPositions.Count} location instances from server — rebuilt {rebuilt} into m_locationInstances ({noType} unknown type) — scheduling recarve.");
             }
             // Server connection confirmed — query for bake file now that peer is established.
             var query = new ZPackage();
