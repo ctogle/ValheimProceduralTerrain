@@ -488,7 +488,11 @@ namespace ProceduralTerrain
                 if (mr2 > 0f) { int cx = AG(g.Verts[v].x), cz = AG(g.Verts[v].y);
                     for (int dz = -1; dz <= 1; dz++) for (int dx = -1; dx <= 1; dx++) if (agrid.TryGetValue((cx + dx, cz + dz), out var l))
                         foreach (int j in l) { if (claimed.Contains(j)) continue; if ((g.Verts[j] - g.Verts[v]).sqrMagnitude > mr2) continue; claimed.Add(j); if (usedDeg[j] > maxDeg) maxDeg = usedDeg[j]; } }
-                atriums.Add(new Atrium { Pos = g.Verts[v], Conv = maxDeg, Links = Array.Empty<Vector2>() });
+                // Links = neighbour-junction positions along this vertex's USED canal edges → the carve stamps short
+                // connector tubes to these so the dome is never a sealed bubble in any single zone buffer (cork fix).
+                var links = new List<Vector2>(4);
+                foreach (int ei in g.Adj[v]) { var e = g.Edges[ei]; int nb = e.A == v ? e.B : e.A; if (usedEdges.Contains(EK(v, nb))) links.Add(g.Verts[nb]); }
+                atriums.Add(new Atrium { Pos = g.Verts[v], Conv = maxDeg, Links = links.ToArray() });
             }
             _netBuildStats = $"verts={nv} | coastMouths={cCoast} →cov{coverage:F2}→ used={cMouthUsed} | routed={cRouted} (fail={cRouteFail}) | junctions(deg≥3)={cJunc} →rejOcean={cRejOcean} rejWrongBiome={cRejBiome} rejShallow={cRejShallow}(need surfH≥{waterY + minOverburden:F0}) rejClear={cRejClear}(minClr={minClearance:F0}) rejBiomeEdge={cRejEdge} → candidates={cand.Count} →mergeClustered→ atriums={atriums.Count}. canals={canals.Count}";
             Debug.Log("[PT-net] " + _netBuildStats);

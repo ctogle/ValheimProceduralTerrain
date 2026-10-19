@@ -1486,6 +1486,9 @@ namespace ProceduralTerrain
                         var tangG   = new List<Vector3>(256);   // G: downslope tangent
                         var tangT   = new List<Vector3>(256);   // T = N×G: cross-slope tangent
                         var shaftStamps = new List<(Vector3 c, float r)>();   // breach shafts: carved HARD (fuse=0) in a separate pass so the mode's smooth-fuse doesn't shrink the thin column into a cork
+                        // connector tubes: atrium → its canal neighbours, carved in-buffer so a dome is never a sealed
+                        // bubble (pocket-removal cork fix). Same hard pass as shafts.
+                        var connectorStamps = new List<(Vector3 c, float r)>();
                         // atrium dome+satellite stamps: carved in their OWN pass with their OWN ellipsoid shape (per-stamp
                         // stretch + horizontal axis), DECOUPLED from the canal tube shape they'd otherwise share via the mode stretch
                         var atriumStamps = new List<(Vector3 c, float r, float sN, float sG, float sT, float gx, float gz, float p)>();
@@ -2026,6 +2029,28 @@ namespace ProceduralTerrain
                                                 DebugViz.Line(new[] { sc - Vector3.up * subr * sN, sc + Vector3.up * subr * sN }, new Color(0f, 0.8f, 0.9f), 0.5f);
                                         }
 
+                                        // CONNECTORS: short tubes from the dome out along each used canal edge, at the
+                                        // canal level — guarantees the dome has an exit carved IN THIS buffer so pocket-
+                                        // removal never sees it as a sealed bubble (the seam-cork fix). Deterministic
+                                        // (pure fn of apos + link), carved HARD below.
+                                        float connR = Mathf.Max(peakMinR, 4f);
+                                        if (atr.Links != null)
+                                            foreach (var lp in atr.Links)
+                                            {
+                                                float ldx = lp.x - apos.x, ldz = lp.y - apos.y;
+                                                float ldist = Mathf.Sqrt(ldx * ldx + ldz * ldz);
+                                                if (ldist < 1f) continue;
+                                                float clen = Mathf.Min(ldist, 50f);           // reach far enough to exit the dome vicinity / meet the canal
+                                                float inv = 1f / ldist;
+                                                int nseg = Mathf.Max(1, Mathf.RoundToInt(clen / 5f));
+                                                float connY = RiverWaterLevel + liftFrac * connR;   // sit at the CANAL level (tubes ride up by liftfrac·r) — not deeper than the sewer
+                                                for (int sgi = 0; sgi <= nseg; sgi++)
+                                                {
+                                                    float t = (float)sgi / nseg * clen;
+                                                    connectorStamps.Add((new Vector3(apos.x + ldx * inv * t, connY, apos.y + ldz * inv * t), connR));
+                                                }
+                                            }
+
                                         if (breachRad > 0f)
                                         {
                                             // The union samples XZ at COARSE cell resolution, so a thin shaft under-
@@ -2209,6 +2234,30 @@ namespace ProceduralTerrain
                                     float wy = extLoS2 + cyc * yStep;
                                     float dy = wy - sc.y;
                                     float air = sr - Mathf.Sqrt(dxz2 + dy * dy);   // >0 inside the shaft sphere
+                                    if (air > 0f) { ref float rf = ref _runSDF![cbaseC + cyc]; if (air > rf) rf = air; }
+                                }
+                            }
+                        }
+
+                        // CONNECTOR TUBES — same hard sphere subtract as shafts; guarantees each dome has carved exits
+                        // in its own buffer so pocket-removal never seals it (the seam-cork fix).
+                        foreach (var (sc, sr) in connectorStamps)
+                        {
+                            float sr2 = sr * sr;
+                            for (int cx4 = 0; cx4 < cw4; cx4++)
+                            for (int cz4 = 0; cz4 < cw4; cz4++)
+                            {
+                                int cell = cx4 * cw4 + cz4;
+                                int cxw = Math.Min(cx4 * cvXZ, bw - 1), czw = Math.Min(cz4 * cvXZ, bw - 1);
+                                float wx = (ox0 + cxw) * s, wz = (oz0 + czw) * s;
+                                float dxz2 = (wx - sc.x) * (wx - sc.x) + (wz - sc.z) * (wz - sc.z);
+                                if (dxz2 > sr2) continue;
+                                int cbaseC = cell * ch;
+                                for (int cyc = 0; cyc < ch; cyc++)
+                                {
+                                    float wy = extLoS2 + cyc * yStep;
+                                    float dy = wy - sc.y;
+                                    float air = sr - Mathf.Sqrt(dxz2 + dy * dy);
                                     if (air > 0f) { ref float rf = ref _runSDF![cbaseC + cyc]; if (air > rf) rf = air; }
                                 }
                             }
