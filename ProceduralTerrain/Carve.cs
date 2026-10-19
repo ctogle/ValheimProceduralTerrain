@@ -439,6 +439,7 @@ namespace ProceduralTerrain
             _phIsland = System.Diagnostics.Stopwatch.GetTimestamp();
 
             if (_pocketRemoval && anyPipelineActive) {   // vanilla heightfield has no sealed air pockets → skip the flood
+                System.Threading.Interlocked.Increment(ref _pocketZonesTotal);
                 Array.Clear(_cb.visitedBuf!, 0, bw * bh * bw);
                 int stride_x = bh * bw;
                 int qHead = 0, qTail = 0;
@@ -486,7 +487,12 @@ namespace ProceduralTerrain
                 for (int i = 0; i < total; i++)
                     if (!_cb.visitedBuf![i] && buf[i] >= 0f) { buf[i] = -s; filled++; }
 
-                Log.LogDebug($"[ProceduralTerrain] pocket-fill zone ({ox},{oz}): filled={filled}");
+                if (filled > 0)
+                {
+                    System.Threading.Interlocked.Increment(ref _pocketFillZones);
+                    System.Threading.Interlocked.Add(ref _pocketVoxels, filled);
+                    Log.LogInfo($"[PT-pocket] zone ({ox},{oz}) filled={filled}  (cumulative: {_pocketFillZones}/{_pocketZonesTotal} zones filled, {_pocketVoxels} vox)");
+                }
             }
             _phPocket = System.Diagnostics.Stopwatch.GetTimestamp();
 
@@ -2938,6 +2944,8 @@ namespace ProceduralTerrain
 
         // World positions of atrium domes the carve ACTUALLY emitted (after all gates). pt_gotoatrium teleports to
         // one of these, so the destination always has a real dome. Deduped by quantized XZ across overlapping zones.
+        // pocket-removal usefulness telemetry: how often / how much it actually fills across all zones+biomes
+        internal static int _pocketZonesTotal, _pocketFillZones; internal static long _pocketVoxels;
         static readonly Dictionary<long, Vector3> _carvedAtriums = new();
         static readonly object _carvedAtriumLock = new();
         static void RecordCarvedAtrium(Vector3 c)

@@ -610,7 +610,19 @@ namespace ProceduralTerrain
             ("amplitude", 0.6f), ("frequency", 0.018f), ("warpamp", 6f), ("warpfrequency", 0.012f),
             ("vscale", 1.5f), ("widthvary", 0.5f), ("widthfrequency", 0.008f),
             ("seaatten", 1f), ("seafade", 0f), ("sealevel", 30f),
-            ("altlo", -10000f), ("althi", 10000f),   // absolute world-Y band: carve ONLY within [altlo,althi] (confine to a stratum above the sewer, below the surface). default = unbounded
+            ("altlo", -10000f), ("althi", 10000f),   // absolute world-Y band: carve ONLY within [altlo,althi] (hard floor above the sewer). default = unbounded
+            ("depthlo", 0f), ("depthhi", 0f),        // DEPTH-RELATIVE band below the composed surface: carve only in [surf−depthhi, surf−depthlo]. tracks terrain (no world-segmentation). 0 = off
+            ("bandfade", 0f),                        // soft ramp (m) at the depth-band edges: sheet width fades 0→full over this → no hard terraced ceiling/floor. 0 = hard edges
+            // STACKED FLOORS (periodic-Y carve) — off by default; when strataperiod>0 the mode carves horizontal
+            // floor-gaps at fixed vertical spacing instead of 3D-noise tunnels. These STACK (level over level), vs
+            // the noise path which only makes one wavy shell.
+            ("strataperiod", 0f),                    // vertical floor-to-floor spacing (m). 0 = off (normal tunnel carve)
+            ("stratagap",    0.5f),                  // fraction of each period that's open walkable air (rest = solid floor slab)
+            ("stratawobble", 0f),                    // XZ height wobble of the floors (m) so they aren't glass-flat
+            ("strataholefreq", 0.02f),               // XZ frequency of the vertical connecting holes (stairwells between levels)
+            ("strataholethresh", 0.6f),              // noise threshold above which a hole opens (higher = fewer holes)
+            ("stratataper", 0f),                     // skylight MOUTH taper: a slow XZ noise shifts the hole threshold as the shaft nears the surface → some flare out (wells), some pinch in. 0 = constant-width shafts
+            ("stratataperfreq", 0.03f),              // XZ scale of the flare-in/flare-out regions
         };
         protected override (string name, float def)[] ParamSpec => _spec;
 
@@ -628,10 +640,33 @@ namespace ProceduralTerrain
             float wv    = P[5][idx], wvf   = P[6][idx];
             float seaAtten = P[7][idx], seaFade = P[8][idx], seaLevel = P[9][idx];
             float altLo = P[10][idx], altHi = P[11][idx];
+            float depthLo = P[12][idx], depthHi = P[13][idx], bandFade = P[14][idx];
+            float strataPeriod = P[15][idx], strataGap = P[16][idx], strataWobble = P[17][idx];
+            float strataHoleFreq = P[18][idx], strataHoleThresh = P[19][idx];
+            float strataTaper = P[20][idx], strataTaperFreq = P[21][idx];
 
             var pool = Plugin._noisePool!;
             var wg   = args.wg ?? WorldGenerator.instance;
             float wx = args.worldX, wz = args.worldZ, s = args.s;
+
+            // depth-relative band: carve sheets only between (surface−depthhi) and (surface−depthlo). Tracks the
+            // composed surface per column → the band follows the terrain instead of a flat absolute slab.
+            float surfH = 0f; bool haveSurf = false;
+            float bandHi = float.MaxValue, bandLo = float.MinValue;
+            if (depthHi > 0f && wg != null)
+            {
+                surfH = Plugin.ComposedSurfaceSample(wx, wz, wg); haveSurf = true;
+                bandHi = surfH - depthLo;   // top of band (closer to surface)
+                bandLo = surfH - depthHi;   // bottom of band (deeper)
+            }
+
+            // SKYLIGHT: the strata hole-shafts (XZ noise, constant in Y → vertical through every floor) are let
+            // through the solid roof up to open sky, so they read as daylight columns + obvious exits to the surface.
+            float holeN = strataPeriod > 0f ? pool[9].GetNoise(wx * strataHoleFreq, 0f, wz * strataHoleFreq) : -1f;
+            float taperN = (strataPeriod > 0f && strataTaper > 0f) ? pool[8].GetNoise(wx * strataTaperFreq, 0f, wz * strataTaperFreq) : 0f;   // slow XZ → per-region flare in/out
+            // breach allowance uses the MOST-permissive threshold so flare-out mouths can still reach the surface
+            bool  canBreach = strataPeriod > 0f && holeN > (strataHoleThresh - Mathf.Max(0f, strataTaper));
+            float effBandHi = (canBreach && haveSurf) ? surfH + 2f : bandHi;   // hole columns breach the roof to daylight
 
             // Per-mode sea-level attenuation: shrink the tunnel radius (amplitude) as the surface
             // approaches sea level. Must scale amplitude, NOT the output SDF — a carve mode's "off"
@@ -647,7 +682,34 @@ namespace ProceduralTerrain
             for (int cy = 0; cy < args.bh; cy++)
             {
                 float wy = args.extLoS + cy * s;
-                if (wy < altLo || wy > altHi) { outCol[baseIdx + cy] = -1e4f; continue; }   // outside the band → solid (no carve); large-negative = solid per this carve mode's convention
+                if (wy < altLo || wy > altHi || wy < bandLo || wy > effBandHi) { outCol[baseIdx + cy] = -1e4f; continue; }   // outside band → solid (hole columns extend to the surface)
+                // soft depth-band edges: carve fades 0→full within bandFade of the band limits → no hard terrace
+                float bandFac = 1f;
+                if (bandFade > 0f && depthHi > 0f) bandFac = Mathf.Clamp01(Mathf.Min(bandHi - wy, wy - bandLo) / bandFade);
+                if (bandFac <= 0f && !canBreach) { outCol[baseIdx + cy] = -1e4f; continue; }      // faded out (non-shaft only; shafts carry on to the surface)
+
+                if (strataPeriod > 0f)
+                {
+                    // STACKED FLOORS: periodic-Y gaps. Air in the gap band of each period, solid floor between.
+                    float wob = strataWobble != 0f ? strataWobble * pool[10].GetNoise(wx * strataHoleFreq, 0f, wz * strataHoleFreq) : 0f;
+                    float ph  = (wy + wob) / strataPeriod; ph -= Mathf.Floor(ph);                 // 0..1 within a period
+                    float gc  = Mathf.Clamp01(strataGap) * 0.5f;                                  // half-gap (period units)
+                    float dGap = (gc - Mathf.Abs(ph - gc)) * strataPeriod;                        // metres; >0 inside the open gap, <0 in the floor slab
+                    if (dGap > 0f) dGap *= bandFac;                                               // fade normal gaps near band edges
+                    // SKYLIGHT shaft: constant XZ through the galleries; near the surface the hole threshold shifts by
+                    // the slow taper noise → the mouth flares out (taperN>0) or pinches in (taperN<0).
+                    float eth = strataHoleThresh;
+                    if (strataTaper > 0f && haveSurf)
+                    {
+                        float rampLo = bandHi - strataPeriod;   // start a period below the roof so the taper is visible over height, not just the thin cap
+                        if (wy > rampLo) eth -= taperN * strataTaper * Mathf.Clamp01((wy - rampLo) / Mathf.Max(effBandHi - rampLo, 0.001f));
+                    }
+                    if (holeN > eth) dGap = Mathf.Max(dGap, strataPeriod);                        // shaft = full air (no floors, no fade)
+                    outCol[baseIdx + cy] = dGap * 4f * s;
+                    continue;
+                }
+
+                float bandAmp = amp * bandFac;
                 float sy = wy * vsc;
 
                 float awx1 = pool[11].GetNoise(wx * warpF, sy * warpF, wz * warpF) * warpA;
@@ -659,7 +721,7 @@ namespace ProceduralTerrain
                 float nb = pool[9].GetNoise((wx + awx2) * freq, sy * freq, (wz + awz2) * freq);
                 float wn = pool[10].GetNoise(wx * wvf, sy * wvf, wz * wvf);
 
-                float localWidth = Mathf.Max(amp * (1f + wv * wn), 0.001f);
+                float localWidth = Mathf.Max(bandAmp * (1f + wv * wn), 0.001f);
                 float dist       = Mathf.Sqrt(na * na + nb * nb) * 0.7071f;
                 outCol[baseIdx + cy] = (localWidth - dist) / localWidth * 4f * s;
             }
