@@ -340,6 +340,12 @@ namespace ProceduralTerrain
                             _locBandFade = Mathf.Max(0.001f, lbf);
                         if (k == "applygroundwork")
                             _applyGroundwork = !(v == "0" || v == "false");
+                        if (k == "corridorgraph")
+                            { _corridorGraph = (v == "1" || v == "true"); LocationVoronoi.Invalidate(); }
+                        if (k == "corridorsteiner" && float.TryParse(v, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float cgs))
+                            { _corridorSteiner = Mathf.Max(0f, cgs); LocationVoronoi.Invalidate(); }
+                        if (k == "corridorclearance" && float.TryParse(v, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float cgc))
+                            { _corridorClearance = Mathf.Max(0f, cgc); LocationVoronoi.Invalidate(); }
                         if (k == "flatplanelocations")
                             _flatPlaneLocations = !(v == "0" || v == "false");
                         if (k == "islandremoval")

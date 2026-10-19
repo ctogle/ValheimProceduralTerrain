@@ -1393,6 +1393,17 @@ namespace ProceduralTerrain
                         bool  flatCap     = _cb.bkModeParams![mi][53][cc] > 0.5f;   // cylinder form: round cross-section + flat caps
                         float coastSeed   = _cb.bkModeParams![mi][54][cc];          // >0: seed only within this of the Ocean biome + aim inland
                         float chainRoute  = _cb.bkModeParams![mi][55][cc];          // >0: Voronoi-corridor route instead of hashed walk
+                        float atriumRad   = _cb.bkModeParams![mi][56][cc];          // >0: carve a dome of this radius at each merge-junction atrium site
+                        float atriumLift  = _cb.bkModeParams![mi][57][cc];          // dome centre lift above water floor (fraction of radius)
+                        float atriumMrg   = _cb.bkModeParams![mi][58][cc];          // merge-junction cluster radius
+                        float atriumNz    = _cb.bkModeParams![mi][59][cc];          // per-site radius jitter fraction
+                        float breachRad   = _cb.bkModeParams![mi][60][cc];          // >0: vertical shaft radius from atrium up through surface
+                        float breachStep  = _cb.bkModeParams![mi][61][cc];          // shaft stamp spacing
+                        float atriumFill  = _cb.bkModeParams![mi][62][cc];          // dome height as fraction of floor→surface depth
+                        float atriumMinD  = _cb.bkModeParams![mi][63][cc];          // min overburden to place an atrium
+                        float atriumLumps = _cb.bkModeParams![mi][64][cc];          // satellite stamp count (noise)
+                        float atriumAngFrac = _cb.bkModeParams![mi][65][cc];        // fraction of satellites that are angular
+                        float atriumAngP  = _cb.bkModeParams![mi][66][cc];          // Lp exponent for angular satellites
                         float chainSlope  = _cb.bkModeParams![mi][41][cc];
                         float biomeMajority = _cb.bkModeParams![mi][42][cc];
                         float skyOpen     = _cb.bkModeParams![mi][43][cc];
@@ -1474,6 +1485,10 @@ namespace ProceduralTerrain
                         var normals = new List<Vector3>(256);   // N: composed-surface normal (stamp axis)
                         var tangG   = new List<Vector3>(256);   // G: downslope tangent
                         var tangT   = new List<Vector3>(256);   // T = N×G: cross-slope tangent
+                        var shaftStamps = new List<(Vector3 c, float r)>();   // breach shafts: carved HARD (fuse=0) in a separate pass so the mode's smooth-fuse doesn't shrink the thin column into a cork
+                        // atrium dome+satellite stamps: carved in their OWN pass with their OWN ellipsoid shape (per-stamp
+                        // stretch + horizontal axis), DECOUPLED from the canal tube shape they'd otherwise share via the mode stretch
+                        var atriumStamps = new List<(Vector3 c, float r, float sN, float sG, float sT, float gx, float gz, float p)>();
                         float h = 1.5f;   // gradient sample step
                         float curvMin = 9999f, curvMax = -9999f, curvSum = 0f; int curvCnt = 0;   // curvature-range diag
                         var work = new List<(Vector3 pos, Vector3 dir, int left, int depth, int seg)>(64);   // chain-branch worklist (reused)
@@ -1680,6 +1695,10 @@ namespace ProceduralTerrain
                                 float rr = asp / biasSpacing + biasPhase; rr -= Mathf.Floor(rr);
                                 if (Mathf.Min(rr, 1f - rr) > biasWidth) continue;
                             }
+                            // Network-driven: when corridorGraph is on, canals (and atriums) come from the shared
+                            // CorridorNetwork stamped once per zone below — the per-seed lattice emission is skipped so
+                            // we don't double-carve or scatter off-network mouth balls.
+                            if (Plugin._corridorGraph && chainRoute > 0.5f) continue;
                             // uniform radius roll in [minR, maxR] from the lattice index (decorrelated hash seeds)
                             float seedR = sminR > 0f ? sminR + (smaxR - sminR) * Hash(li*2+1, lj*2+1, hk*2+1) : smaxR;
                             if (liftFrac != 0f) ctr += N * (liftFrac * seedR);   // lift the stamp off the surface by liftfrac·radius → ball sits proud
@@ -1883,6 +1902,167 @@ namespace ProceduralTerrain
                             }
                         }
 
+                        // NETWORK-DRIVEN CANALS + ATRIUMS: the shared CorridorNetwork (coast mouths routed inland and
+                        // unioned) is the single source. We stamp its canal polylines near this zone, and atriums are
+                        // the network's junctions → ON the carved tunnels by construction (no connector hack).
+                        if (chainRoute > 0.5f && wg != null && Plugin._locationsCached && Plugin._corridorGraph)
+                        {
+                            float zcx = 0.5f * (wxLo + wxHi), zcz = 0.5f * (wzLo + wzHi);
+                            // half-DIAGONAL of the carved extent (zone+overlap), not half-side: a zone's farthest cell
+                            // is at the corner, so a feature reaching that corner sits up to the diagonal away from the
+                            // zone centre. Querying with the side radius makes corner-band atriums/canals captured by
+                            // one zone but not its neighbour → a seam (half-carved cork split on the zone boundary).
+                            float zhalf = 0.5f * Mathf.Sqrt((wxHi - wxLo) * (wxHi - wxLo) + (wzHi - wzLo) * (wzHi - wzLo));
+                            // CANONICAL params for the network key — per-cell reads are biome-BLENDED so they vary
+                            // slightly every zone; feeding those to GetNetwork changed the cache key per zone → the
+                            // whole global network rebuilt every carve → stall. Use the peak (unblended, max over
+                            // biomes using the mode), identical everywhere → one build, cached.
+                            float Peak(int idx, float fb) { float pk = fb; foreach (var kv in _biomeParams) { var bp = kv.Value; if (bp != null && mi < bp.Length && bp[mi] != null && idx < bp[mi].Length && bp[mi][idx] > pk) pk = bp[mi][idx]; } return pk; }
+                            float covP = Peak(6, coverage), mergeP = Peak(58, atriumMrg), radP = Peak(56, atriumRad), minDP = Peak(63, atriumMinD);
+                            float inlandGoal = Peak(26, chainN) * Mathf.Abs(Peak(27, chainStep));
+                            float minClr = (radP > 0f ? radP : 0f) + Mathf.Max(Plugin._corridorClearance, 20f);   // rim clears locations
+                            // biome mask = biomes whose params use THIS mode (parity with the biomemajority gate). 0 =
+                            // no filter (mode carves everywhere). Confines the sewer network to its biome(s).
+                            int biomeMask = 0;
+                            if (biomeMajority > 0f)
+                                foreach (var kv in _biomeParams) { var bp = kv.Value; if (bp != null && mi < bp.Length && bp[mi] != null && bp[mi].Length > 0 && bp[mi][0] > 0f) biomeMask |= (int)kv.Key; }
+                            var net = LocationVoronoi.GetNetwork(Plugin._corridorSteiner, Plugin._corridorClearance,
+                                                                 covP, mergeP, minClr, minDP, RiverWaterLevel, inlandGoal, biomeMask);
+                            if (net != null)
+                            {
+                                float cStep = Mathf.Max(1f, Mathf.Abs(chainStep));
+                                // CANAL TUBES: stamp along each network canal polyline near the zone (swell-noised radius).
+                                var canalScratch = new List<Vector3[]>();
+                                net.CanalsNear(new Vector2(zcx, zcz), zhalf + reach + 128f, canalScratch);
+                                foreach (var poly in canalScratch)
+                                {
+                                    var runPts = viz ? new List<Vector3> { poly[0] } : null;
+                                    for (int pi = 1; pi < poly.Length; pi++)
+                                    {
+                                        Vector3 a = poly[pi - 1], b = poly[pi];
+                                        float segLen = Vector3.Distance(a, b);
+                                        int nst = Mathf.Max(1, Mathf.RoundToInt(segLen / cStep));
+                                        Vector3 dir = b - a; dir.y = 0f; if (dir.sqrMagnitude < 1e-6f) dir = new Vector3(1f, 0f, 0f); dir = dir.normalized;
+                                        var pG = dir;
+                                        var pN = Vector3.up - Vector3.Dot(Vector3.up, pG) * pG; if (pN.sqrMagnitude < 1e-5f) pN = Vector3.Cross(pG, Vector3.right); pN = pN.normalized;
+                                        var pT = Vector3.Cross(pN, pG).normalized;
+                                        for (int st = 1; st <= nst; st++)
+                                        {
+                                            var pos = Vector3.Lerp(a, b, (float)st / nst);
+                                            if (biomeMask != 0 && (biomeMask & (int)wg.GetBiome(pos.x, pos.z)) == 0) continue;   // canal only carves in its biome(s)
+                                            runPts?.Add(pos);
+                                            float swell = 0.5f + 0.5f * Plugin._noisePool![11].GetNoise(pos.x * 0.07f, pos.y * 0.07f, pos.z * 0.07f);
+                                            float cr = peakMinR + (peakMaxR - peakMinR) * Mathf.Clamp01(swell);
+                                            var cpos = pos + pN * (liftFrac * cr);
+                                            centers.Add(cpos); normals.Add(pN); tangG.Add(pG); tangT.Add(pT); radii.Add(cr);
+                                            if (cr > maxChainReach) maxChainReach = cr;
+                                        }
+                                    }
+                                    if (runPts != null && runPts.Count >= 2 && poly[0].x >= ownXLo && poly[0].x < ownXHi && poly[0].z >= ownZLo && poly[0].z < ownZHi)
+                                        DebugViz.Line(runPts, colPath, 0.8f);
+                                }
+
+                                // ATRIUM DOMES at network junctions — depth-scaled, noisy (central + satellites), with a
+                                // breach shaft. On the network by construction, so always reachable via the canals.
+                                if (atriumRad > 0f)
+                                {
+                                    // capture radius must cover the dome's TRUE reach: core ellipsoid major (domeR·sG,
+                                    // sG up to ~1.26) + satellite spread (~1.67·domeR). Underestimating it makes corner
+                                    // zones miss the atrium → a seam-aligned cork. 1.8× is a safe envelope.
+                                    float atriumMaxR = atriumRad * 1.8f;
+                                    var atriumScratch = new List<LocationVoronoi.Atrium>(16);
+                                    net.AtriumsNear(new Vector2(zcx, zcz), zhalf + atriumMaxR, atriumScratch);
+                                    foreach (var atr in atriumScratch)
+                                    {
+                                        var apos = atr.Pos;
+                                        uint hh = (uint)((int)apos.x * 73856093) ^ (uint)((int)apos.y * 19349663); hh ^= hh >> 13; hh *= 2246822519u; hh ^= hh >> 16;
+                                        float H(int kq) { uint x = hh + (uint)kq * 2654435761u; x ^= x >> 15; x *= 2246822519u; x ^= x >> 13; return x / 4294967295f; }
+
+                                        float floorY = RiverWaterLevel;
+                                        float surfH = ComposedSurfaceSample(apos.x, apos.y, wg);   // COMPOSED surface (vanilla + formation), not vanilla GroundHeight → dome sized to the real walkable surface + breach reaches it
+                                        float depth = surfH - floorY;
+                                        if (depth < Mathf.Max(atriumMinD, 1f)) continue;             // no overburden → skip
+                                        float domeH = depth * Mathf.Clamp01(atriumFill <= 0f ? 0.85f : atriumFill);
+                                        domeH *= 1f + (H(1) - 0.5f) * 2f * Mathf.Max(0f, atriumNz);
+                                        float vertHalf = Mathf.Min(0.5f * domeH, atriumRad);        // atriumRad caps BOTH height and width
+                                        float domeR = vertHalf;
+                                        float centerY = floorY + vertHalf + atriumLift * domeR;
+                                        // per-atrium ELLIPSOID: area-preserving horizontal aspect on a hashed axis, its OWN
+                                        // stretch frame — decoupled from the canal tube shape (own pass below).
+                                        float elong = 1f + H(11) * 0.6f;                            // aspect 1.0 .. 1.6
+                                        float sN = 1f, sG = Mathf.Sqrt(elong), sT = 1f / Mathf.Sqrt(elong);
+                                        float eang = H(10) * 6.2831853f; float gx = Mathf.Cos(eang), gz = Mathf.Sin(eang);
+                                        // whole-CHAMBER angularity for a hashed fraction — the core is big enough to show
+                                        // facets at coarse live res (small satellites are not), so this is what you'll actually see
+                                        float coreP = H(13) < atriumAngFrac ? Mathf.Max(2.05f, atriumAngP) : 2f;
+                                        atriumStamps.Add((new Vector3(apos.x, centerY, apos.y), domeR, sN, sG, sT, gx, gz, coreP));   // core
+                                        if (domeR > maxChainReach) maxChainReach = domeR;
+                                        RecordCarvedAtrium(new Vector3(apos.x, centerY, apos.y));
+                                        // DEBUG: paint the carve volumes so a cork can be judged directly — does a stamp
+                                        // cover it (carve failed) or is it a placement gap? Core ellipsoid axes = GREEN.
+                                        bool atrViz = viz && apos.x >= ownXLo && apos.x < ownXHi && apos.y >= ownZLo && apos.y < ownZHi;
+                                        if (atrViz)
+                                        {
+                                            var ac0 = new Vector3(apos.x, centerY, apos.y);
+                                            var gdir = new Vector3(gx, 0f, gz); var tdir = new Vector3(-gz, 0f, gx);
+                                            var gcol = new Color(0.1f, 0.9f, 0.2f);
+                                            DebugViz.Line(new[] { ac0 - Vector3.up * domeR * sN, ac0 + Vector3.up * domeR * sN }, gcol, 0.6f);
+                                            DebugViz.Line(new[] { ac0 - gdir * domeR * sG, ac0 + gdir * domeR * sG }, gcol, 0.6f);
+                                            DebugViz.Line(new[] { ac0 - tdir * domeR * sT, ac0 + tdir * domeR * sT }, gcol, 0.6f);
+                                        }
+
+                                        int lumps = Mathf.Clamp(Mathf.RoundToInt(atriumLumps), 0, 24);
+                                        for (int kl = 0; kl < lumps; kl++)
+                                        {
+                                            float ang = H(kl * 4 + 2) * 6.2831853f;
+                                            float rho = (0.25f + 0.6f * H(kl * 4 + 3)) * domeR;
+                                            float hoff = (H(kl * 4 + 4) - 0.35f) * domeH;
+                                            float subr = (0.35f + 0.3f * H(kl * 4 + 5)) * domeR;
+                                            var sc = new Vector3(apos.x + rho * Mathf.Cos(ang), centerY + hoff, apos.y + rho * Mathf.Sin(ang));
+                                            // a cfg-tunable fraction of satellites are ANGULAR (superellipsoid) → boxy bosses/ledges; rest round
+                                            float sp = H(kl * 4 + 6) < atriumAngFrac ? Mathf.Max(2.05f, atriumAngP) : 2f;
+                                            atriumStamps.Add((sc, subr, sN, sG, sT, gx, gz, sp));   // satellites share the atrium's ellipsoid frame
+                                            if (atrViz)   // satellite extent = CYAN tick (vertical, ±subr·sN)
+                                                DebugViz.Line(new[] { sc - Vector3.up * subr * sN, sc + Vector3.up * subr * sN }, new Color(0f, 0.8f, 0.9f), 0.5f);
+                                        }
+
+                                        if (breachRad > 0f)
+                                        {
+                                            // The union samples XZ at COARSE cell resolution, so a thin shaft under-
+                                            // resolves near the surface exit and leaves an uncarved plug ("cork"). Fix:
+                                            // floor the radius to ≥~1 coarse cell so it's always sampled, and FLARE it
+                                            // open toward the surface (funnel) so the mouth is reliably wide + clean.
+                                            // Clamp the shaft radius to ≥~0.8 coarse cells: a disk that wide always
+                                            // contains a sample column regardless of alignment (worst case ~0.71·cell on
+                                            // the diagonal), so the center can't under-resolve into a cork — at coarse
+                                            // live res OR bake res 1 (where breachRad already dominates and this is a
+                                            // no-op). Keeps the shaft only as wide as sampling demands → no crater.
+                                            // ≥1.3 coarse cells so a 3×3 block of sample columns (incl. the centre) is
+                                            // always covered regardless of axis↔grid alignment — a narrower shaft aliases
+                                            // into a carved ring + solid centre pillar (divot + cork). Width no longer
+                                            // causes a floor divot now that the bottom rests ON the floor (y0 below).
+                                            float surfTop = Mathf.Max(surfH, floorY);
+                                            // span floor → surface, but rest the shaft's BOTTOM on the floor rather than
+                                            // centring a sphere there (which carved a bowl a full radius below the floor
+                                            // → the divot). Lowest stamp's underside ≈ floorY clears the dead-centre cork
+                                            // without digging under the floor.
+                                            float y0 = centerY, y1 = surfTop + 10f;
+                                            if (viz && apos.x >= ownXLo && apos.x < ownXHi && apos.y >= ownZLo && apos.y < ownZHi)
+                                                DebugViz.Line(new[] { new Vector3(apos.x, centerY, apos.y), new Vector3(apos.x, y1, apos.y) }, new Color(0.2f, 0.45f, 1f), 0.8f);
+                                            int nsh = Mathf.Max(1, Mathf.RoundToInt((y1 - y0) / Mathf.Max(breachStep, 2f)));
+                                            for (int sh = 0; sh <= nsh; sh++)
+                                            {
+                                                float yy = Mathf.Lerp(y0, y1, (float)sh / nsh);
+                                                float t = Mathf.Clamp01(Mathf.InverseLerp(centerY, surfTop, yy));   // 0 at dome, 1 at surface
+                                                float r = breachRad * (1f + 0.4f * t);                               // mild funnel: ~1.4× at the mouth (no crater)
+                                                shaftStamps.Add((new Vector3(apos.x, yy, apos.y), r));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
                         // DIAG: field Y window vs how deep/far the stamps go, + how many stamps fall OUTSIDE this
                         // zone's field (Y below floor / above top, or XZ outside) → can't be carved here.
                         float fieldYlo = extLoS2, fieldYhi = extLoS2 + (ch - 1) * yStep;
@@ -1899,7 +2079,12 @@ namespace ProceduralTerrain
 
                         // Spatial buckets (cell = reach) so each voxel tests only stamps in its 27 neighbour
                         // buckets, not all N. Turns the union from O(voxels*centers) into O(voxels*localCenters).
-                        float bsz = Mathf.Max(reach, 1f);
+                        // bsz MUST cover the largest stamp radius: atrium domes (r≫corridor maxR) would otherwise be
+                        // truncated to a reach-sized CUBE because distant voxels never test the big stamp.
+                        float maxStampR = 0f;
+                        for (int ci = 0; ci < radii.Count; ci++) if (radii[ci] > maxStampR) maxStampR = radii[ci];
+                        float stampStretch = Mathf.Max(1f, Mathf.Max(stretchN, Mathf.Max(stretchG, stretchT)));
+                        float bsz = Mathf.Max(Mathf.Max(reach, maxStampR * stampStretch), 1f);
                         var buckets = new Dictionary<long, List<int>>(centers.Count + 1);
                         long BKey(int bx, int by, int bz) => ((long)(bx + 100000) * 200003L + (by + 100000)) * 200003L + (bz + 100000);
                         for (int ci = 0; ci < centers.Count; ci++)
@@ -1965,7 +2150,70 @@ namespace ProceduralTerrain
                                 if (nr != r) { r = nr; dbgHit++; }
                             }
                         }
-                        Log.LogDebug($"[PT-blobs] centers={centers.Count} L={L:F0} rad=[{minR:F1},{maxR:F1}] stretchN={stretchN:F1} carve={carve} branches={branchEvents} branchprob={branchProb:F2} flow={flowSteer:F2} hub={hubSeek:F2} maxreach={maxChainReach:F0}m ridgeratio={ridgeRatio:F1} solidVoxels={dbgHit} curv=[{curvMin:F3},{curvMax:F3}]");
+
+                        // ATRIUM DOMES — carved in their OWN pass with their OWN ellipsoid shape (per-stamp stretch
+                        // sN/sG/sT on a hashed horizontal axis), DECOUPLED from the canal tube shape. Smooth-subtract
+                        // with the mode fuse for an organic shell (wide feature → fuse doesn't cork it like the shaft).
+                        foreach (var a in atriumStamps)
+                        {
+                            float aReach = a.r * Mathf.Max(a.sN, Mathf.Max(a.sG, a.sT)) * 1.5f;   // ×1.5 so angular (box-corner) stamps aren't clipped by the XZ cull
+                            float aReach2 = aReach * aReach;
+                            for (int cx4 = 0; cx4 < cw4; cx4++)
+                            for (int cz4 = 0; cz4 < cw4; cz4++)
+                            {
+                                int cell = cx4 * cw4 + cz4;
+                                // NO amplitude gate here: the atrium is a network feature (biome-confined at placement),
+                                // not the per-cell sewer mode — gating it by the canal amplitude leaves holes and, where
+                                // that amplitude disagrees across a zone boundary, a seam-aligned cork.
+                                int cxw = Math.Min(cx4 * cvXZ, bw - 1), czw = Math.Min(cz4 * cvXZ, bw - 1);
+                                float wx = (ox0 + cxw) * s, wz = (oz0 + czw) * s;
+                                float ddx = wx - a.c.x, ddz = wz - a.c.z;
+                                if (ddx * ddx + ddz * ddz > aReach2) continue;
+                                float dG = ddx * a.gx + ddz * a.gz, dT = -ddx * a.gz + ddz * a.gx;   // horizontal ellipse axes
+                                int cbaseC = cell * ch;
+                                for (int cyc = 0; cyc < ch; cyc++)
+                                {
+                                    float wy = extLoS2 + cyc * yStep;
+                                    float dN = wy - a.c.y;
+                                    float uN = dN / (a.r * a.sN), uG = dG / (a.r * a.sG), uT = dT / (a.r * a.sT);
+                                    float comb = a.p == 2f
+                                        ? Mathf.Sqrt(uN * uN + uG * uG + uT * uT)                                                 // round ellipsoid
+                                        : Mathf.Pow(Mathf.Pow(Mathf.Abs(uN), a.p) + Mathf.Pow(Mathf.Abs(uG), a.p) + Mathf.Pow(Mathf.Abs(uT), a.p), 1f / a.p);   // angular superellipsoid
+                                    float dd = (comb - 1f) * a.r;
+                                    ref float rf = ref _runSDF![cbaseC + cyc];
+                                    // angular stamps (p>2) carve HARD so their edges survive; round stamps smooth-blend
+                                    // (fuse) for an organic shell. Smooth-subtract rounds corners → angular looks round.
+                                    rf = (a.p > 2f || fuse <= 0f) ? Mathf.Max(rf, -dd) : -Smin(-rf, dd, fuse);
+                                }
+                            }
+                        }
+
+                        // BREACH SHAFTS — carved HARD (fuse=0) as round spheres, AFTER the fused union. The mode's
+                        // smooth-fuse shrinks thin carves by ~fuse at their boundary, which seals this narrow column
+                        // into a cork right under the mouth; a hard subtract leaves it clean. Same coarse-XZ sampling
+                        // (one column per cell) as the union, so geometry stays consistent.
+                        foreach (var (sc, sr) in shaftStamps)
+                        {
+                            float sr2 = sr * sr;
+                            for (int cx4 = 0; cx4 < cw4; cx4++)
+                            for (int cz4 = 0; cz4 < cw4; cz4++)
+                            {
+                                int cell = cx4 * cw4 + cz4;
+                                int cxw = Math.Min(cx4 * cvXZ, bw - 1), czw = Math.Min(cz4 * cvXZ, bw - 1);   // no amplitude gate: shaft is a network feature
+                                float wx = (ox0 + cxw) * s, wz = (oz0 + czw) * s;
+                                float dxz2 = (wx - sc.x) * (wx - sc.x) + (wz - sc.z) * (wz - sc.z);
+                                if (dxz2 > sr2) continue;
+                                int cbaseC = cell * ch;
+                                for (int cyc = 0; cyc < ch; cyc++)
+                                {
+                                    float wy = extLoS2 + cyc * yStep;
+                                    float dy = wy - sc.y;
+                                    float air = sr - Mathf.Sqrt(dxz2 + dy * dy);   // >0 inside the shaft sphere
+                                    if (air > 0f) { ref float rf = ref _runSDF![cbaseC + cyc]; if (air > rf) rf = air; }
+                                }
+                            }
+                        }
+                        Log.LogDebug($"[PT-blobs] centers={centers.Count} L={L:F0} rad=[{minR:F1},{maxR:F1}] stretchN={stretchN:F1} carve={carve} branches={branchEvents} branchprob={branchProb:F2} flow={flowSteer:F2} hub={hubSeek:F2} maxreach={maxChainReach:F0}m ridgeratio={ridgeRatio:F1} solidVoxels={dbgHit} curv=[{curvMin:F3},{curvMax:F3}] shafts={shaftStamps.Count}");
                         if (needsEikonal) RedistanceEikonal(_runSDF!, cw4, cw4, ch, xzStep, xzStep, yStep, 2);
                         continue;
                     }
@@ -2629,12 +2877,53 @@ namespace ProceduralTerrain
         // IDENTICAL polyline → seam-free. Built lazily once the deterministic location set is available.
         static readonly Dictionary<long, List<Vector3>?> _canalRouteCache = new();
         static readonly object _canalRouteLock = new();
+
+        // Snapshot of every routed+smoothed canal polyline generated so far (populated where zones carved). The viz
+        // draws these to show the ACTUAL corridors in-world, vs the full graph of candidate edges.
+        internal static List<List<Vector3>> SnapshotCanalRoutes()
+        {
+            var o = new List<List<Vector3>>();
+            lock (_canalRouteLock) foreach (var v in _canalRouteCache.Values) if (v != null && v.Count >= 2) o.Add(v);
+            return o;
+        }
+
+        // World positions of atrium domes the carve ACTUALLY emitted (after all gates). pt_gotoatrium teleports to
+        // one of these, so the destination always has a real dome. Deduped by quantized XZ across overlapping zones.
+        static readonly Dictionary<long, Vector3> _carvedAtriums = new();
+        static readonly object _carvedAtriumLock = new();
+        static void RecordCarvedAtrium(Vector3 c)
+        {
+            long key = ((long)Mathf.RoundToInt(c.x / 8f) * 73856093L) ^ ((long)Mathf.RoundToInt(c.z / 8f) * 19349663L);
+            lock (_carvedAtriumLock) _carvedAtriums[key] = c;
+        }
+        internal static List<Vector3> SnapshotCarvedAtriums()
+        {
+            lock (_carvedAtriumLock) return new List<Vector3>(_carvedAtriums.Values);
+        }
         internal static void ClearCanalRouteCache() { lock (_canalRouteLock) _canalRouteCache.Clear(); }
 
         static List<Vector3>? GetCanalRoute(Vector3 ctr, Vector3 inland, float inlandGoal)
         {
             long key = ((long)Mathf.RoundToInt(ctr.x / 4f) * 73856093L) ^ ((long)Mathf.RoundToInt(ctr.z / 4f) * 19349663L);
             lock (_canalRouteLock) { if (_canalRouteCache.TryGetValue(key, out var cached)) return cached; }
+
+            // NEW PATH (opt-in via corridorGraph=1): route against the shared global annotated graph instead of a
+            // windowed per-seed Delaunay. Same seeded-path policy (deepest-inland, clearance-weighted, Chaikin).
+            if (Plugin._corridorGraph)
+            {
+                var gg = LocationVoronoi.Get(Plugin._corridorSteiner, Plugin._corridorClearance);
+                List<Vector3>? gres = null;
+                if (gg != null)
+                {
+                    var gstart = new Vector2(ctr.x, ctr.z);
+                    var gdir = new Vector2(inland.x - ctr.x, inland.z - ctr.z);
+                    if (gdir.sqrMagnitude > 1e-6f) gdir.Normalize();
+                    var gpr = new CanalRouter.Params { InlandGoal = inlandGoal };
+                    gres = LocationVoronoi.RoutePath(gg, gstart, gdir, gpr, RiverWaterLevel);
+                }
+                lock (_canalRouteLock) { _canalRouteCache[key] = gres; }
+                return gres;
+            }
 
             List<Vector3>? result = null;
             var locs = Plugin._locationPositions;      // deterministic, complete once ZoneSystem.LocationsGenerated

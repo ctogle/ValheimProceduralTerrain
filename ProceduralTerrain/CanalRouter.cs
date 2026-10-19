@@ -26,6 +26,23 @@ namespace ProceduralTerrain
         }
 
         // Route every seed. Returns one polyline per seed (null if it couldn't reach a clear inland node).
+        // Build the raw Voronoi corridor graph over the sites (Delaunay → Voronoi edges). Exposed for the
+        // LocationVoronoi service + debug viz. Edges are index pairs into verts (Voronoi vertices = circumcenters).
+        // nLoc = number of REAL locations at the front of `sites` (rest are Steiner points). edge kind:
+        // 0 = location↔location (original pure-Voronoi edge), 1 = touches a Steiner point (added by densification).
+        public static (List<Vector2> verts, List<(int a, int b)> edges, List<int> kinds) BuildGraph(List<Site> sites, int nLoc)
+        {
+            if (sites.Count < 3) return (new List<Vector2>(), new List<(int, int)>(), new List<int>());
+            var pts = sites.Select(s => new V(s.x, s.z)).ToList();
+            var tris = Delaunay(pts);
+            var (vverts, vedges, vsites) = Voronoi(tris, pts);
+            var verts = new List<Vector2>(vverts.Count);
+            foreach (var v in vverts) verts.Add(new Vector2((float)v.x, (float)v.z));
+            var kinds = new List<int>(vsites.Count);
+            foreach (var (sa, sb) in vsites) kinds.Add((sa < nLoc && sb < nLoc) ? 0 : 1);
+            return (verts, vedges, kinds);
+        }
+
         public static List<List<Vector2>> Route(List<Site> sites, List<(Vector2 start, Vector2 dir)> seeds, Params pr,
                                                 out int reached, out int terminated)
         {
@@ -35,7 +52,7 @@ namespace ProceduralTerrain
 
             var pts = sites.Select(s => new V(s.x, s.z)).ToList();
             var tris = Delaunay(pts);
-            var (vverts, vedges) = Voronoi(tris, pts);
+            var (vverts, vedges, _) = Voronoi(tris, pts);
 
             double Clearance(V p)
             {
@@ -137,21 +154,23 @@ namespace ProceduralTerrain
         }
 
         // ---- Voronoi edges = circumcenters of Delaunay triangles sharing an edge ----
-        static (List<V>, List<(int, int)>) Voronoi(List<int[]> tris, List<V> pts)
+        // Also returns, per vedge, the SITE PAIR (Delaunay edge) it separates — so callers can tell which two
+        // sites an edge is equidistant between (e.g. location vs Steiner point).
+        static (List<V>, List<(int, int)>, List<(int, int)>) Voronoi(List<int[]> tris, List<V> pts)
         {
             var cc = new List<V>();
             foreach (var t in tris) cc.Add(Circumcenter(pts[t[0]], pts[t[1]], pts[t[2]]));
-            var edgeToTri = new Dictionary<(int, int), int>(); var vedges = new List<(int, int)>();
+            var edgeToTri = new Dictionary<(int, int), int>(); var vedges = new List<(int, int)>(); var vsites = new List<(int, int)>();
             for (int ti = 0; ti < tris.Count; ti++)
             {
                 var t = tris[ti];
                 for (int e = 0; e < 3; e++)
                 {
                     int a = t[e], b = t[(e + 1) % 3]; var key = a < b ? (a, b) : (b, a);
-                    if (edgeToTri.TryGetValue(key, out int tj)) vedges.Add((ti, tj)); else edgeToTri[key] = ti;
+                    if (edgeToTri.TryGetValue(key, out int tj)) { vedges.Add((ti, tj)); vsites.Add(key); } else edgeToTri[key] = ti;
                 }
             }
-            return (cc, vedges);
+            return (cc, vedges, vsites);
         }
         static V Circumcenter(V a, V b, V c)
         {
@@ -201,5 +220,12 @@ namespace ProceduralTerrain
             return p;
         }
         static double Dist(V a, V b) => Math.Sqrt((a.x - b.x) * (a.x - b.x) + (a.z - b.z) * (a.z - b.z));
+
+        // Public smoothing for graph-policy consumers (LocationVoronoi) so corridor polylines match the legacy look.
+        public static List<Vector2> Smooth(List<Vector2> pts, int iters)
+        {
+            var p = pts.Select(v => new V(v.x, v.y)).ToList();
+            return Chaikin(p, iters).Select(v => new Vector2((float)v.x, (float)v.z)).ToList();
+        }
     }
 }

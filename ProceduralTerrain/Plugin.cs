@@ -459,6 +459,17 @@ namespace ProceduralTerrain
             ("flatcap",       0f),  // >0: CYLINDER form — round cross-section (G,T) with FLAT caps along N (comb = max(radial, |uN|)) instead of the rounded ellipsoid. tapered+flatcap = truncated cone / sharp-rimmed bell
             ("coastseed",     0f),  // >0: only seed within this many world-units of the OCEAN biome, AND aim the chain INLAND (up the ocean-distance gradient). For canals that start at the shoreline and run in. 0 = off
             ("chainroute",    0f),  // >0: route the canal through the Voronoi location-corridor graph (CanalRouter) instead of the hashed random walk — snakes AROUND protected locations. needs coastseed + generated locations. 0 = hashed walk (default)
+            ("atriumradius",  0f),  // >0: carve a DOME of this radius at each merge-junction atrium site on the shared LocationVoronoi graph (needs chainroute + generated locations). 0 = off
+            ("atriumlift",    0.3f),// dome centre raised above the water floor (RiverWaterLevel) by this fraction of the radius → floor clamp leaves a flat-ish water floor, dome ceiling above
+            ("atriummerge", 300f),  // cluster merge-junctions within this radius into a single atrium site
+            ("atriumnoise",   0.25f),// per-site radius jitter (fraction) so domes aren't uniform spheres
+            ("breachradius",  0f),  // >0: carve a vertical SHAFT of this radius from each atrium up through the surface → a visible entrance. 0 = off
+            ("breachstep",    4f),  // vertical spacing of shaft stamps
+            ("atriumfill",    0.85f),// dome HEIGHT as a fraction of the floor→surface depth (1 = ceiling right at the surface). radius derives from this
+            ("atriummindepth",18f), // skip atriums where surface−waterfloor < this → never place a dome with no overburden (no half-exposed rooms)
+            ("atriumlumps",   8f),  // satellite stamps per atrium → lumpy, noisy dome instead of one smooth sphere. 0 = single sphere
+            ("atriumangularfrac", 0.4f),// fraction of satellites that are ANGULAR (hard-carved superellipsoid) vs round. 0 = all round
+            ("atriumangularp",    4f),  // Lp exponent for angular satellites (>2 = boxy; higher = sharper). 4–8 reads clearly
         };
         protected override (string name, float def)[] ParamSpec => _spec;
         public override void BakeColumn(ref CarveBuffers cb, in BakeCellArgs args)
@@ -599,6 +610,7 @@ namespace ProceduralTerrain
             ("amplitude", 0.6f), ("frequency", 0.018f), ("warpamp", 6f), ("warpfrequency", 0.012f),
             ("vscale", 1.5f), ("widthvary", 0.5f), ("widthfrequency", 0.008f),
             ("seaatten", 1f), ("seafade", 0f), ("sealevel", 30f),
+            ("altlo", -10000f), ("althi", 10000f),   // absolute world-Y band: carve ONLY within [altlo,althi] (confine to a stratum above the sewer, below the surface). default = unbounded
         };
         protected override (string name, float def)[] ParamSpec => _spec;
 
@@ -615,6 +627,7 @@ namespace ProceduralTerrain
             float freq  = P[1][idx], warpA = P[2][idx], warpF = P[3][idx], vsc = P[4][idx];
             float wv    = P[5][idx], wvf   = P[6][idx];
             float seaAtten = P[7][idx], seaFade = P[8][idx], seaLevel = P[9][idx];
+            float altLo = P[10][idx], altHi = P[11][idx];
 
             var pool = Plugin._noisePool!;
             var wg   = args.wg ?? WorldGenerator.instance;
@@ -634,6 +647,7 @@ namespace ProceduralTerrain
             for (int cy = 0; cy < args.bh; cy++)
             {
                 float wy = args.extLoS + cy * s;
+                if (wy < altLo || wy > altHi) { outCol[baseIdx + cy] = -1e4f; continue; }   // outside the band → solid (no carve); large-negative = solid per this carve mode's convention
                 float sy = wy * vsc;
 
                 float awx1 = pool[11].GetNoise(wx * warpF, sy * warpF, wz * warpF) * warpA;
@@ -773,6 +787,12 @@ namespace ProceduralTerrain
         internal static float _locDomeHeight       = 0f;     // metres the location protection DOME rises over the pad centre (hemisphere bubble, terrain free above). 0 = full-column protect (guaranteed open to sky — spawn/altars)
         internal static float _locBandFade         = 8f;     // metres the location protection tapers out above the dome top
         internal static bool  _applyGroundwork     = true;   // bake location terrain modifiers into the baseline
+        // Shared global corridor graph (LocationVoronoi). When on, canal/sewer routing pulls paths from ONE global
+        // annotated Voronoi graph instead of rebuilding a windowed Delaunay per seed. EXPERIMENTAL, default off —
+        // when off, routing is byte-for-byte the legacy windowed CanalRouter.Route path.
+        internal static bool  _corridorGraph       = false;
+        internal static float _corridorSteiner     = 0f;     // Steiner lattice spacing (0 = pure location Voronoi)
+        internal static float _corridorClearance   = 0f;     // prune Steiner within (loc.extR + this) of any location → ≥this/2 corridor clearance
         internal static bool  _flatPlaneLocations  = true;
         internal static bool  _islandRemoval       = true;
         internal static bool  _pocketRemoval       = true;
@@ -1333,6 +1353,193 @@ namespace ProceduralTerrain
                     Log.LogInfo(msg); Console.instance?.Print(msg);
                 }
                 catch (Exception e) { Log.LogError($"[PT] canalmap exception: {e}"); }
+            });
+            new Terminal.ConsoleCommand("pt_voronoi", "pt_voronoi [radius] [steinerSpacing] [clearance] — build the location Voronoi corridor graph for a window, render it with the COASTLINE overlaid. With steinerSpacing>0, overlay a jittered background lattice at that spacing and triangulate the union; edges that touch a Steiner point (the densified fill) draw in a DISTINCT color. clearance>0 prunes Steiner points within (loc.extR + clearance) of any location, guaranteeing ≥clearance/2 margin on orange edges. select=1 overlays the selected corridor network (length-weighted MST; only fully-at-sea edges excluded, so coastal exits are kept) in magenta. atriumMerge (arg6) clusters merge-junctions within that radius into cyan atrium sites (dome candidates); defaults to 0.6×steiner. -> BepInEx/config/ProceduralTerrain/pt_voronoi.png", args =>
+            {
+                try
+                {
+                    var player = Player.m_localPlayer; var wg = WorldGenerator.instance;
+                    if (player == null || wg == null) { Log.LogWarning("[PT] voronoi: no player/worldgen."); return; }
+                    var pp = player.transform.position;
+                    float cx = pp.x, cz = pp.z, range = 2000f;
+                    if (args.Length >= 2 && float.TryParse(args[1], out float r)) range = r;
+                    // default to the LIVE cfg values so the viz reflects the graph generation actually uses; args override
+                    float steiner = _corridorSteiner;
+                    if (args.Length >= 3 && float.TryParse(args[2], out float st)) steiner = st;
+                    float clearance = _corridorClearance;   // prune Steiner within (loc.r + clearance) of any location → ≥ clearance/2 margin
+                    if (args.Length >= 4 && float.TryParse(args[3], out float cl)) clearance = cl;
+                    bool select = args.Length >= 5 && (args[4] == "1" || args[4].ToLowerInvariant() == "true");   // overlay the selected corridor network (MST)
+                    float atriumMerge = steiner > 0f ? steiner * 0.6f : 300f;   // merge junctions within this radius into one atrium site
+                    if (args.Length >= 6 && float.TryParse(args[5], out float am)) atriumMerge = am;
+
+                    // Build (or reuse cached) the GLOBAL annotated corridor graph via the shared service — the same
+                    // asset live generation consumes. The window `range` only crops the render; the graph is global.
+                    var sw = System.Diagnostics.Stopwatch.StartNew();
+                    var g = LocationVoronoi.Get(steiner, clearance);
+                    sw.Stop();
+                    if (g == null) { Log.LogWarning("[PT] voronoi: locations not ready (need ≥3). Explore/generate first."); return; }
+                    var verts = g.Verts; var edges = g.Edges;
+                    int nLoc = _locationPositions.Count;
+
+                    int res = 900; float step = range * 2f / res;
+                    var px = new Color[res * res]; for (int i = 0; i < px.Length; i++) px[i] = Color.white;
+                    int PX(float wx) => Mathf.RoundToInt((wx - (cx - range)) / step);
+                    int PZ(float wz) => Mathf.RoundToInt(((cz + range) - wz) / step);
+                    // COASTLINE: ocean mask per pixel, then draw where ocean meets land (4-neighbour transition).
+                    var ocean = new bool[res * res];
+                    for (int yy = 0; yy < res; yy++)
+                    for (int xx = 0; xx < res; xx++)
+                    {
+                        float wx = cx - range + xx * step, wz = (cz + range) - yy * step;
+                        ocean[yy * res + xx] = wg.GetBiome(wx, wz) == Heightmap.Biome.Ocean;
+                    }
+                    var coastCol = new Color(0.1f, 0.5f, 0.55f);
+                    for (int yy = 0; yy < res; yy++)
+                    for (int xx = 0; xx < res; xx++)
+                    {
+                        bool o = ocean[yy * res + xx];
+                        bool edge = (xx + 1 < res && ocean[yy * res + xx + 1] != o) || (yy + 1 < res && ocean[(yy + 1) * res + xx] != o);
+                        if (edge) px[yy * res + xx] = coastCol;
+                        else if (o) px[yy * res + xx] = new Color(0.88f, 0.94f, 0.97f);   // faint ocean tint
+                    }
+                    void Dot(int x, int y, float rad, Color c) { int ri = Mathf.CeilToInt(rad); for (int b = -ri; b <= ri; b++) for (int a = -ri; a <= ri; a++) if (a * a + b * b <= rad * rad) { int xx = x + a, yy = y + b; if (xx >= 0 && yy >= 0 && xx < res && yy < res) px[yy * res + xx] = c; } }
+                    void Line(float x0, float y0, float x1, float y1, Color c) { float len = Mathf.Sqrt((x1 - x0) * (x1 - x0) + (y1 - y0) * (y1 - y0)); int n = (int)len + 1; for (int i = 0; i <= n; i++) { float t = (float)i / n; int xx = (int)(x0 + (x1 - x0) * t), yy = (int)(y0 + (y1 - y0) * t); if (xx >= 0 && yy >= 0 && xx < res && yy < res) px[yy * res + xx] = c; } }
+                    var edgeCol = new Color(0.0f, 0.45f, 0.85f);        // location↔location (original)
+                    var steinerCol = new Color(0.95f, 0.55f, 0.0f);     // touches a Steiner point (added by densification)
+                    int added = 0;
+                    for (int i = 0; i < edges.Length; i++)
+                    {
+                        var e = edges[i];
+                        if (e.Steiner) added++;
+                        Line(PX(verts[e.A].x), PZ(verts[e.A].y), PX(verts[e.B].x), PZ(verts[e.B].y), e.Steiner ? steinerCol : edgeCol);
+                    }
+                    // real locations in red (drawn from the location set directly; graph verts are Voronoi vertices)
+                    foreach (var loc in _locationPositions)
+                    {
+                        if ((loc.pos.x - cx) * (loc.pos.x - cx) + (loc.pos.y - cz) * (loc.pos.y - cz) >= range * range) continue;
+                        Dot(PX(loc.pos.x), PZ(loc.pos.y), Math.Max(1.5f, Math.Max(loc.extR, LocProtectR) / step), new Color(0.82f, 0.2f, 0.2f));
+                    }
+
+                    // MERGE JUNCTIONS: Voronoi vertices where ≥3 corridor edges meet — the atrium-dome candidate sites.
+                    var deg = new int[verts.Length];
+                    foreach (var e in edges) { deg[e.A]++; deg[e.B]++; }
+                    int junctions = 0;
+                    var juncCol = new Color(0.15f, 0.7f, 0.2f);
+                    for (int i = 0; i < verts.Length; i++)
+                    {
+                        if (deg[i] < 3) continue;
+                        float vx = verts[i].x, vz = verts[i].y;
+                        if ((vx - cx) * (vx - cx) + (vz - cz) * (vz - cz) >= range * range) continue;   // only count junctions inside the viewport
+                        junctions++;
+                        Dot(PX(vx), PZ(vz), 2.6f, juncCol);
+                    }
+
+                    // CORRIDOR SELECTION: minimum spanning tree over the graph (via the shared service). Fully-at-sea
+                    // edges are dropped so the network stays inland but keeps land↔ocean coastal exits; forest across
+                    // disjoint land masses.
+                    int selEdges = 0; float selLen = 0f;
+                    if (select)
+                    {
+                        var mst = LocationVoronoi.BuildMST(g, excludeOcean: true);
+                        var selCol = new Color(0.65f, 0.0f, 0.55f);
+                        foreach (int i in mst)
+                        {
+                            var e = edges[i]; selEdges++; selLen += e.Length;
+                            float x0 = PX(verts[e.A].x), y0 = PZ(verts[e.A].y), x1 = PX(verts[e.B].x), y1 = PZ(verts[e.B].y);
+                            Line(x0, y0, x1, y1, selCol); Line(x0 + 1, y0, x1 + 1, y1, selCol); Line(x0, y0 + 1, x1, y1 + 1, selCol);
+                        }
+                    }
+
+                    // CORRIDOR NETWORK: the actual canals (coast mouths routed inland + unioned) and their junction
+                    // atriums — the same object the carve consumes. Canals drawn BLACK, atriums as cyan rings.
+                    var net = LocationVoronoi.GetNetwork(steiner, clearance, 0.6f, atriumMerge, 28f + Math.Max(clearance, 20f), 18f, 30f, 600f, (int)Heightmap.Biome.Plains);
+                    int atriumsShown = 0, canalsShown = 0;
+                    var atriumCol = new Color(0.0f, 0.75f, 0.85f);
+                    void Ring(int x, int y, float rad, Color c) { int ri = Mathf.CeilToInt(rad); float r0 = (rad - 1.3f) * (rad - 1.3f), r1 = rad * rad; for (int b = -ri; b <= ri; b++) for (int a = -ri; a <= ri; a++) { int d = a * a + b * b; if (d < r0 || d > r1) continue; int xx = x + a, yy = y + b; if (xx >= 0 && yy >= 0 && xx < res && yy < res) px[yy * res + xx] = c; } }
+                    if (net != null)
+                    {
+                        var canalCol = new Color(0f, 0f, 0f);
+                        foreach (var poly in net.Canals)
+                        {
+                            bool any = false;
+                            for (int i = 0; i < poly.Length - 1; i++)
+                            {
+                                float ax = poly[i].x, az = poly[i].z, bx = poly[i + 1].x, bz = poly[i + 1].z;
+                                if ((ax - cx) * (ax - cx) + (az - cz) * (az - cz) >= range * range && (bx - cx) * (bx - cx) + (bz - cz) * (bz - cz) >= range * range) continue;
+                                Line(PX(ax), PZ(az), PX(bx), PZ(bz), canalCol); any = true;
+                            }
+                            if (any) canalsShown++;
+                        }
+                        foreach (var atr in net.Atriums)
+                        {
+                            var apos = atr.Pos;
+                            if ((apos.x - cx) * (apos.x - cx) + (apos.y - cz) * (apos.y - cz) >= range * range) continue;
+                            atriumsShown++;
+                            Ring(PX(apos.x), PZ(apos.y), Mathf.Clamp(3f + atr.Conv, 4f, 10f), atriumCol);
+                        }
+                    }
+
+                    var tex = new Texture2D(res, res, TextureFormat.RGBA32, false); tex.SetPixels(px); tex.Apply();
+                    string dir = System.IO.Path.GetDirectoryName(ConfigPath)!;
+                    System.IO.File.WriteAllBytes(System.IO.Path.Combine(dir, "pt_voronoi.png"), tex.EncodeToPNG());
+                    UnityEngine.Object.Destroy(tex);
+                    var clrNote = clearance > 0f ? $", ≥{clearance * 0.5f:F0}m clearance" : "";
+                    var selNote = select ? $", corridor MST {selEdges} edges / {selLen:F0}m (magenta)" : "";
+                    var msg = $"[PT] voronoi (global graph): {nLoc} locs (spacing {steiner:F0}{clrNote}) → {verts.Length} verts / {edges.Length} edges ({added} steiner-touching), {junctions} junctions (green), {canalsShown} network canals (black), {atriumsShown} atriums (cyan, merge {atriumMerge:F0}m){selNote}, built/cached in {sw.Elapsed.TotalMilliseconds:F0}ms (render window {range * 2f:F0}m) → {dir}\\pt_voronoi.png";
+                    Log.LogInfo(msg); Console.instance?.Print(msg);
+                }
+                catch (Exception e) { Log.LogError($"[PT] voronoi: {e}"); }
+            });
+            new Terminal.ConsoleCommand("pt_atriums", "pt_atriums [radius] [mergeRadius] — list the nearest atrium (merge-junction) world coords + surface height using the live corridorGraph cfg, so you can navigate to one. Prints a map ping for the nearest.", args =>
+            {
+                try
+                {
+                    var player = Player.m_localPlayer; var wg = WorldGenerator.instance;
+                    if (player == null || wg == null) { Log.LogWarning("[PT] atriums: no player/worldgen."); return; }
+                    float range = 4000f; if (args.Length >= 2 && float.TryParse(args[1], out float r)) range = r;
+                    float merge = 300f;  if (args.Length >= 3 && float.TryParse(args[2], out float mg)) merge = mg;
+                    float minClr = 28f + Math.Max(_corridorClearance, 20f);   // matches the sewer carve's dome clearance
+                    var net = LocationVoronoi.GetNetwork(_corridorSteiner, _corridorClearance, 0.6f, merge, minClr, 18f, 30f, 600f, (int)Heightmap.Biome.Plains);
+                    if (net == null) { Log.LogWarning("[PT] atriums: locations not ready (explore/generate first)."); return; }
+                    var sites = new List<LocationVoronoi.Atrium>(net.Atriums);
+                    var pp2 = new Vector2(player.transform.position.x, player.transform.position.z);
+                    sites.Sort((a, b) => (a.Pos - pp2).sqrMagnitude.CompareTo((b.Pos - pp2).sqrMagnitude));
+                    var sb = new System.Text.StringBuilder(); int shown = 0;
+                    foreach (var atr in sites)
+                    {
+                        var apos = atr.Pos;
+                        float d = Vector2.Distance(apos, pp2); if (d > range) break;
+                        float sh = ComposedSurfaceSample(apos.x, apos.y, wg);
+                        sb.AppendLine($"  ({apos.x:F0}, {apos.y:F0})  surfH={sh:F0}  conv={atr.Conv}  links={atr.Links?.Length ?? 0}  dist={d:F0}m");
+                        if (++shown >= 15) break;
+                    }
+                    var msg = $"[PT] {shown} nearest atriums (merge {merge:F0}, within {range:F0}m):\n{sb}  NETWORK FUNNEL: {LocationVoronoi._netBuildStats}";
+                    Log.LogInfo(msg); Console.instance?.Print(msg);
+                }
+                catch (Exception e) { Log.LogError($"[PT] atriums: {e}"); }
+            });
+            new Terminal.ConsoleCommand("pt_gotoatrium", "pt_gotoatrium [n] — teleport to the Nth-nearest atrium the carve ACTUALLY emitted (default 1). These are recorded as zones generate, so explore some plains first if none are found.", args =>
+            {
+                try
+                {
+                    var player = Player.m_localPlayer; var wg = WorldGenerator.instance;
+                    if (player == null || wg == null) { Log.LogWarning("[PT] gotoatrium: no player/worldgen."); return; }
+                    int n = 1; if (args.Length >= 2 && int.TryParse(args[1], out int ni)) n = Math.Max(1, ni);
+                    // Use the SERVICE network atriums (global, all of them) — the carve's own source, so teleporting
+                    // generates the dome on arrival. (The carved-so-far list only held zones you'd already visited.)
+                    var net = LocationVoronoi.GetNetwork(_corridorSteiner, _corridorClearance, 0.6f, 300f, 28f + Math.Max(_corridorClearance, 20f), 18f, 30f, 600f, (int)Heightmap.Biome.Plains);
+                    if (net == null || net.Atriums.Count == 0) { Log.LogWarning("[PT] gotoatrium: no atriums (locations not ready, or network empty)."); return; }
+                    var pp = player.transform.position; var pp2 = new Vector2(pp.x, pp.z);
+                    var sorted = new List<LocationVoronoi.Atrium>(net.Atriums);
+                    sorted.Sort((a, b) => (a.Pos - pp2).sqrMagnitude.CompareTo((b.Pos - pp2).sqrMagnitude));
+                    var pick = sorted[Math.Min(n - 1, sorted.Count - 1)].Pos;
+                    float sh = ComposedSurfaceSample(pick.x, pick.y, wg);   // composed surface so we land ON the raised plains, not ~26m under it
+                    var dest = new Vector3(pick.x, sh + 3f, pick.y);
+                    player.TeleportTo(dest, player.transform.rotation, true);
+                    var msg = $"[PT] teleporting to atrium #{n}/{net.Atriums.Count} at ({pick.x:F0}, {pick.y:F0}) surfH={sh:F0}, dist={Vector2.Distance(pick, pp2):F0}m. Look for the breach pit / dig down.";
+                    Log.LogInfo(msg); Console.instance?.Print(msg);
+                }
+                catch (Exception e) { Log.LogError($"[PT] gotoatrium: {e}"); }
             });
             new Terminal.ConsoleCommand("pt_dumplocs", "pt_dumplocs [radius] — write location sites (worldX,worldZ,protectRadius CSV) around the player to BepInEx/config/ProceduralTerrain/pt_locs.csv (for offline canal-path prototyping)", args =>
             {
