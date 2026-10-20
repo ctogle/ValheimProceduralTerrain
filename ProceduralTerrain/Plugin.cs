@@ -625,6 +625,11 @@ namespace ProceduralTerrain
             ("stratataperfreq", 0.03f),              // XZ scale of the flare-in/flare-out regions
             ("stratatilt", 0f),                      // slab TILT: a slow XZ noise warps the floor heights so slabs cant at varied angles per region (no discontinuities). metres of warp amplitude. keep < ~period/2
             ("stratatiltfreq", 0.01f),               // XZ scale of the tilt regions (low = broad regional cant)
+            ("stratadrift", 0f),                     // skylight DRIFT: m of XZ wander the shaft centre picks up as it climbs (Y-varying noise) → leaning/meandering shafts instead of perfectly vertical cutouts. 0 = straight
+            ("stratadriftfreq", 0.02f),              // scale of the drift noise (low = long slow leans; high = jittery)
+            ("stratapillar", 0f),                    // internal SUPPORT COLUMNS: m of solid forced through the gaps where the pillar noise fires → ties floating floor slabs down to the grounded mass (vs isoform blobs, which breach the surface = teeth). 0 = off. Stays under the roof cap → no surface teeth
+            ("stratapillarfreq", 0.04f),             // XZ frequency of the support columns (lower = fewer, wider-spaced pillars)
+            ("stratapillarthresh", 0.5f),            // noise threshold a column must exceed to be a pillar (higher = fewer/thinner pillars)
         };
         protected override (string name, float def)[] ParamSpec => _spec;
 
@@ -647,6 +652,8 @@ namespace ProceduralTerrain
             float strataHoleFreq = P[18][idx], strataHoleThresh = P[19][idx];
             float strataTaper = P[20][idx], strataTaperFreq = P[21][idx];
             float strataTilt = P[22][idx], strataTiltFreq = P[23][idx];
+            float strataDrift = P[24][idx], strataDriftFreq = P[25][idx];
+            float strataPillar = P[26][idx], strataPillarFreq = P[27][idx], strataPillarThresh = P[28][idx];
 
             var pool = Plugin._noisePool!;
             var wg   = args.wg ?? WorldGenerator.instance;
@@ -668,6 +675,11 @@ namespace ProceduralTerrain
             float holeN = strataPeriod > 0f ? pool[9].GetNoise(wx * strataHoleFreq, 0f, wz * strataHoleFreq) : -1f;
             float taperN = (strataPeriod > 0f && strataTaper > 0f) ? pool[8].GetNoise(wx * strataTaperFreq, 0f, wz * strataTaperFreq) : 0f;   // slow XZ → per-region flare in/out
             float tiltField = (strataPeriod > 0f && strataTilt > 0f) ? strataTilt * pool[11].GetNoise(wx * strataTiltFreq, 0f, wz * strataTiltFreq) : 0f;   // slow XZ height-warp → slabs cant per region
+            // internal support columns: metres of solid forced through the gaps wherever the pillar noise clears the
+            // threshold → a vertical column, constant in XZ (same for every floor), tying the slabs to grounded rock.
+            float pillarSolid = (strataPeriod > 0f && strataPillar > 0f)
+                ? (pool[14].GetNoise(wx * strataPillarFreq, 0f, wz * strataPillarFreq) - strataPillarThresh) * strataPillar
+                : -1f;   // >0 = inside a pillar (metres); <0 = no pillar here
             // breach allowance uses the MOST-permissive threshold so flare-out mouths can still reach the surface
             bool  canBreach = strataPeriod > 0f && holeN > (strataHoleThresh - Mathf.Max(0f, strataTaper));
             float effBandHi = (canBreach && haveSurf) ? surfH + 2f : bandHi;   // hole columns breach the roof to daylight
@@ -698,15 +710,33 @@ namespace ProceduralTerrain
                     float dGap = (gc - Mathf.Abs(ph - gc)) * strataPeriod;                        // triangle SDF: + in the gap (air), − in the floor slab
                     float sdf  = haveSurf ? Mathf.Min(dGap, Mathf.Min(wy - bandLo, bandHi - wy))  // confine floors to the band (smooth edge, no sentinel)
                                           : dGap;
-                    // skylight shaft: hole columns are air gallery→surface; near the top the threshold shifts by the
-                    // taper noise so some mouths flare, some pinch.
-                    float eth = strataHoleThresh;
-                    if (strataTaper > 0f && haveSurf)
+                    // SUPPORT COLUMN: force solid (sdf≤−pillarSolid) through the gaps in pillar columns → ties floating
+                    // slabs to grounded rock. Applied BEFORE the shaft block so a coincident skylight still carves through.
+                    if (pillarSolid > 0f) sdf = Mathf.Min(sdf, -pillarSolid);
+                    // skylight shaft: hole columns are air gallery→surface. Only matters above the gallery band
+                    // (below that the gap/floor confinement dominates), so do the extra work only up there.
+                    if (haveSurf && wy > bandHi - strataPeriod)
                     {
-                        float rampLo = bandHi - strataPeriod;
-                        if (wy > rampLo) eth -= taperN * strataTaper * Mathf.Clamp01((wy - rampLo) / Mathf.Max(effBandHi - rampLo, 0.001f));
+                        // DRIFT: wander the shaft centre in XZ as it climbs (Y-varying noise) → leaning/meandering
+                        // shafts, not perfectly vertical cutouts. Re-sample the hole field at the drifted point.
+                        float hN = holeN;
+                        if (strataDrift > 0f)
+                        {
+                            float dx = strataDrift * pool[12].GetNoise(wx * strataDriftFreq, wy * strataDriftFreq, wz * strataDriftFreq);
+                            float dz = strataDrift * pool[13].GetNoise(wx * strataDriftFreq, wy * strataDriftFreq, wz * strataDriftFreq);
+                            hN = pool[9].GetNoise((wx + dx) * strataHoleFreq, 0f, (wz + dz) * strataHoleFreq);
+                        }
+                        // TAPER: shift the hole threshold with height over the WHOLE shaft (not a thin top cap) so the
+                        // flare/pinch is visible as a gradient. taperN>0 regions flare out (eth drops → mouth widens),
+                        // taperN<0 pinch in. Breach is driven purely by this per-height test → self-limiting, no roof pock.
+                        float eth = strataHoleThresh;
+                        if (strataTaper > 0f)
+                        {
+                            float rampLo = bandHi - strataPeriod;                       // start at the gallery roof
+                            eth -= taperN * strataTaper * Mathf.Clamp01((wy - rampLo) / Mathf.Max(surfH + 2f - rampLo, 0.001f));
+                        }
+                        if (hN > eth) sdf = Mathf.Max(sdf, Mathf.Min(wy - bandLo, (surfH + 2f) - wy));
                     }
-                    if (holeN > eth && haveSurf) sdf = Mathf.Max(sdf, Mathf.Min(wy - bandLo, (surfH + 2f) - wy));
                     sdf = Mathf.Min(sdf, wy - altLo);                                             // solid below the sewer-floor cap
                     if (altHi < 9000f) sdf = Mathf.Min(sdf, altHi - wy);                          // optional hard top cap
                     outCol[baseIdx + cy] = sdf * 4f * s;
