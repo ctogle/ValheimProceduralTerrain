@@ -1556,13 +1556,17 @@ namespace ProceduralTerrain
                             // tube walls) whose normals point every which way. If going straight UP from the seed hits
                             // solid within 40m, it's enclosed → skip. Keeps seeds on the open mountainside (N outward,
                             // −N into the rock) so tunnels are predictable.
-                            if (!tile && skyOpen > 0.5f)   // field-based sky-open test; skyopen=0 lets internal surfaces (cave ceilings) seed
+                            // skyopen: >0.5 = sky-exposed OUTER surfaces only; <−0.5 = strictly INTERNAL (reject
+                            // anything open to sky); in between (0) = either. The internal-only case is the real
+                            // "not open sky" we wanted for cave ledges without the hillside teeth.
+                            if (!tile && (skyOpen > 0.5f || skyOpen < -0.5f))
                             {
                                 bool openAbove = true;
                                 float upTop = Mathf.Min(wyHi, ctr.y + 40f);
                                 for (float uy = ctr.y + 2f; uy <= upTop; uy += 4f)
                                     if (SampleD(ctr.x, uy, ctr.z) < 0f) { openAbove = false; break; }
-                                if (!openAbove) continue;
+                                if (skyOpen > 0.5f && !openAbove) continue;   // sky-only: drop enclosed
+                                if (skyOpen < -0.5f && openAbove) continue;   // internal-only: drop sky-exposed
                             }
                             // Tile seeds are 2D (one per li,lj, processed at this zone's lk0 which VARIES per zone),
                             // so any hash keyed on lk would differ between zones → the same seed gets accepted/sized

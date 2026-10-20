@@ -446,7 +446,7 @@ namespace ProceduralTerrain
             ("chaintile",   0f),  // >0: generate the whole chain from the GLOBAL ground surface (not this zone's field) so tunnels TILE across zones = run their full length; Y follows ground − keepdepth
             ("chainslope",  0f),  // target downward drift the walk levels toward (0 = flatten to horizontal; 0.1 = gentle descent into the mountain)
             ("biomemajority",0f), // >0: only seed where THIS mode's biome is the dominant biome at the point (global GetBiome gate) AND use a CONSTANT radius (no biome-blend fade) → features stay full-size inside their biome and cut off at the edge
-            ("skyopen",     1f),  // 1 = only seed on sky-exposed OUTER surfaces (default); 0 = allow INTERNAL surfaces (cave ceilings/walls) → stalactites etc.
+            ("skyopen",     1f),  // 1 = sky-exposed OUTER surfaces only (default); 0 = either; -1 = strictly INTERNAL (reject anything open to sky) → cave ledges without hillside teeth
             ("concaveratio",0f),  // >0: place only on anisotropic CONCAVE surfaces (|min curvature| >= ratio*|max|, concave) — the inverse of ridgeratio; for stalactites on tube/cave undersides
             ("chainhorizontal",0f), // >0: launch the chain HORIZONTALLY (flatten dir.y) regardless of surface normal — for flat biomes (Plains) where −N points straight down and would dive. Mountains leave 0.
             ("forestlo", -10000f),  // keep a stamp only where the vanilla WorldGenerator.GetForestFactor >= forestlo ...
@@ -705,7 +705,7 @@ namespace ProceduralTerrain
                     // everywhere. The coarse-Y upsample then interpolates a clean crossing (no hard -1e4/gate jumps
                     // to pin the surface to the coarse grid) → the Y-terracing is gone.
                     float wob = strataWobble != 0f ? strataWobble * pool[10].GetNoise(wx * strataHoleFreq, 0f, wz * strataHoleFreq) : 0f;
-                    float ph  = (wy + wob - tiltField) / strataPeriod; ph -= Mathf.Floor(ph);   // tiltField warps floor heights per region → canted slabs                 // 0..1 within a period
+                    float ph  = (wy + wob - tiltField) / strataPeriod; ph -= Mathf.Floor(ph);   // tiltField = regional cant                // 0..1 within a period
                     float gc  = Mathf.Clamp01(strataGap) * 0.5f;
                     float dGap = (gc - Mathf.Abs(ph - gc)) * strataPeriod;                        // triangle SDF: + in the gap (air), − in the floor slab
                     float sdf  = haveSurf ? Mathf.Min(dGap, Mathf.Min(wy - bandLo, bandHi - wy))  // confine floors to the band (smooth edge, no sentinel)
