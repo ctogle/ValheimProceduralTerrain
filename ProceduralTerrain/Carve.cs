@@ -2323,6 +2323,14 @@ namespace ProceduralTerrain
                     var aux = _cb.bkModeAux![mi][0];
                     string blend = mode.Blend;
                     float k = mode.BlendK * scale2;
+                    // Anti-alias the coarse-Y compose: instead of POINT-sampling the mode's full-Y
+                    // output every cvY levels (which undersamples near-Nyquist periodic relief like the
+                    // strata floors → terraces that scale with cvY), BOX-AVERAGE the mode's full-Y output
+                    // over the half-cell window this coarse level reconstructs. A mean is an unbiased
+                    // low-pass: it smooths the floor crossings without favouring air (max) or solid (min),
+                    // so the strata thin out evenly instead of collapsing. Narrow window (±cvY/2 ≈ 1m at
+                    // cvY=2) only touches sub-grid detail; the 9m strata period is preserved.
+                    int halfWin = cvY > 1 ? cvY >> 1 : 0;
                     for (int cell = 0; cell < cellCount; cell++)
                     {
                         if (_cb.bkModeParams![mi][0][cell] <= 0f) continue;   // mode inactive here
@@ -2333,6 +2341,13 @@ namespace ProceduralTerrain
                             int cyf = Math.Min(cyc * cvY, bh - 1);
                             float worldY = extLoS2 + cyc * yStep;
                             float raw = aux[cbaseF + cyf] * scale2;
+                            if (halfWin > 0)
+                            {
+                                int wlo = Math.Max(0, cyf - halfWin), whi = Math.Min(bh - 1, cyf + halfWin);
+                                float sum = 0f; int n = 0;
+                                for (int wy = wlo; wy <= whi; wy++) { sum += aux[cbaseF + wy]; n++; }
+                                raw = (sum / n) * scale2;
+                            }
                             float sdf = Mathf.Min(raw, worldY - floorY);
                             ref float r = ref _runSDF![cbaseC + cyc];
                             switch (blend)
