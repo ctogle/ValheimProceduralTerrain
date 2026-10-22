@@ -46,6 +46,35 @@ namespace ProceduralTerrain
         }
     }
 
+    // Inert decor: strip the components that make a prop remove or transform itself (building-ivy WearNTear
+    // collapse, Plant grow/wither, Pickable harvest) so it persists as static decoration. Flagged per-instance via
+    // a ZDO int and re-applied on EVERY load (the prefab respawns fresh with those components each session).
+    [HarmonyPatch(typeof(ZNetView), "Awake")]
+    static class InertDecorPatch
+    {
+        internal static readonly int Key = StringExtensionMethods.GetStableHashCode("PT_inert");
+        static int _logged;
+        static void Postfix(ZNetView __instance)
+        {
+            var zdo = __instance.GetZDO(); if (zdo == null) return;
+            if (zdo.GetInt(Key, 0) == 0) return;                 // cheap: one int read for non-inert objects
+            StripInertComponents(__instance.gameObject, ref _logged);
+        }
+        internal static void StripInertComponents(GameObject go, ref int logged)
+        {
+            foreach (var mb in go.GetComponentsInChildren<MonoBehaviour>(true))
+            {
+                if (mb == null) continue;
+                string n = mb.GetType().Name;
+                if (n == "WearNTear" || n == "Plant" || n == "TreeBase" || n == "Pickable" || n == "Vine" || n == "TimedDestruction")
+                {
+                    if (logged < 30) { logged++; Plugin.Log.LogInfo($"[PT-cave] inert: stripped {n} from {go.name}"); }
+                    UnityEngine.Object.Destroy(mb);
+                }
+            }
+        }
+    }
+
     // Rung 2 POC (hardcoded, not cfg-driven yet): spawn ADDITIONAL ore/rocks in Mountain caverns, on top of
     // vanilla (we never touch vanilla's own spawns). Runs as a postfix on ZoneSystem.PlaceVegetation, so the
     // SpawnZone gate has already made surfH/_sdfCache ready. One-shot per zone (generate block), server-side,
@@ -131,12 +160,53 @@ namespace ProceduralTerrain
             for (int j = 0; j < channels.Count; j++) chanOn[j] = channels[j].ZoneChance >= 1f || CCRand(ox, oz, j, 6) < channels[j].ZoneChance;
             int objPlaced = 0, spwPlaced = 0, width = e.width;
 
+            // Atrium gate: if any active rule confines to atriums, gather the carved-atrium centres near THIS zone
+            // once (the carve records every emitted dome; this zone's own dome, if any, was just carved). Small list
+            // → cheap per-column distance test below.
+            float maxAtriumGate = 0f;
+            foreach (var p in objPool)  if (p.AtriumOnly > maxAtriumGate) maxAtriumGate = p.AtriumOnly;
+            foreach (var p in spwPool)  if (p.AtriumOnly > maxAtriumGate) maxAtriumGate = p.AtriumOnly;
+            foreach (var p in channels) if (p.AtriumOnly > maxAtriumGate) maxAtriumGate = p.AtriumOnly;
+            List<Vector3>? nearAtriums = null;
+            if (maxAtriumGate > 0f)
+            {
+                nearAtriums = new List<Vector3>();
+                float filt = maxAtriumGate + 96f, f2 = filt * filt;
+                foreach (var a in Plugin.SnapshotCarvedAtriums())
+                { float dx = a.x - zoneCenterPos.x, dz = a.z - zoneCenterPos.z; if (dx * dx + dz * dz <= f2) nearAtriums.Add(a); }
+            }
+
+            // Light field (0..1 per column): fade decoration out of the dark toward sky-openings. Built once per zone.
+            float maxLightRange = 0f;
+            foreach (var p in objPool)  if (p.LightRange > maxLightRange) maxLightRange = p.LightRange;
+            foreach (var p in spwPool)  if (p.LightRange > maxLightRange) maxLightRange = p.LightRange;
+            foreach (var p in channels) if (p.LightRange > maxLightRange) maxLightRange = p.LightRange;
+            float[]? light = maxLightRange > 0f ? ComputeLightField(e, width, s, maxLightRange, nearAtriums ?? Plugin.SnapshotCarvedAtriums(), ox, oz) : null;
+
             // place one rule at a crossing, honoring its cap + spacing + flatness; returns true if placed.
             bool TryPlace(Placement p, int ix, int iz, int ci, bool isFloor, bool isSurface, float cyY, float worldX, float worldZ, float yaw)
             {
                 if (isSurface && !p.Surface) return false;   // only surface-opted rules place at the top crossing
-                if (cyY < p.MinY) return false;              // world-Y floor (e.g. above sea level → raised hammocks only)
+                if (p.Hang && (isFloor || isSurface)) return false;   // hanging props need a ceiling crossing (air below, solid above)
+                if (cyY < p.MinY || cyY > p.MaxY) return false;   // world-Y band (e.g. sewer level only, below the strata galleries)
+                if (p.ClusterFreq > 0f && Plugin._noisePool != null)  // patchy spatial structure: only place where the noise field clears the threshold
+                {
+                    float cn = Plugin._noisePool[1].GetNoise(worldX * p.ClusterFreq, 0f, worldZ * p.ClusterFreq);
+                    if (cn < p.ClusterThresh) return false;
+                }
+                if (p.LightRange > 0f && light != null)   // fade out of the dark: keep ∝ proximity to a sky-opening
+                {
+                    float lf = light[ix * width + iz];
+                    if (lf <= 0f || CCRand(ox + ix, oz + iz, ci, 53) >= lf) return false;
+                }
                 if (p.BiomePure > 0f && wg.GetBiomeArea(new Vector3(worldX, 0f, worldZ)) == Heightmap.BiomeArea.Edge) return false;  // interior only, off the boundary
+                if (p.AtriumOnly > 0f)   // confine to atrium rooms: within AtriumOnly metres (XZ) of a carved dome centre
+                {
+                    if (nearAtriums == null || nearAtriums.Count == 0) return false;
+                    float r2 = p.AtriumOnly * p.AtriumOnly; bool near = false;
+                    foreach (var a in nearAtriums) { float dx = a.x - worldX, dz = a.z - worldZ; if (dx * dx + dz * dz <= r2) { near = true; break; } }
+                    if (!near) return false;
+                }
                 int cap = p.Cap < 0 ? int.MaxValue : p.Cap;
                 var ps = S(p); if (ps.count >= cap) return false;
                 if (p.FloorOnly && !isFloor) return false;
@@ -167,12 +237,62 @@ namespace ProceduralTerrain
                 // orientation: spawners/upright = world-up + yaw; floor objects tilt to the floor normal (any
                 // orientation). Embed sinks ALONG that same normal (below), so a tilted prop buries its base into
                 // the slope instead of floating — straight-down embed only works on flat ground.
-                Vector3 fnormal = (isFloor && p.Kind == PlacementKind.Object && !p.Upright)
-                                  ? CaveFloorNormal(e, ix, iz, width, cyY, s) : Vector3.up;
-                if (p.Kind == PlacementKind.Spawner || p.Upright) rot = Quaternion.Euler(0f, yaw, 0f);
-                else if (isFloor) rot = Quaternion.FromToRotation(Vector3.up, fnormal) * Quaternion.Euler(0f, yaw, 0f);
-                else rot = Quaternion.Euler(0f, yaw, 0f);
-                if (p.Embed > 0f) pos = anchor - fnormal * p.Embed;   // sink along the surface normal → tilted props bury their base
+                // Surface normal for THIS crossing: floor → up-ish, ceiling → down-ish, surface/top → world up.
+                // Used for both orientation and embed, so a rule works on floor AND ceiling crossings (no hang needed).
+                Vector3 surfN = isSurface ? Vector3.up
+                              : isFloor   ? CaveFloorNormal(e, ix, iz, width, cyY, s)
+                              :             CaveCeilingNormal(e, ix, iz, width, cyY, s);
+                // Orientation modes (all with a live rotx/y/z offset applied last to correct a model's axis):
+                //   NoAlign / spawner / upright → identity + yaw (+offset)
+                //   FaceNormal                  → align +Z (forward) to the surface normal (flat decals/ivy); yaw rolls about it.
+                //     Uses FromToRotation (minimal rotation) NOT LookRotation — LookRotation is degenerate when the
+                //     normal points straight down (ceiling) and produced the garbage roll.
+                //   default (hang or floor)     → align +Y (up) to the surface normal (standing/hanging props)
+                Quaternion offset = Quaternion.Euler(p.RotX, p.RotY, p.RotZ);
+                Vector3 embedN = Vector3.up;
+                if (p.NoAlign || p.Kind == PlacementKind.Spawner || p.Upright)
+                    rot = Quaternion.Euler(0f, yaw, 0f) * offset;
+                else if (p.FaceNormal)
+                {
+                    // TRUE normal from the density gradient (accurate on walls/overhangs, not just floors/ceilings).
+                    // Build a FULL deterministic frame like the blob stamps (NOT a single-axis align + random roll,
+                    // which spun flat ivy randomly): face (+Z) along -N so the ivy's -Z face points OUT along the
+                    // normal, and the ivy's up (+Y) along world-up projected onto the surface plane → ivy stands
+                    // "upright" on walls and lies flat on floors/ceilings with a consistent orientation.
+                    int cyAbs = Mathf.RoundToInt(cyY / s) - e.extLo;
+                    Vector3 gn = GradientNormalSnap(e, ix, iz, cyAbs, width, out float distVox, out float gmag);
+                    // guard: degenerate gradient (flat coarse facet) or a long snap = unreliable → skip, don't float it
+                    if (gmag < 1.0f || Mathf.Abs(distVox) > 3f) { if (_ivyDbg < 20) { _ivyDbg++; Log.LogInfo($"[PT-ivy] #{_ivyDbg} SKIP gm={gmag:F2} snapVox={distVox:F2}"); } return false; }
+                    anchor -= gn * (distVox * s);   // SNAP onto the real surface (column x/z is only on-surface for flat spots)
+                    pos = anchor;
+                    Vector3 upRef = Mathf.Abs(gn.y) > 0.9f ? Vector3.forward : Vector3.up;   // avoid degenerate up∥N on floors/ceilings
+                    Vector3 inUp = (upRef - Vector3.Dot(upRef, gn) * gn).normalized;
+                    rot = Quaternion.LookRotation(-gn, inUp) * offset;   // +Z→-N (face -Z points out), +Y→in-plane up
+                    embedN = gn;
+                    // position-keyed jitter → break the uniform grid look, mask gaps (deterministic via CCRand)
+                    if (p.JitterYaw > 0f) rot = Quaternion.AngleAxis((CCRand(ox + ix, oz + iz, ci, 61) - 0.5f) * 2f * p.JitterYaw, gn) * rot;
+                    if (p.JitterPos > 0f)
+                    {
+                        Vector3 tA = inUp, tB = Vector3.Cross(gn, inUp);
+                        anchor += tA * ((CCRand(ox + ix, oz + iz, ci, 67) - 0.5f) * 2f * p.JitterPos)
+                                + tB * ((CCRand(ox + ix, oz + iz, ci, 71) - 0.5f) * 2f * p.JitterPos);
+                        pos = anchor;
+                    }
+                    if (_ivyDbg < 20) { _ivyDbg++; Log.LogInfo($"[PT-ivy] #{_ivyDbg} {(isFloor ? "FLOOR" : isSurface ? "SURF" : "CEIL")} gn=({gn.x:F2},{gn.y:F2},{gn.z:F2}) gm={gmag:F1} snapVox={distVox:F2} pos=({anchor.x:F1},{anchor.y:F1},{anchor.z:F1})"); }
+                }
+                else if (p.Hang)
+                {
+                    rot = Quaternion.FromToRotation(Vector3.up, surfN) * Quaternion.Euler(0f, yaw, 0f) * offset;
+                    embedN = surfN;
+                }
+                else if (isFloor && p.Kind == PlacementKind.Object)
+                {
+                    rot = Quaternion.FromToRotation(Vector3.up, surfN) * Quaternion.Euler(0f, yaw, 0f) * offset;
+                    embedN = surfN;
+                }
+                else
+                    rot = Quaternion.Euler(0f, yaw, 0f) * offset;
+                if (p.Embed > 0f) pos -= embedN * p.Embed;   // sink along the aligned normal (keeps any surface snap)
                 if (p.RandTilt > 0f)   // extra random X/Z tilt about a random horizontal axis → varied orientation (roots don't all lie identically)
                 {
                     float ta = CCRand(ox + ix, oz + iz, ci, 31) * p.RandTilt;
@@ -186,7 +306,8 @@ namespace ProceduralTerrain
                 // uniform pick from the resolved pool (deterministic per crossing)
                 var prefab = p.Resolved.Length == 1 ? p.Resolved[0]
                            : p.Resolved[Math.Min(p.Resolved.Length - 1, (int)(CCRand(ox + ix, oz + iz, ci, 43) * p.Resolved.Length))];
-                if (!SpawnCave(prefab, pos, rot, ghost, spawnedObjects, p.CreatureHash)) return false;
+                float scaleMul = p.JitterScale > 0f ? 1f + (CCRand(ox + ix, oz + iz, ci, 73) - 0.5f) * 2f * p.JitterScale : 1f;
+                if (!SpawnCave(prefab, pos, rot, ghost, spawnedObjects, p.CreatureHash, p.Inert, scaleMul)) return false;
                 ps.count++; ps.pts.Add(anchor);
                 return true;
             }
@@ -277,13 +398,21 @@ namespace ProceduralTerrain
             return false;
         }
 
-        static bool SpawnCave(GameObject prefab, Vector3 pos, Quaternion rot, bool ghost, List<GameObject> spawnedObjects, int overrideCreature = 0)
+        static int _inertLiveLogged;
+        static int _ivyDbg;
+        static bool SpawnCave(GameObject prefab, Vector3 pos, Quaternion rot, bool ghost, List<GameObject> spawnedObjects, int overrideCreature = 0, bool inert = false, float scaleMul = 1f)
         {
             try
             {
                 if (ghost) ZNetView.StartGhostInit();
                 var go = UnityEngine.Object.Instantiate(prefab, pos, rot);
+                if (scaleMul != 1f) go.transform.localScale *= scaleMul;
                 if (ghost) { spawnedObjects.Add(go); ZNetView.FinishGhostInit(); }
+                if (inert)   // persist the flag (re-stripped on reload) + neutralize this live instance now
+                {
+                    go.GetComponent<ZNetView>()?.GetZDO()?.Set(InertDecorPatch.Key, 1);
+                    InertDecorPatch.StripInertComponents(go, ref _inertLiveLogged);
+                }
                 if (overrideCreature != 0)
                 {
                     // Two steps, because CreatureSpawner.Awake already ran during Instantiate (before the ZDO
@@ -319,6 +448,117 @@ namespace ProceduralTerrain
             float hpz = NearestCrossingY(e, ix, iz + 1, width, cyY, s, cyY), hmz = NearestCrossingY(e, ix, iz - 1, width, cyY, s, cyY);
             float dydx = (hpx - hmx) / (2f * s), dydz = (hpz - hmz) / (2f * s);
             return new Vector3(-dydx, 1f, -dydz).normalized;
+        }
+
+        // local cave-CEILING normal, pointing DOWN into the cavity (for hanging props). Same finite diff as the
+        // floor normal but y negated → a prop aligned +Y to this normal hangs down and tilts with the ceiling slope.
+        static Vector3 CaveCeilingNormal(Plugin.ZoneField e, int ix, int iz, int width, float cyY, float s)
+        {
+            float hpx = NearestCrossingY(e, ix + 1, iz, width, cyY, s, cyY), hmx = NearestCrossingY(e, ix - 1, iz, width, cyY, s, cyY);
+            float hpz = NearestCrossingY(e, ix, iz + 1, width, cyY, s, cyY), hmz = NearestCrossingY(e, ix, iz - 1, width, cyY, s, cyY);
+            float dydx = (hpx - hmx) / (2f * s), dydz = (hpz - hmz) / (2f * s);
+            return new Vector3(dydx, -1f, dydz).normalized;
+        }
+
+        // Per-zone LIGHT field in 0..1: 1 at a sky-opening (skylight shaft / atrium breach / atrium centre), fading
+        // linearly to 0 at `range` metres away (chamfer distance transform). Used to fade decoration out of the dark.
+        static float[] ComputeLightField(Plugin.ZoneField e, int width, float s, float range, List<Vector3>? atriums, int ox, int oz)
+        {
+            int n = width * width;
+            const float BIG = 1e9f;
+            var dist = new float[n];
+            for (int i = 0; i < n; i++) dist[i] = BIG;
+            // seeds: columns whose surface has AIR a few voxels below it (a hole/atrium opening, not solid roof)
+            for (int ix = 0; ix < width; ix++)
+            for (int iz = 0; iz < width; iz++)
+            {
+                int oc = ix * width + iz, start = e.colStart[oc]; if (start < 0) continue;
+                int len = e.colLen[oc], off = e.colOff[oc];
+                int surfK = -1; for (int k = 1; k < len; k++) if ((e.band[off + k - 1] < 0) != (e.band[off + k] < 0)) surfK = k;
+                if (surfK < 0) continue;
+                int probe = surfK - 4;                                   // ~4 voxels below the surface crossing
+                if (probe >= 0 && e.band[off + probe] >= 0) dist[oc] = 0f;   // air below surface → open to sky
+            }
+            // seed atrium centres too (their breach may be small/offset)
+            if (atriums != null)
+                foreach (var a in atriums)
+                {
+                    int aix = Mathf.RoundToInt(a.x / s) - ox, aiz = Mathf.RoundToInt(a.z / s) - oz;
+                    if (aix >= 0 && aix < width && aiz >= 0 && aiz < width) dist[aix * width + aiz] = 0f;
+                }
+            // 2-pass chamfer distance transform (voxels)
+            float d1 = 1f, d2 = 1.41421356f;
+            for (int ix = 0; ix < width; ix++)
+            for (int iz = 0; iz < width; iz++)
+            {
+                int c = ix * width + iz; float m = dist[c];
+                if (ix > 0)            m = Mathf.Min(m, dist[c - width] + d1);
+                if (iz > 0)            m = Mathf.Min(m, dist[c - 1] + d1);
+                if (ix > 0 && iz > 0)  m = Mathf.Min(m, dist[c - width - 1] + d2);
+                if (ix > 0 && iz < width - 1) m = Mathf.Min(m, dist[c - width + 1] + d2);
+                dist[c] = m;
+            }
+            for (int ix = width - 1; ix >= 0; ix--)
+            for (int iz = width - 1; iz >= 0; iz--)
+            {
+                int c = ix * width + iz; float m = dist[c];
+                if (ix < width - 1)    m = Mathf.Min(m, dist[c + width] + d1);
+                if (iz < width - 1)    m = Mathf.Min(m, dist[c + 1] + d1);
+                if (ix < width - 1 && iz < width - 1) m = Mathf.Min(m, dist[c + width + 1] + d2);
+                if (ix < width - 1 && iz > 0)         m = Mathf.Min(m, dist[c + width - 1] + d2);
+                dist[c] = m;
+            }
+            var light = new float[n];
+            float rv = Mathf.Max(0.001f, range / s);   // range in voxels
+            for (int i = 0; i < n; i++) light[i] = Mathf.Clamp01(1f - dist[i] / rv);
+            return light;
+        }
+
+        // Density at a single voxel from the packed band (sbyte; <0 = solid, >0 = air). Clamps to the stored run
+        // at the column's ends and returns NaN for empty/out-of-zone columns (caller substitutes the centre value).
+        static float SdfByte(Plugin.ZoneField e, int ix, int iz, int cyAbs, int width)
+        {
+            if (ix < 0 || ix >= width || iz < 0 || iz >= width) return float.NaN;
+            int oc = ix * width + iz, start = e.colStart[oc];
+            if (start < 0) return float.NaN;
+            int len = e.colLen[oc], off = e.colOff[oc];
+            int k = cyAbs - start; if (k < 0) k = 0; else if (k >= len) k = len - 1;
+            return e.band[off + k];
+        }
+
+        // TRUE surface normal from the 3D gradient of the density field — accurate at ANY surface angle (wall,
+        // overhang, ceiling), unlike the crossing-height finite diff which gets ambiguous in the multi-crossing
+        // strata. Points toward air (increasing density) = outward. This is the reliable normal for decals/ivy.
+        static Vector3 GradientNormal(Plugin.ZoneField e, int ix, int iz, int cyAbs, int width)
+        {
+            float c  = SdfByte(e, ix, iz, cyAbs, width); if (float.IsNaN(c)) c = 0f;
+            float xp = SdfByte(e, ix + 1, iz, cyAbs, width), xm = SdfByte(e, ix - 1, iz, cyAbs, width);
+            float zp = SdfByte(e, ix, iz + 1, cyAbs, width), zm = SdfByte(e, ix, iz - 1, cyAbs, width);
+            float yp = SdfByte(e, ix, iz, cyAbs + 1, width), ym = SdfByte(e, ix, iz, cyAbs - 1, width);
+            if (float.IsNaN(xp)) xp = c; if (float.IsNaN(xm)) xm = c;
+            if (float.IsNaN(zp)) zp = c; if (float.IsNaN(zm)) zm = c;
+            if (float.IsNaN(yp)) yp = c; if (float.IsNaN(ym)) ym = c;
+            var g = new Vector3(xp - xm, yp - ym, zp - zm);
+            return g.sqrMagnitude < 1e-6f ? Vector3.up : g.normalized;   // degenerate → fallback up
+        }
+
+        // Outward normal + signed distance (in VOXELS) from the sampled voxel to the actual zero-crossing surface,
+        // scale-free (uses the band's own gradient magnitude so sbyte quantization cancels — Newton step to the
+        // isosurface). distVox > 0 when the sample sits in air; move -normal*distVox to land ON the surface.
+        static Vector3 GradientNormalSnap(Plugin.ZoneField e, int ix, int iz, int cyAbs, int width, out float distVox, out float gm)
+        {
+            float c  = SdfByte(e, ix, iz, cyAbs, width); if (float.IsNaN(c)) c = 0f;
+            float xp = SdfByte(e, ix + 1, iz, cyAbs, width), xm = SdfByte(e, ix - 1, iz, cyAbs, width);
+            float zp = SdfByte(e, ix, iz + 1, cyAbs, width), zm = SdfByte(e, ix, iz - 1, cyAbs, width);
+            float yp = SdfByte(e, ix, iz, cyAbs + 1, width), ym = SdfByte(e, ix, iz, cyAbs - 1, width);
+            if (float.IsNaN(xp)) xp = c; if (float.IsNaN(xm)) xm = c;
+            if (float.IsNaN(zp)) zp = c; if (float.IsNaN(zm)) zm = c;
+            if (float.IsNaN(yp)) yp = c; if (float.IsNaN(ym)) ym = c;
+            var g = new Vector3(xp - xm, yp - ym, zp - zm);
+            gm = g.magnitude;
+            if (gm < 1e-4f) { distVox = 0f; return Vector3.up; }
+            distVox = c / (gm * 0.5f);   // |∇band|/2 = band change per voxel → Newton step to the crossing
+            return g / gm;
         }
     }
 }

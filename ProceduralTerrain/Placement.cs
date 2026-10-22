@@ -39,9 +39,22 @@ namespace ProceduralTerrain
         public bool  Upright   = false; // force world-up orientation instead of tilting to the floor normal
         public bool  Surface   = false; // opt in to the TOP (surface) crossing — ground scatter, not cave-only
         public float MinY       = float.NegativeInfinity; // world-Y floor: skip crossings below this (e.g. keep scatter above sea level → raised hammocks)
+        public float MaxY       = float.PositiveInfinity;  // world-Y ceiling: skip crossings ABOVE this (band a rule to the sewer level vs the strata galleries above)
         public float MinNormalY = 0.6f;  // floor-prop flatness gate; lower = allow steeper slopes (hammock flanks). only used for FloorOnly objects
         public float RandTilt   = 0f;    // extra random tilt (deg) about a random horizontal axis → varied X/Z orientation (roots don't all lie the same way). Y-yaw is always random.
         public float BiomePure  = 0f;    // >0: place only in the biome INTERIOR — WorldGenerator.GetBiomeArea != Edge (i.e. the point isn't near a boundary with an adjacent biome). 0 = off
+        public float AtriumOnly = 0f;    // >0: place only within this many metres (XZ) of a carved atrium centre → confine rare loot/encounters to the atrium rooms. 0 = off
+        public bool  Hang       = false; // place on CEILING crossings (air below, solid above) and orient +Y along the down-pointing ceiling normal → hanging roots/ivy; Embed sinks the base UP into the ceiling.
+        public bool  NoAlign    = false; // skip surface-normal alignment → identity + yaw (+ rot offset). For prefabs already authored hanging/standing (e.g. crypt roots) that a flip would break.
+        public bool  FaceNormal = false; // align the prop's FORWARD (+Z) to the surface normal (LookRotation), not its up — for flat decals/ivy whose visible face is +Z. yaw rolls about the normal.
+        public bool  Inert      = false; // after spawn (and on every reload, via ZDO flag) strip self-destruct/transform/harvest components (WearNTear collapse, Plant grow, Pickable) → the prop persists as static decor instead of falling apart.
+        public float LightRange = 0f;    // >0: fade placement by distance (m) to the nearest sky-opening (skylight shaft / atrium breach / atrium centre). Full density at the opening → 0 at this range → nothing in the deep dark. 0 = off.
+        public float JitterYaw  = 0f;    // random roll (±deg) about the surface normal → break the uniform look (position-keyed, deterministic).
+        public float JitterPos  = 0f;    // random offset (±m) in the surface TANGENT plane → stagger placements off the grid so gaps read less.
+        public float JitterScale= 0f;    // random scale (±fraction, e.g. 0.3 = ±30%) → varied sizes.
+        public float RotX = 0f, RotY = 0f, RotZ = 0f;  // fixed euler offset (deg) applied in the prop's local space after alignment — correct a model whose face/up axis is off (e.g. ivy rendering perpendicular). Live-tunable.
+        public float ClusterFreq  = 0f;  // >0: gate placement by a 2D noise field at this frequency → patchy spatial structure (cheap). 0 = uniform.
+        public float ClusterThresh = 0f; // keep only where the cluster noise (-1..1) >= this; higher = sparser/smaller patches.
 
         // resolved at runtime (needs ZNetScene). ALL candidates that resolve → one is picked uniformly per
         // placement (comma list = a random pool, not a first-wins fallback). Empty = none resolved.
@@ -156,9 +169,24 @@ namespace ProceduralTerrain
                     case "upright":   p.Upright   = (v == "1" || v.Equals("true", StringComparison.OrdinalIgnoreCase)); break;
                     case "surface":   p.Surface   = !(v == "0" || v.Equals("false", StringComparison.OrdinalIgnoreCase)); break;
                     case "miny":      p.MinY      = F(v, p.MinY); break;
+                    case "maxy":      p.MaxY      = F(v, p.MaxY); break;
                     case "minnormaly":p.MinNormalY= F(v, p.MinNormalY); break;
                     case "randtilt":  p.RandTilt  = F(v, p.RandTilt); break;
                     case "biomepure": p.BiomePure = F(v, p.BiomePure); break;
+                    case "atriumonly":p.AtriumOnly= F(v, p.AtriumOnly); break;
+                    case "hang":      p.Hang      = (v == "1" || v.Equals("true", StringComparison.OrdinalIgnoreCase)); break;
+                    case "noalign":   p.NoAlign   = (v == "1" || v.Equals("true", StringComparison.OrdinalIgnoreCase)); break;
+                    case "facenormal":p.FaceNormal= (v == "1" || v.Equals("true", StringComparison.OrdinalIgnoreCase)); break;
+                    case "inert":     p.Inert     = (v == "1" || v.Equals("true", StringComparison.OrdinalIgnoreCase)); break;
+                    case "lightrange":p.LightRange= F(v, p.LightRange); break;
+                    case "jitteryaw": p.JitterYaw = F(v, p.JitterYaw); break;
+                    case "jitterpos": p.JitterPos = F(v, p.JitterPos); break;
+                    case "jitterscale":p.JitterScale=F(v, p.JitterScale); break;
+                    case "rotx":      p.RotX      = F(v, p.RotX); break;
+                    case "roty":      p.RotY      = F(v, p.RotY); break;
+                    case "rotz":      p.RotZ      = F(v, p.RotZ); break;
+                    case "clusterfreq":  p.ClusterFreq   = F(v, p.ClusterFreq); break;
+                    case "clusterthresh":p.ClusterThresh = F(v, p.ClusterThresh); break;
                 }
             }
             if (!haveKind) { Log.LogWarning($"[PT-cave] placement '{name}': missing kind= (object|spawner)."); return null; }

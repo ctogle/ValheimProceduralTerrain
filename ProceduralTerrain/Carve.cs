@@ -2334,7 +2334,9 @@ namespace ProceduralTerrain
                     // low-pass: it smooths the floor crossings without favouring air (max) or solid (min),
                     // so the strata thin out evenly instead of collapsing. Narrow window (±cvY/2 ≈ 1m at
                     // cvY=2) only touches sub-grid detail; the 9m strata period is preserved.
-                    int halfWin = cvY > 1 ? cvY >> 1 : 0;
+                    // composeSmoothY forces a MINIMUM anti-alias window (voxels) even at full res (cvY=1), where the
+                    // res-derived window is 0 — that's why full-res brought the strata terracing back. 0 = off (default).
+                    int halfWin = Math.Max(cvY > 1 ? cvY >> 1 : 0, Plugin._composeSmoothY);
                     for (int cell = 0; cell < cellCount; cell++)
                     {
                         if (_cb.bkModeParams![mi][0][cell] <= 0f) continue;   // mode inactive here

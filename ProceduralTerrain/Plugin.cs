@@ -912,6 +912,7 @@ namespace ProceduralTerrain
         internal static bool  _biomeBlendSmooth    = true;   // false=linear, true=smoothstep
         internal static int   _transitionBlurPasses = 3;     // min blur passes for any active zone
         internal static int   _fixpointMaxZones     = 8;     // EnsureFixpoint hop cap
+        internal static int   _composeSmoothY       = 0;     // min compose-Y anti-alias window (voxels); >0 smooths near-horizontal relief at full res (kills strata terracing). 0 = off
         internal static float _coastFade           = 0f;     // world units from the OCEAN BIOME (coastline distance, NOT height) over which Ocean inflates into the blend → suppress carving near the real coast, leave low inland biomes alone (0=off)
         internal static float _coastStrength       = 1f;     // gain on the coastFade Ocean weight — >1 lets Ocean dominate the blend (harder suppression) past the 50/50 a weight of 1 gives
         internal static float _riverProtect        = 0f;     // gain on river-weight Ocean inflation: suppress carving inside river corridors + banks (0=off; >1 widens/strengthens)

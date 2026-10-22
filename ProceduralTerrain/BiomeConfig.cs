@@ -383,6 +383,8 @@ namespace ProceduralTerrain
                             _transitionBlurPasses = Mathf.Max(0, tbp);
                         if (k == "fixpointmaxzones" && int.TryParse(v, out int fmz))
                             _fixpointMaxZones = Mathf.Max(1, fmz);
+                        if (k == "composesmoothy" && int.TryParse(v, out int csy))
+                            _composeSmoothY = Mathf.Max(0, csy);
                         if (k == "coastfade" && float.TryParse(v, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float cf))
                             _coastFade = Mathf.Max(0f, cf);
                         if (k == "coaststrength" && float.TryParse(v, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float cst))
