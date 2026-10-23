@@ -184,7 +184,7 @@ namespace ProceduralTerrain
             float[]? light = maxLightRange > 0f ? ComputeLightField(e, width, s, maxLightRange, nearAtriums ?? Plugin.SnapshotCarvedAtriums(), ox, oz) : null;
 
             // place one rule at a crossing, honoring its cap + spacing + flatness; returns true if placed.
-            bool TryPlace(Placement p, int ix, int iz, int ci, bool isFloor, bool isSurface, float cyY, float worldX, float worldZ, float yaw)
+            bool TryPlace(Placement p, int ix, int iz, int ci, bool isFloor, bool isSurface, float cyY, float worldX, float worldZ, float yaw, Vector3? wallNormal = null)
             {
                 if (isSurface && !p.Surface) return false;   // only surface-opted rules place at the top crossing
                 if (p.Hang && (isFloor || isSurface)) return false;   // hanging props need a ceiling crossing (air below, solid above)
@@ -194,10 +194,9 @@ namespace ProceduralTerrain
                     float cn = Plugin._noisePool[1].GetNoise(worldX * p.ClusterFreq, 0f, worldZ * p.ClusterFreq);
                     if (cn < p.ClusterThresh) return false;
                 }
-                if (p.LightRange > 0f && light != null)   // fade out of the dark: keep ∝ proximity to a sky-opening
-                {
-                    float lf = light[ix * width + iz];
-                    if (lf <= 0f || CCRand(ox + ix, oz + iz, ci, 53) >= lf) return false;
+                if (p.LightRange > 0f && light != null)   // HARD mask: inside the lit region (contiguous), not a
+                {                                         // probabilistic fade (that salt-and-peppered the edges)
+                    if (light[ix * width + iz] <= 0f) return false;
                 }
                 if (p.BiomePure > 0f && wg.GetBiomeArea(new Vector3(worldX, 0f, worldZ)) == Heightmap.BiomeArea.Edge) return false;  // interior only, off the boundary
                 if (p.AtriumOnly > 0f)   // confine to atrium rooms: within AtriumOnly metres (XZ) of a carved dome centre
@@ -259,12 +258,22 @@ namespace ProceduralTerrain
                     // which spun flat ivy randomly): face (+Z) along -N so the ivy's -Z face points OUT along the
                     // normal, and the ivy's up (+Y) along world-up projected onto the surface plane → ivy stands
                     // "upright" on walls and lies flat on floors/ceilings with a consistent orientation.
-                    int cyAbs = Mathf.RoundToInt(cyY / s) - e.extLo;
-                    Vector3 gn = GradientNormalSnap(e, ix, iz, cyAbs, width, out float distVox, out float gmag);
-                    // guard: degenerate gradient (flat coarse facet) or a long snap = unreliable → skip, don't float it
-                    if (gmag < 1.0f || Mathf.Abs(distVox) > 3f) { if (_ivyDbg < 20) { _ivyDbg++; Log.LogInfo($"[PT-ivy] #{_ivyDbg} SKIP gm={gmag:F2} snapVox={distVox:F2}"); } return false; }
-                    anchor -= gn * (distVox * s);   // SNAP onto the real surface (column x/z is only on-surface for flat spots)
-                    pos = anchor;
+                    Vector3 gn;
+                    if (wallNormal.HasValue)
+                    {
+                        // WALL pass: the normal comes from the solid→air column pair (the band is saturated laterally,
+                        // so its gradient is useless here). The anchor is already the face midpoint → no snap, no guard.
+                        gn = wallNormal.Value;
+                    }
+                    else
+                    {
+                        int cyAbs = Mathf.RoundToInt(cyY / s) - e.extLo;
+                        gn = GradientNormalSnap(e, ix, iz, cyAbs, width, out float distVox, out float gmag);
+                        // guard: degenerate gradient (flat coarse facet) or a long snap = unreliable → skip, don't float it
+                        if (gmag < 1.0f || Mathf.Abs(distVox) > 1.2f) { if (_ivyDbg < 20) { _ivyDbg++; Log.LogInfo($"[PT-ivy] #{_ivyDbg} SKIP gm={gmag:F2} snapVox={distVox:F2}"); } return false; }
+                        anchor -= gn * (distVox * s);   // SNAP onto the real surface (column x/z is only on-surface for flat spots)
+                        pos = anchor;
+                    }
                     Vector3 upRef = Mathf.Abs(gn.y) > 0.9f ? Vector3.forward : Vector3.up;   // avoid degenerate up∥N on floors/ceilings
                     Vector3 inUp = (upRef - Vector3.Dot(upRef, gn) * gn).normalized;
                     rot = Quaternion.LookRotation(-gn, inUp) * offset;   // +Z→-N (face -Z points out), +Y→in-plane up
@@ -278,7 +287,7 @@ namespace ProceduralTerrain
                                 + tB * ((CCRand(ox + ix, oz + iz, ci, 71) - 0.5f) * 2f * p.JitterPos);
                         pos = anchor;
                     }
-                    if (_ivyDbg < 20) { _ivyDbg++; Log.LogInfo($"[PT-ivy] #{_ivyDbg} {(isFloor ? "FLOOR" : isSurface ? "SURF" : "CEIL")} gn=({gn.x:F2},{gn.y:F2},{gn.z:F2}) gm={gmag:F1} snapVox={distVox:F2} pos=({anchor.x:F1},{anchor.y:F1},{anchor.z:F1})"); }
+                    if (_ivyDbg < 20) { _ivyDbg++; Log.LogInfo($"[PT-ivy] #{_ivyDbg} {(wallNormal.HasValue ? "WALL" : isFloor ? "FLOOR" : isSurface ? "SURF" : "CEIL")} gn=({gn.x:F2},{gn.y:F2},{gn.z:F2}) pos=({anchor.x:F1},{anchor.y:F1},{anchor.z:F1})"); }
                 }
                 else if (p.Hang)
                 {
@@ -307,7 +316,7 @@ namespace ProceduralTerrain
                 var prefab = p.Resolved.Length == 1 ? p.Resolved[0]
                            : p.Resolved[Math.Min(p.Resolved.Length - 1, (int)(CCRand(ox + ix, oz + iz, ci, 43) * p.Resolved.Length))];
                 float scaleMul = p.JitterScale > 0f ? 1f + (CCRand(ox + ix, oz + iz, ci, 73) - 0.5f) * 2f * p.JitterScale : 1f;
-                if (!SpawnCave(prefab, pos, rot, ghost, spawnedObjects, p.CreatureHash, p.Inert, scaleMul)) return false;
+                if (!SpawnCave(prefab, pos, rot, ghost, spawnedObjects, p.CreatureHash, p.Inert, scaleMul, p)) return false;
                 ps.count++; ps.pts.Add(anchor);
                 return true;
             }
@@ -376,12 +385,119 @@ namespace ProceduralTerrain
                     {
                         if (!chanOn[j]) continue;
                         var p = channels[j];
+                        if (p.WallOnly) continue;   // wall-only rules skip the vertical floor/ceiling pass
                         float r = p.Ramp(depth); if (r <= 0f) continue;
                         if (CCRand(ox + ix, oz + iz, ci, 20 + j) >= p.Prob * r) continue;
                         TryPlace(p, ix, iz, ci, isFloor, isSurface, cyY, worldX, worldZ, yaw);
                     }
                 }
             }
+
+            // LATERAL WALL pass: the vertical-column crossing scan can't see near-vertical faces (a column runs
+            // parallel to a wall). For Wall-flagged rules, seed where adjacent columns flip solidity at the same Y =
+            // a vertical face. Cheap: band-run array lookups, stride 2 in Y, +x/+z neighbours only. TryPlace does the
+            // rest (gradient normal here is ~horizontal → correct wall orientation; snap lands it on the face).
+            var wallRules = new List<Placement>();
+            foreach (var p in objPool)  if (p.Wall || p.WallOnly) wallRules.Add(p);
+            foreach (var p in channels) if (p.Wall || p.WallOnly) wallRules.Add(p);
+            if (wallRules.Count > 0)
+            {
+                // Collect threshold = most permissive steepness across the wall rules (per-rule gate still applies at
+                // placement). minClump = strictest component-size floor among them.
+                float collectSlope = 90f; int minClump = 0;
+                foreach (var wr in wallRules) { if (wr.WallSlopeMin < collectSlope) collectSlope = wr.WallSlopeMin; if (wr.WallMinClump > minClump) minClump = wr.WallMinClump; }
+                float collectCos = Mathf.Cos(collectSlope * Mathf.Deg2Rad);
+
+                // PASS 1 — collect steep wall-face voxels + their normals (keyed by column+Y, neighbour-agnostic).
+                var faceNorm = new Dictionary<long, Vector3>();
+                long Key(int cx, int cz, int cy) => ((long)(cx * width + cz) << 20) | (uint)cy;
+                for (int ix = 0; ix < width; ix++)
+                for (int iz = 0; iz < width; iz++)
+                {
+                    int oc = ix * width + iz, start = e.colStart[oc]; if (start < 0) continue;
+                    int len = e.colLen[oc], off = e.colOff[oc];
+                    for (int k = 0; k < len; k++)
+                    {
+                        int cyAbs = start + k;
+                        bool colSolid = e.band[off + k] < 0;
+                        // is this a lateral face? any of the 4 XZ neighbours flips solidity at this Y
+                        bool face = false;
+                        if (WallSign(e, ix + 1, iz, cyAbs, width) != 0f && (WallSign(e, ix + 1, iz, cyAbs, width) < 0f) != colSolid) face = true;
+                        else if (WallSign(e, ix - 1, iz, cyAbs, width) != 0f && (WallSign(e, ix - 1, iz, cyAbs, width) < 0f) != colSolid) face = true;
+                        else if (WallSign(e, ix, iz + 1, cyAbs, width) != 0f && (WallSign(e, ix, iz + 1, cyAbs, width) < 0f) != colSolid) face = true;
+                        else if (WallSign(e, ix, iz - 1, cyAbs, width) != 0f && (WallSign(e, ix, iz - 1, cyAbs, width) < 0f) != colSolid) face = true;
+                        if (!face) continue;
+                        // smooth 3D normal from the 3x3x3 solidity gradient (incl. Y slope) + surface-mix check
+                        Vector3 g = Vector3.zero; int airN = 0, solN = 0;
+                        for (int ddx = -1; ddx <= 1; ddx++)
+                        for (int ddy = -1; ddy <= 1; ddy++)
+                        for (int ddz = -1; ddz <= 1; ddz++)
+                        {
+                            if (ddx == 0 && ddy == 0 && ddz == 0) continue;
+                            float sgn = WallSign(e, ix + ddx, iz + ddz, cyAbs + ddy, width);
+                            if (sgn == 0f) continue;
+                            if (sgn > 0f) airN++; else solN++;
+                            g += new Vector3(ddx, ddy, ddz).normalized * sgn;
+                        }
+                        if (airN < 3 || solN < 3 || g.sqrMagnitude < 1e-4f) continue;   // speck/corner
+                        Vector3 wallN = g.normalized;
+                        if (Mathf.Abs(wallN.y) > collectCos) continue;                   // not steep enough for any rule
+                        faceNorm[Key(ix, iz, cyAbs)] = wallN;
+                    }
+                }
+
+                // PASS 2 — flood-fill into connected components (6-conn in column+Y); keep only big ones.
+                var kept = new HashSet<long>();
+                var visited = new HashSet<long>();
+                var comp = new List<long>();
+                var stack = new Stack<long>();
+                foreach (var seed in faceNorm.Keys)
+                {
+                    if (!visited.Add(seed)) continue;
+                    comp.Clear(); stack.Clear(); stack.Push(seed);
+                    while (stack.Count > 0)
+                    {
+                        long cur = stack.Pop(); comp.Add(cur);
+                        long xz = cur >> 20; int cy = (int)(cur & 0xFFFFF);
+                        int cx = (int)(xz / width), cz = (int)(xz % width);
+                        long[] nb = { Key(cx + 1, cz, cy), Key(cx - 1, cz, cy), Key(cx, cz + 1, cy), Key(cx, cz - 1, cy), Key(cx, cz, cy + 1), Key(cx, cz, cy - 1) };
+                        foreach (var nkey in nb) if (faceNorm.ContainsKey(nkey) && visited.Add(nkey)) stack.Push(nkey);
+                    }
+                    if (comp.Count >= minClump) foreach (var c in comp) kept.Add(c);
+                }
+
+                // PASS 3 — place on surviving (big-component) faces; light/cluster/spacing/cap applied in TryPlace.
+                foreach (var key in kept)
+                {
+                    long xz = key >> 20; int cyAbs = (int)(key & 0xFFFFF);
+                    int ix = (int)(xz / width), iz = (int)(xz % width);
+                    Vector3 wallN = faceNorm[key];
+                    float cyY = (e.extLo + cyAbs) * s;
+                    // POSITION at the actual face midpoint — offset toward the opposite-solidity neighbour(s), NOT
+                    // along wallN. The 26-neighbour normal is corner-biased (averages both walls at a concave corner),
+                    // so positioning by it gave a distance-from-corner linear drift. The face is between this column
+                    // and its solid/air-flipped neighbour → independent of the normal, so no corner drift. wallN now
+                    // only ORIENTS. Corner (2 flips) → average toward the concave edge.
+                    bool colSolid = WallSign(e, ix, iz, cyAbs, width) < 0f;
+                    float spx = WallSign(e, ix + 1, iz, cyAbs, width), smx = WallSign(e, ix - 1, iz, cyAbs, width);
+                    float spz = WallSign(e, ix, iz + 1, cyAbs, width), smz = WallSign(e, ix, iz - 1, cyAbs, width);
+                    float offX = 0f, offZ = 0f; int bn = 0;
+                    if (spx != 0f && (spx < 0f) != colSolid) { offX += 1f; bn++; }
+                    if (smx != 0f && (smx < 0f) != colSolid) { offX -= 1f; bn++; }
+                    if (spz != 0f && (spz < 0f) != colSolid) { offZ += 1f; bn++; }
+                    if (smz != 0f && (smz < 0f) != colSolid) { offZ -= 1f; bn++; }
+                    if (bn > 1) { offX /= bn; offZ /= bn; }
+                    float wX = (ox + ix) * s + offX * 0.5f * s, wZ = (oz + iz) * s + offZ * 0.5f * s;
+                    float yaw = CCRand(ox + ix, oz + iz, cyAbs, 7) * 360f;
+                    foreach (var wr in wallRules)
+                    {
+                        if (Mathf.Abs(wallN.y) > Mathf.Cos(wr.WallSlopeMin * Mathf.Deg2Rad)) continue;
+                        if (wr.Prob >= 0f && CCRand(ox + ix, oz + iz, cyAbs, 23) >= wr.Prob) continue;
+                        TryPlace(wr, ix, iz, cyAbs, false, false, cyY, wX, wZ, yaw, wallN);
+                    }
+                }
+            }
+
             if (st.Count > 0)
             {
                 var sb = new System.Text.StringBuilder();
@@ -400,13 +516,26 @@ namespace ProceduralTerrain
 
         static int _inertLiveLogged;
         static int _ivyDbg;
-        static bool SpawnCave(GameObject prefab, Vector3 pos, Quaternion rot, bool ghost, List<GameObject> spawnedObjects, int overrideCreature = 0, bool inert = false, float scaleMul = 1f)
+        static int _pivotDbg;
+        static bool SpawnCave(GameObject prefab, Vector3 pos, Quaternion rot, bool ghost, List<GameObject> spawnedObjects, int overrideCreature = 0, bool inert = false, float scaleMul = 1f, Placement? cfg = null)
         {
             try
             {
                 if (ghost) ZNetView.StartGhostInit();
                 var go = UnityEngine.Object.Instantiate(prefab, pos, rot);
                 if (scaleMul != 1f) go.transform.localScale *= scaleMul;
+                if (_pivotDbg < 8 && (go.name.StartsWith("vines", StringComparison.OrdinalIgnoreCase) || go.name.StartsWith("VineGreen", StringComparison.OrdinalIgnoreCase)))
+                {
+                    var rnd = go.GetComponentInChildren<Renderer>();
+                    if (rnd != null)
+                    {
+                        Vector3 localCenter = go.transform.InverseTransformPoint(rnd.bounds.center);
+                        Vector3 ext = go.transform.InverseTransformVector(rnd.bounds.size);
+                        _pivotDbg++;
+                        Plugin.Log.LogInfo($"[PT-pivot] {go.name} pivot→centroid(local)=({localCenter.x:F2},{localCenter.y:F2},{localCenter.z:F2}) size(local)=({Mathf.Abs(ext.x):F2},{Mathf.Abs(ext.y):F2},{Mathf.Abs(ext.z):F2})");
+                    }
+                }
+                if (cfg != null) ConfigBird(go, cfg);
                 if (ghost) { spawnedObjects.Add(go); ZNetView.FinishGhostInit(); }
                 if (inert)   // persist the flag (re-stripped on reload) + neutralize this live instance now
                 {
@@ -427,6 +556,26 @@ namespace ProceduralTerrain
                 return true;
             }
             catch (Exception ex) { Log.LogWarning($"[PT-cave] spawn {prefab.name} failed: {ex.Message}"); if (ghost) ZNetView.FinishGhostInit(); return false; }
+        }
+
+        // Tune a RandomFlyingBird after spawn (nesting vibe: more/longer perching, tamer noise, tighter roam) and
+        // optionally swap its model from another bird prefab. Behaviour fields read live each Update → safe post-Awake;
+        // the MODEL swap is best-effort (Awake may have already built the visible model — may need a prefab-level swap).
+        static void ConfigBird(GameObject go, Placement p)
+        {
+            var bird = go.GetComponent<RandomFlyingBird>();
+            if (bird == null) return;
+            if (p.BirdLandChance   >= 0f) bird.m_landChance             = p.BirdLandChance;
+            if (p.BirdLandDuration >= 0f) bird.m_landDuration           = p.BirdLandDuration;
+            if (p.BirdNoiseMin     >= 0f) bird.m_randomNoiseIntervalMin = p.BirdNoiseMin;
+            if (p.BirdNoiseMax     >= 0f) bird.m_randomNoiseIntervalMax = p.BirdNoiseMax;
+            if (p.BirdFlyRange     >= 0f) bird.m_flyRange               = p.BirdFlyRange;
+            if (!string.IsNullOrEmpty(p.BirdModel))
+            {
+                var mp = ZNetScene.instance?.GetPrefab(p.BirdModel);
+                var mb = mp != null ? mp.GetComponent<RandomFlyingBird>() : null;
+                if (mb != null) { bird.m_flyingModel = mb.m_flyingModel; bird.m_landedModel = mb.m_landedModel; }
+            }
         }
 
         // nearest sign-crossing Y in a neighbour column (for a local floor-slope finite diff), fallback if none.
@@ -512,6 +661,16 @@ namespace ProceduralTerrain
             float rv = Mathf.Max(0.001f, range / s);   // range in voxels
             for (int i = 0; i < n; i++) light[i] = Mathf.Clamp01(1f - dist[i] / rv);
             return light;
+        }
+
+        // Solidity sign at a voxel for the wall-normal gradient: -1 solid, +1 air, 0 = no data (out of band).
+        // Does NOT clamp (unlike SdfByte) — out-of-band contributes nothing so the horizontal gradient stays local.
+        static float WallSign(Plugin.ZoneField e, int cx, int cz, int cyAbs, int width)
+        {
+            if (cx < 0 || cx >= width || cz < 0 || cz >= width) return 0f;
+            int o = cx * width + cz, st = e.colStart[o]; if (st < 0) return 0f;
+            int kk = cyAbs - st; if (kk < 0 || kk >= e.colLen[o]) return 0f;
+            return e.band[e.colOff[o] + kk] < 0 ? -1f : 1f;
         }
 
         // Density at a single voxel from the packed band (sbyte; <0 = solid, >0 = air). Clamps to the stored run

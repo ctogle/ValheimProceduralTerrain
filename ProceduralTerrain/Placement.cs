@@ -52,6 +52,17 @@ namespace ProceduralTerrain
         public float JitterYaw  = 0f;    // random roll (±deg) about the surface normal → break the uniform look (position-keyed, deterministic).
         public float JitterPos  = 0f;    // random offset (±m) in the surface TANGENT plane → stagger placements off the grid so gaps read less.
         public float JitterScale= 0f;    // random scale (±fraction, e.g. 0.3 = ±30%) → varied sizes.
+        public bool  Wall       = false; // ALSO place on vertical wall faces (lateral crossings between adjacent columns) — the vertical-column crossing scan can't see near-vertical faces, so ivy/pillars need this extra pass.
+        public bool  WallOnly   = false; // ONLY the wall pass — skip the vertical floor/ceiling crossings entirely (isolates wall placement).
+        public float WallSlopeMin = 50f; // wall pass: minimum surface steepness (deg from horizontal) to accept — rejects gentle slopes / the top surface that also produce lateral solidity flips. 90 = vertical only.
+        public int   WallMinClump = 12;  // wall pass: discard connected wall-face components smaller than this (voxels) → ivy only on sizeable contiguous sheets, never a lone plant on an isolated bump.
+        // RandomFlyingBird tuning (applied post-spawn if the prefab is a flying bird). -1 = leave default.
+        public float BirdLandChance   = -1f;  // 0..1 chance to land vs keep flying (higher = more perched = nesting vibe)
+        public float BirdLandDuration = -1f;  // seconds perched once landed (higher = many landed at a given time)
+        public float BirdNoiseMin     = -1f;  // min seconds between squawks (raise to tame the noise)
+        public float BirdNoiseMax     = -1f;  // max seconds between squawks
+        public float BirdFlyRange     = -1f;  // roam radius from spawn (keep tight to the atrium)
+        public string? BirdModel      = null; // swap the flying/landed MODEL from this prefab's RandomFlyingBird (e.g. a seagull) — pending a resolvable source
         public float RotX = 0f, RotY = 0f, RotZ = 0f;  // fixed euler offset (deg) applied in the prop's local space after alignment — correct a model whose face/up axis is off (e.g. ivy rendering perpendicular). Live-tunable.
         public float ClusterFreq  = 0f;  // >0: gate placement by a 2D noise field at this frequency → patchy spatial structure (cheap). 0 = uniform.
         public float ClusterThresh = 0f; // keep only where the cluster noise (-1..1) >= this; higher = sparser/smaller patches.
@@ -182,6 +193,16 @@ namespace ProceduralTerrain
                     case "jitteryaw": p.JitterYaw = F(v, p.JitterYaw); break;
                     case "jitterpos": p.JitterPos = F(v, p.JitterPos); break;
                     case "jitterscale":p.JitterScale=F(v, p.JitterScale); break;
+                    case "wall":      p.Wall      = (v == "1" || v.Equals("true", StringComparison.OrdinalIgnoreCase)); break;
+                    case "wallonly":  p.WallOnly  = (v == "1" || v.Equals("true", StringComparison.OrdinalIgnoreCase)); break;
+                    case "wallslopemin":p.WallSlopeMin = F(v, p.WallSlopeMin); break;
+                    case "wallminclump":p.WallMinClump = (int)F(v, p.WallMinClump); break;
+                    case "birdlandchance":   p.BirdLandChance   = F(v, p.BirdLandChance); break;
+                    case "birdlandduration": p.BirdLandDuration = F(v, p.BirdLandDuration); break;
+                    case "birdnoisemin":     p.BirdNoiseMin     = F(v, p.BirdNoiseMin); break;
+                    case "birdnoisemax":     p.BirdNoiseMax     = F(v, p.BirdNoiseMax); break;
+                    case "birdflyrange":     p.BirdFlyRange     = F(v, p.BirdFlyRange); break;
+                    case "birdmodel":        p.BirdModel        = string.IsNullOrWhiteSpace(v) ? null : v.Trim(); break;
                     case "rotx":      p.RotX      = F(v, p.RotX); break;
                     case "roty":      p.RotY      = F(v, p.RotY); break;
                     case "rotz":      p.RotZ      = F(v, p.RotZ); break;
