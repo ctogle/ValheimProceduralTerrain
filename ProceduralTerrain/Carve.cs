@@ -2327,19 +2327,15 @@ namespace ProceduralTerrain
                     var aux = _cb.bkModeAux![mi][0];
                     string blend = mode.Blend;
                     float k = mode.BlendK * scale2;
-                    // Anti-alias the coarse-Y compose: instead of POINT-sampling the mode's full-Y
-                    // output every cvY levels (which undersamples near-Nyquist periodic relief like the
-                    // strata floors → terraces that scale with cvY), BOX-AVERAGE the mode's full-Y output
-                    // over the half-cell window this coarse level reconstructs. A mean is an unbiased
-                    // low-pass: it smooths the floor crossings without favouring air (max) or solid (min),
-                    // so the strata thin out evenly instead of collapsing. Narrow window (±cvY/2 ≈ 1m at
-                    // cvY=2) only touches sub-grid detail; the 9m strata period is preserved.
-                    // composeSmoothY forces a MINIMUM anti-alias window (voxels) even at full res (cvY=1), where the
-                    // res-derived window is 0 — that's why full-res brought the strata terracing back. 0 = off (default).
-                    int halfWin = Math.Max(cvY > 1 ? cvY >> 1 : 0, Plugin._composeSmoothY);
+                    // Anti-alias the coarse-Y compose: instead of POINT-sampling the mode's full-Y output every cvY
+                    // levels (which undersamples near-Nyquist periodic relief like the strata floors → terraces),
+                    // BOX-AVERAGE over a ±halfWin window. PER-PROFILE (composeSmoothY): 0 = pure point-sample (the
+                    // ORIGINAL behaviour — e.g. mountains keep crisp spines), >0 = low-pass (plains strata). Read per
+                    // cell from the blended profile so one biome's smoothing can NEVER bleed into another's.
                     for (int cell = 0; cell < cellCount; cell++)
                     {
                         if (_cb.bkModeParams![mi][0][cell] <= 0f) continue;   // mode inactive here
+                        int halfWin = (_blendedProfs != null && cell < _blendedProfs.Length) ? Mathf.RoundToInt(_blendedProfs[cell].composeSmoothY) : 0;
                         int cbaseF = cell * bh, cbaseC = cell * ch;
                         float hCell = _composeHCell![cell], floorY = _composeFloorY![cell];
                         for (int cyc = 0; cyc < ch; cyc++)

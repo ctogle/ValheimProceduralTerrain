@@ -179,6 +179,7 @@ namespace ProceduralTerrain
                                 tp.PeronaK      = incl.PeronaK;
                                 tp.PeronaLambda = incl.PeronaLambda;
                                 tp.ExtendUp     = incl.ExtendUp;
+                                tp.ComposeSmoothY = incl.ComposeSmoothY;
                             }
                             else Log.LogWarning($"[ProceduralTerrain] Profile '{name}': parent profile '{pn}' not found.");
                         }
@@ -210,6 +211,7 @@ namespace ProceduralTerrain
                             case "perona_k":      tp.PeronaK      = fv; break;
                             case "perona_lambda": tp.PeronaLambda = fv; break;
                             case "extendup":      tp.ExtendUp     = fv; break;
+                            case "composesmoothy":tp.ComposeSmoothY = fv; break;
                         }
                         break;
                 }
@@ -383,8 +385,6 @@ namespace ProceduralTerrain
                             _transitionBlurPasses = Mathf.Max(0, tbp);
                         if (k == "fixpointmaxzones" && int.TryParse(v, out int fmz))
                             _fixpointMaxZones = Mathf.Max(1, fmz);
-                        if (k == "composesmoothy" && int.TryParse(v, out int csy))
-                            _composeSmoothY = Mathf.Max(0, csy);
                         if (k == "coastfade" && float.TryParse(v, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float cf))
                             _coastFade = Mathf.Max(0f, cf);
                         if (k == "coaststrength" && float.TryParse(v, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float cst))
@@ -686,6 +686,7 @@ namespace ProceduralTerrain
             acc.floorFade     += w * prof.floorFade;
             acc.floorLevel    += w * prof.floorLevel;
             acc.extendUp      += w * prof.extendUp;
+            acc.composeSmoothY += w * prof.composeSmoothY;
         }
 
         static void NormalizeProfile(ref CaveProfile p, float totW)
@@ -699,6 +700,7 @@ namespace ProceduralTerrain
             p.floorFade      = Mathf.Min(p.floorFade * rcp, p.floorDepth);
             p.floorLevel    *= rcp;
             p.extendUp      *= rcp;
+            p.composeSmoothY *= rcp;
         }
 
         // ── voxcaves_probe: biome blend breakdown logged to console ──────────────────

@@ -780,6 +780,7 @@ namespace ProceduralTerrain
         public float        PeronaK      = 0f;
         public float        PeronaLambda = 0.1f;
         public float        ExtendUp     = 0f;
+        public float        ComposeSmoothY = 0f;  // per-profile compose-Y anti-alias window (voxels). 0 = point-sample (original). plains sets >0 for the strata terracing fix without touching other biomes.
         public float        VegDensity   = 1f;    // per-biome multiplier on vanilla tree count (m_min/m_max) at placement — non-destructive (restored after the zone). 1 = vanilla
         public float        VegForestWiden = 0f;  // per-biome widen of the vanilla forest band (m_forestTresholdMax += this) → trees spill into more-open ground. 0 = vanilla
         public bool         VegInForest  = false; // force tree items to be forest-gated (m_inForest=true) so they CLUSTER by GetForestFactor (vanilla swamp trees are uniform)
@@ -802,7 +803,8 @@ namespace ProceduralTerrain
                 blur_passes  = BlurPasses,
                 perona_k     = PeronaK,
                 perona_lambda = PeronaLambda,
-                extendUp     = ExtendUp
+                extendUp     = ExtendUp,
+                composeSmoothY = ComposeSmoothY
             };
         }
 
@@ -819,6 +821,7 @@ namespace ProceduralTerrain
         public float floorFade;        // metres above floorY over which carving tapers to zero (0=hard stop)
         public float floorLevel;       // ABSOLUTE world-Y floor: carving re-solidifies below this (floorFade softens). -10000 = off
         public float extendUp;         // metres above terrain the profile may raise features (bake vertical window)
+        public float composeSmoothY;   // compose-Y anti-alias window (voxels) for THIS profile's modes. 0 = pure point-sample (original). >0 low-passes near-horizontal relief (plains strata). Per-profile so it can't bleed into other biomes.
 
         public static readonly CaveProfile Default = new CaveProfile
         {
@@ -829,6 +832,7 @@ namespace ProceduralTerrain
             floorFade     = 0f,
             floorLevel    = -10000f,
             extendUp      = 0f,
+            composeSmoothY = 0f,
         };
     }
 
@@ -912,7 +916,6 @@ namespace ProceduralTerrain
         internal static bool  _biomeBlendSmooth    = true;   // false=linear, true=smoothstep
         internal static int   _transitionBlurPasses = 3;     // min blur passes for any active zone
         internal static int   _fixpointMaxZones     = 8;     // EnsureFixpoint hop cap
-        internal static int   _composeSmoothY       = 0;     // min compose-Y anti-alias window (voxels); >0 smooths near-horizontal relief at full res (kills strata terracing). 0 = off
         internal static float _coastFade           = 0f;     // world units from the OCEAN BIOME (coastline distance, NOT height) over which Ocean inflates into the blend → suppress carving near the real coast, leave low inland biomes alone (0=off)
         internal static float _coastStrength       = 1f;     // gain on the coastFade Ocean weight — >1 lets Ocean dominate the blend (harder suppression) past the 50/50 a weight of 1 gives
         internal static float _riverProtect        = 0f;     // gain on river-weight Ocean inflation: suppress carving inside river corridors + banks (0=off; >1 widens/strengthens)
