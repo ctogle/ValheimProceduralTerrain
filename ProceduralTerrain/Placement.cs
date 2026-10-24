@@ -62,6 +62,8 @@ namespace ProceduralTerrain
         public float BirdNoiseMin     = -1f;  // min seconds between squawks (raise to tame the noise)
         public float BirdNoiseMax     = -1f;  // max seconds between squawks
         public float BirdFlyRange     = -1f;  // roam radius from spawn (keep tight to the atrium)
+        public float BirdMinAlt       = -1f;  // min flight altitude above spawn (default 5)
+        public float BirdMaxAlt       = -1f;  // max flight altitude above spawn — cap LOW to keep atrium birds inside the dome (default 20 lets them climb out the breach)
         public string? BirdModel      = null; // swap the flying/landed MODEL from this prefab's RandomFlyingBird (e.g. a seagull) — pending a resolvable source
         public float RotX = 0f, RotY = 0f, RotZ = 0f;  // fixed euler offset (deg) applied in the prop's local space after alignment — correct a model whose face/up axis is off (e.g. ivy rendering perpendicular). Live-tunable.
         public float ClusterFreq  = 0f;  // >0: gate placement by a 2D noise field at this frequency → patchy spatial structure (cheap). 0 = uniform.
@@ -202,6 +204,8 @@ namespace ProceduralTerrain
                     case "birdnoisemin":     p.BirdNoiseMin     = F(v, p.BirdNoiseMin); break;
                     case "birdnoisemax":     p.BirdNoiseMax     = F(v, p.BirdNoiseMax); break;
                     case "birdflyrange":     p.BirdFlyRange     = F(v, p.BirdFlyRange); break;
+                    case "birdminalt":       p.BirdMinAlt       = F(v, p.BirdMinAlt); break;
+                    case "birdmaxalt":       p.BirdMaxAlt       = F(v, p.BirdMaxAlt); break;
                     case "birdmodel":        p.BirdModel        = string.IsNullOrWhiteSpace(v) ? null : v.Trim(); break;
                     case "rotx":      p.RotX      = F(v, p.RotX); break;
                     case "roty":      p.RotY      = F(v, p.RotY); break;

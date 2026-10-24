@@ -176,12 +176,11 @@ namespace ProceduralTerrain
                 { float dx = a.x - zoneCenterPos.x, dz = a.z - zoneCenterPos.z; if (dx * dx + dz * dz <= f2) nearAtriums.Add(a); }
             }
 
-            // Light field (0..1 per column): fade decoration out of the dark toward sky-openings. Built once per zone.
-            float maxLightRange = 0f;
-            foreach (var p in objPool)  if (p.LightRange > maxLightRange) maxLightRange = p.LightRange;
-            foreach (var p in spwPool)  if (p.LightRange > maxLightRange) maxLightRange = p.LightRange;
-            foreach (var p in channels) if (p.LightRange > maxLightRange) maxLightRange = p.LightRange;
-            float[]? light = maxLightRange > 0f ? ComputeLightField(e, width, s, maxLightRange, nearAtriums ?? Plugin.SnapshotCarvedAtriums(), ox, oz) : null;
+            bool anyLight = false;
+            foreach (var p in objPool)  if (p.LightRange > 0f) anyLight = true;
+            foreach (var p in channels) if (p.LightRange > 0f) anyLight = true;
+            foreach (var p in spwPool)  if (p.LightRange > 0f) anyLight = true;
+            float[]? seedY = anyLight ? ComputeLightSeeds(e, width, s) : null;
 
             // place one rule at a crossing, honoring its cap + spacing + flatness; returns true if placed.
             bool TryPlace(Placement p, int ix, int iz, int ci, bool isFloor, bool isSurface, float cyY, float worldX, float worldZ, float yaw, Vector3? wallNormal = null)
@@ -194,16 +193,32 @@ namespace ProceduralTerrain
                     float cn = Plugin._noisePool[1].GetNoise(worldX * p.ClusterFreq, 0f, worldZ * p.ClusterFreq);
                     if (cn < p.ClusterThresh) return false;
                 }
-                if (p.LightRange > 0f && light != null)   // HARD mask: inside the lit region (contiguous), not a
-                {                                         // probabilistic fade (that salt-and-peppered the edges)
-                    if (light[ix * width + iz] <= 0f) return false;
+                if (p.LightRange > 0f && seedY != null)   // lit iff within LightRange (3D) of a sky-ray-reached seed
+                {
+                    float X = p.LightRange, X2 = X * X;
+                    bool lit = false;
+                    float self = seedY[ix * width + iz];                       // own column's surface (vertical check, cheap)
+                    if (!float.IsNaN(self) && Mathf.Abs(self - cyY) <= X) lit = true;
+                    if (!lit)                                                  // else scan laterally for a near seed (shaft-bottom halo)
+                    {
+                        int R = Mathf.CeilToInt(X / s);
+                        for (int dxi = -R; dxi <= R && !lit; dxi++)
+                        for (int dzi = -R; dzi <= R && !lit; dzi++)
+                        {
+                            int nx = ix + dxi, nz = iz + dzi; if (nx < 0 || nx >= width || nz < 0 || nz >= width) continue;
+                            float ny = seedY[nx * width + nz]; if (float.IsNaN(ny)) continue;
+                            float lx = dxi * s, lz = dzi * s, ldy = ny - cyY;
+                            if (lx * lx + lz * lz + ldy * ldy <= X2) lit = true;
+                        }
+                    }
+                    if (!lit) return false;
                 }
                 if (p.BiomePure > 0f && wg.GetBiomeArea(new Vector3(worldX, 0f, worldZ)) == Heightmap.BiomeArea.Edge) return false;  // interior only, off the boundary
-                if (p.AtriumOnly > 0f)   // confine to atrium rooms: within AtriumOnly metres (XZ) of a carved dome centre
-                {
+                if (p.AtriumOnly > 0f)   // confine to atrium ROOM: within AtriumOnly metres in 3D of a carved dome centre
+                {                        // (3D — XZ-only let strata floors ABOVE an atrium pass → elites in the strata)
                     if (nearAtriums == null || nearAtriums.Count == 0) return false;
                     float r2 = p.AtriumOnly * p.AtriumOnly; bool near = false;
-                    foreach (var a in nearAtriums) { float dx = a.x - worldX, dz = a.z - worldZ; if (dx * dx + dz * dz <= r2) { near = true; break; } }
+                    foreach (var a in nearAtriums) { float dx = a.x - worldX, dy = a.y - cyY, dz = a.z - worldZ; if (dx * dx + dy * dy + dz * dz <= r2) { near = true; break; } }
                     if (!near) return false;
                 }
                 int cap = p.Cap < 0 ? int.MaxValue : p.Cap;
@@ -517,21 +532,26 @@ namespace ProceduralTerrain
         static int _inertLiveLogged;
         static int _ivyDbg;
         static int _pivotDbg;
+        static int _pivotDbgShip;
         static bool SpawnCave(GameObject prefab, Vector3 pos, Quaternion rot, bool ghost, List<GameObject> spawnedObjects, int overrideCreature = 0, bool inert = false, float scaleMul = 1f, Placement? cfg = null)
         {
             try
             {
                 if (ghost) ZNetView.StartGhostInit();
                 var go = UnityEngine.Object.Instantiate(prefab, pos, rot);
+                if (!go.activeSelf) go.SetActive(true);   // some runtime prefabs (dust motes) ship inactive as a template
                 if (scaleMul != 1f) go.transform.localScale *= scaleMul;
-                if (_pivotDbg < 8 && (go.name.StartsWith("vines", StringComparison.OrdinalIgnoreCase) || go.name.StartsWith("VineGreen", StringComparison.OrdinalIgnoreCase)))
+                bool isShip = go.name.StartsWith("shipwreck", StringComparison.OrdinalIgnoreCase);
+                bool isVine = go.name.StartsWith("vines", StringComparison.OrdinalIgnoreCase) || go.name.StartsWith("VineGreen", StringComparison.OrdinalIgnoreCase);
+                // separate budgets so a flood of vines can't starve the shipwreck-pivot capture (and vice-versa)
+                if ((isShip ? _pivotDbgShip : _pivotDbg) < 16 && (isShip || isVine))
                 {
                     var rnd = go.GetComponentInChildren<Renderer>();
                     if (rnd != null)
                     {
                         Vector3 localCenter = go.transform.InverseTransformPoint(rnd.bounds.center);
                         Vector3 ext = go.transform.InverseTransformVector(rnd.bounds.size);
-                        _pivotDbg++;
+                        if (isShip) _pivotDbgShip++; else _pivotDbg++;
                         Plugin.Log.LogInfo($"[PT-pivot] {go.name} pivot→centroid(local)=({localCenter.x:F2},{localCenter.y:F2},{localCenter.z:F2}) size(local)=({Mathf.Abs(ext.x):F2},{Mathf.Abs(ext.y):F2},{Mathf.Abs(ext.z):F2})");
                     }
                 }
@@ -570,6 +590,8 @@ namespace ProceduralTerrain
             if (p.BirdNoiseMin     >= 0f) bird.m_randomNoiseIntervalMin = p.BirdNoiseMin;
             if (p.BirdNoiseMax     >= 0f) bird.m_randomNoiseIntervalMax = p.BirdNoiseMax;
             if (p.BirdFlyRange     >= 0f) bird.m_flyRange               = p.BirdFlyRange;
+            if (p.BirdMinAlt       >= 0f) bird.m_minAlt                 = p.BirdMinAlt;
+            if (p.BirdMaxAlt       >= 0f) bird.m_maxAlt                 = p.BirdMaxAlt;
             if (!string.IsNullOrEmpty(p.BirdModel))
             {
                 var mp = ZNetScene.instance?.GetPrefab(p.BirdModel);
@@ -609,58 +631,67 @@ namespace ProceduralTerrain
             return new Vector3(dydx, -1f, dydz).normalized;
         }
 
-        // Per-zone LIGHT field in 0..1: 1 at a sky-opening (skylight shaft / atrium breach / atrium centre), fading
-        // linearly to 0 at `range` metres away (chamfer distance transform). Used to fade decoration out of the dark.
-        static float[] ComputeLightField(Plugin.ZoneField e, int width, float s, float range, List<Vector3>? atriums, int ox, int oz)
+        // LIGHT SEEDS: a column is a seed only if its topmost crossing (where a downward sky-ray stops) is a LOCAL
+        // DEPRESSION — ≥OPEN_DEPTH below the highest surface in a small neighbourhood (a shaft/breach into the cave),
+        // NOT the normal roof/ground. Returns per-column seed Y (NaN = not a seed). This is where light actually enters.
+        static float[] ComputeLightSeeds(Plugin.ZoneField e, int width, float s)
         {
             int n = width * width;
-            const float BIG = 1e9f;
-            var dist = new float[n];
-            for (int i = 0; i < n; i++) dist[i] = BIG;
-            // seeds: columns whose surface has AIR a few voxels below it (a hole/atrium opening, not solid roof)
+            var topY = new float[n];
             for (int ix = 0; ix < width; ix++)
             for (int iz = 0; iz < width; iz++)
             {
-                int oc = ix * width + iz, start = e.colStart[oc]; if (start < 0) continue;
-                int len = e.colLen[oc], off = e.colOff[oc];
-                int surfK = -1; for (int k = 1; k < len; k++) if ((e.band[off + k - 1] < 0) != (e.band[off + k] < 0)) surfK = k;
-                if (surfK < 0) continue;
-                int probe = surfK - 4;                                   // ~4 voxels below the surface crossing
-                if (probe >= 0 && e.band[off + probe] >= 0) dist[oc] = 0f;   // air below surface → open to sky
+                int oc = ix * width + iz; topY[oc] = float.NaN;
+                int start = e.colStart[oc]; if (start < 0) continue;
+                int len = e.colLen[oc], off = e.colOff[oc]; int topK = -1;
+                for (int k = 1; k < len; k++) if ((e.band[off + k - 1] < 0) != (e.band[off + k] < 0)) topK = k;
+                if (topK >= 0) topY[oc] = (e.extLo + start + topK) * s;
             }
-            // seed atrium centres too (their breach may be small/offset)
-            if (atriums != null)
-                foreach (var a in atriums)
+            const float OPEN_DEPTH = 5f; const int RN = 4;
+            var seed = new float[n];
+            for (int ix = 0; ix < width; ix++)
+            for (int iz = 0; iz < width; iz++)
+            {
+                int oc = ix * width + iz; seed[oc] = float.NaN;
+                float t = topY[oc]; if (float.IsNaN(t)) continue;
+                float nmax = t;
+                for (int dxi = -RN; dxi <= RN; dxi++)
+                for (int dzi = -RN; dzi <= RN; dzi++)
                 {
-                    int aix = Mathf.RoundToInt(a.x / s) - ox, aiz = Mathf.RoundToInt(a.z / s) - oz;
-                    if (aix >= 0 && aix < width && aiz >= 0 && aiz < width) dist[aix * width + aiz] = 0f;
+                    int nx = ix + dxi, nz = iz + dzi; if (nx < 0 || nx >= width || nz < 0 || nz >= width) continue;
+                    float nt = topY[nx * width + nz]; if (!float.IsNaN(nt) && nt > nmax) nmax = nt;
                 }
-            // 2-pass chamfer distance transform (voxels)
-            float d1 = 1f, d2 = 1.41421356f;
-            for (int ix = 0; ix < width; ix++)
-            for (int iz = 0; iz < width; iz++)
-            {
-                int c = ix * width + iz; float m = dist[c];
-                if (ix > 0)            m = Mathf.Min(m, dist[c - width] + d1);
-                if (iz > 0)            m = Mathf.Min(m, dist[c - 1] + d1);
-                if (ix > 0 && iz > 0)  m = Mathf.Min(m, dist[c - width - 1] + d2);
-                if (ix > 0 && iz < width - 1) m = Mathf.Min(m, dist[c - width + 1] + d2);
-                dist[c] = m;
+                if (nmax - t >= OPEN_DEPTH) seed[oc] = t;   // a hole below the surrounding terrain → light enters here
             }
-            for (int ix = width - 1; ix >= 0; ix--)
-            for (int iz = width - 1; iz >= 0; iz--)
+            return seed;
+        }
+
+        // Debug: draw a cyan marker at every light seed within `radius` of center (pt_lightfield).
+        internal static void DrawLightSeeds(Vector3 center, float radius)
+        {
+            float s = ActiveScale(); int drawn = 0; float r2 = radius * radius;
+            foreach (var kv in _sdfCache)
             {
-                int c = ix * width + iz; float m = dist[c];
-                if (ix < width - 1)    m = Mathf.Min(m, dist[c + width] + d1);
-                if (iz < width - 1)    m = Mathf.Min(m, dist[c + 1] + d1);
-                if (ix < width - 1 && iz < width - 1) m = Mathf.Min(m, dist[c + width + 1] + d2);
-                if (ix < width - 1 && iz > 0)         m = Mathf.Min(m, dist[c + width - 1] + d2);
-                dist[c] = m;
+                var parts = kv.Key.Split(',');
+                if (parts.Length != 2 || !int.TryParse(parts[0], out int ox) || !int.TryParse(parts[1], out int oz)) continue;
+                var e = kv.Value; int width = e.width;
+                float zcx = (ox + width * 0.5f) * s, zcz = (oz + width * 0.5f) * s, zr = radius + width * s;
+                if ((zcx - center.x) * (zcx - center.x) + (zcz - center.z) * (zcz - center.z) > zr * zr) continue;
+                var seed = ComputeLightSeeds(e, width, s);
+                for (int ix = 0; ix < width; ix++)
+                for (int iz = 0; iz < width; iz++)
+                {
+                    float sy = seed[ix * width + iz]; if (float.IsNaN(sy)) continue;
+                    float wx = (ox + ix) * s, wz = (oz + iz) * s;
+                    if ((wx - center.x) * (wx - center.x) + (wz - center.z) * (wz - center.z) > r2) continue;
+                    // AddToZone (explicit zone + version bump), NOT Line — Line needs the thread-static _cur that only
+                    // the Carve capture sets; from the console thread it's unset and every marker is silently dropped.
+                    DebugViz.AddToZone(ox, oz, new[] { new Vector3(wx, sy, wz), new Vector3(wx, sy + 4f, wz) }, new Color(0.2f, 0.9f, 1f), 0.3f);
+                    drawn++;
+                }
             }
-            var light = new float[n];
-            float rv = Mathf.Max(0.001f, range / s);   // range in voxels
-            for (int i = 0; i < n; i++) light[i] = Mathf.Clamp01(1f - dist[i] / rv);
-            return light;
+            Log.LogInfo($"[PT] lightfield: drew {drawn} seed markers within {radius:F0}m");
+            Console.instance?.Print($"[PT] lightfield: {drawn} seed markers (cyan verticals) — these are the ONLY spots light enters. pt_viz_clear to wipe.");
         }
 
         // Solidity sign at a voxel for the wall-normal gradient: -1 solid, +1 air, 0 = no data (out of band).

@@ -1692,6 +1692,41 @@ namespace ProceduralTerrain
                 }
                 catch (Exception e) { Log.LogError($"[PT] dumpprefabs: {e}"); }
             });
+            new Terminal.ConsoleCommand("pt_lightfield", "pt_lightfield [radius] — draw a cyan marker at every ivy LIGHT SEED (sky-opening: shaft/breach, a local depression) around you. These are the only spots light enters; ivy is allowed within lightrange of them. If markers appear in dark roofed spots, the seed detection is wrong. pt_viz_clear wipes.", args =>
+            {
+                try
+                {
+                    var player = Player.m_localPlayer; if (player == null) { Console.instance?.Print("[PT] lightfield: no player."); return; }
+                    float radius = 64f; if (args.Length >= 2 && float.TryParse(args[1], out float r)) radius = r;
+                    DebugViz.Enabled = true;                           // force the overlay on — else the renderer early-returns and the markers never draw (debugViz=false in cfg)
+                    if (DebugViz.Radius > 0f && DebugViz.Radius < radius) DebugViz.Radius = radius;   // don't let the camera-radius cull hide markers inside the requested range
+                    DrawLightSeeds(player.transform.position, radius);
+                }
+                catch (Exception e) { Log.LogError($"[PT] lightfield: {e}"); }
+            });
+            new Terminal.ConsoleCommand("pt_spawncount", "pt_spawncount [filter] — tally all LOADED networked objects (ZNetViews in the active area) by prefab name, top 30 (or only names containing [filter]). Diagnose spawn-count/draw-call lag — run it standing still.", args =>
+            {
+                try
+                {
+                    string? filt = args.Length >= 2 ? args[1] : null;
+                    var counts = new Dictionary<string, int>();
+                    int total = 0;
+                    foreach (var nv in UnityEngine.Object.FindObjectsOfType<ZNetView>())
+                    {
+                        if (nv == null) continue;
+                        string n = nv.gameObject.name.Replace("(Clone)", "");
+                        if (filt != null && n.IndexOf(filt, StringComparison.OrdinalIgnoreCase) < 0) continue;
+                        counts.TryGetValue(n, out int c); counts[n] = c + 1; total++;
+                    }
+                    var list = new List<KeyValuePair<string, int>>(counts);
+                    list.Sort((a, b) => b.Value.CompareTo(a.Value));
+                    var sb = new System.Text.StringBuilder();
+                    sb.AppendLine($"[PT] loaded networked objects: {total}" + (filt != null ? $" matching '{filt}'" : "") + " (top 30):");
+                    for (int i = 0; i < list.Count && i < 30; i++) sb.AppendLine($"  {list[i].Value,6}  {list[i].Key}");
+                    Log.LogInfo(sb.ToString()); Console.instance?.Print(sb.ToString());
+                }
+                catch (Exception e) { Log.LogError($"[PT] spawncount: {e}"); }
+            });
             new Terminal.ConsoleCommand("pt_vegdump", "pt_vegdump [biome] — write the FULL ZoneSystem vegetation table (every spawn incl. pickables/berries, with biomes + rates) to BepInEx/config/ProceduralTerrain/pt_vegdump.txt. Optional biome filter (e.g. Swamp).", args =>
             {
                 try
