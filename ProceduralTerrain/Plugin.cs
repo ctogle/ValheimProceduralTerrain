@@ -836,10 +836,11 @@ namespace ProceduralTerrain
         };
     }
 
-    [BepInPlugin("com.ctogle.procedural_terrain", "ProceduralTerrain", "0.0.1")]
+    [BepInPlugin("com.ctogle.procedural_terrain", "ProceduralTerrain", Plugin.Version)]
     [BepInDependency("com.bogey.voxheim", BepInDependency.DependencyFlags.SoftDependency)]
     public partial class Plugin : BaseUnityPlugin
     {
+        internal const string Version = "0.0.1";   // single source of truth — also the world version tag (see WorldVersionGuard)
         internal static ManualLogSource Log = null!;
 
         // HeightGrid scale delegate. Built in BuildDelegates.
@@ -1214,6 +1215,9 @@ namespace ProceduralTerrain
             var vizGo = new GameObject("PTDebugVizRenderer");
             DontDestroyOnLoad(vizGo);
             vizGo.AddComponent<DebugVizRenderer>();
+            var guardGo = new GameObject("PTWorldGuardDriver");
+            DontDestroyOnLoad(guardGo);
+            guardGo.AddComponent<WorldGuardDriver>();
             new Terminal.ConsoleCommand("pt_viz_clear", "pt_viz_clear — clear the debug brush overlay (seed/path lines)", _ =>
             {
                 DebugViz.ClearAll();
