@@ -613,23 +613,7 @@ namespace ProceduralTerrain
             ("altlo", -10000f), ("althi", 10000f),   // absolute world-Y band: carve ONLY within [altlo,althi] (hard floor above the sewer). default = unbounded
             ("depthlo", 0f), ("depthhi", 0f),        // DEPTH-RELATIVE band below the composed surface: carve only in [surf−depthhi, surf−depthlo]. tracks terrain (no world-segmentation). 0 = off
             ("bandfade", 0f),                        // soft ramp (m) at the depth-band edges: sheet width fades 0→full over this → no hard terraced ceiling/floor. 0 = hard edges
-            // STACKED FLOORS (periodic-Y carve) — off by default; when strataperiod>0 the mode carves horizontal
-            // floor-gaps at fixed vertical spacing instead of 3D-noise tunnels. These STACK (level over level), vs
-            // the noise path which only makes one wavy shell.
-            ("strataperiod", 0f),                    // vertical floor-to-floor spacing (m). 0 = off (normal tunnel carve)
-            ("stratagap",    0.5f),                  // fraction of each period that's open walkable air (rest = solid floor slab)
-            ("stratawobble", 0f),                    // XZ height wobble of the floors (m) so they aren't glass-flat
-            ("strataholefreq", 0.02f),               // XZ frequency of the vertical connecting holes (stairwells between levels)
-            ("strataholethresh", 0.6f),              // noise threshold above which a hole opens (higher = fewer holes)
-            ("stratataper", 0f),                     // skylight MOUTH taper: a slow XZ noise shifts the hole threshold as the shaft nears the surface → some flare out (wells), some pinch in. 0 = constant-width shafts
-            ("stratataperfreq", 0.03f),              // XZ scale of the flare-in/flare-out regions
-            ("stratatilt", 0f),                      // slab TILT: a slow XZ noise warps the floor heights so slabs cant at varied angles per region (no discontinuities). metres of warp amplitude. keep < ~period/2
-            ("stratatiltfreq", 0.01f),               // XZ scale of the tilt regions (low = broad regional cant)
-            ("stratadrift", 0f),                     // skylight DRIFT: m of XZ wander the shaft centre picks up as it climbs (Y-varying noise) → leaning/meandering shafts instead of perfectly vertical cutouts. 0 = straight
-            ("stratadriftfreq", 0.02f),              // scale of the drift noise (low = long slow leans; high = jittery)
-            ("stratapillar", 0f),                    // internal SUPPORT COLUMNS: m of solid forced through the gaps where the pillar noise fires → ties floating floor slabs down to the grounded mass (vs isoform blobs, which breach the surface = teeth). 0 = off. Stays under the roof cap → no surface teeth
-            ("stratapillarfreq", 0.04f),             // XZ frequency of the support columns (lower = fewer, wider-spaced pillars)
-            ("stratapillarthresh", 0.5f),            // noise threshold a column must exceed to be a pillar (higher = fewer/thinner pillars)
+            // (strata floor-galleries extracted to the dedicated isotropic_strata mode)
         };
         protected override (string name, float def)[] ParamSpec => _spec;
 
@@ -648,12 +632,6 @@ namespace ProceduralTerrain
             float seaAtten = P[7][idx], seaFade = P[8][idx], seaLevel = P[9][idx];
             float altLo = P[10][idx], altHi = P[11][idx];
             float depthLo = P[12][idx], depthHi = P[13][idx], bandFade = P[14][idx];
-            float strataPeriod = P[15][idx], strataGap = P[16][idx], strataWobble = P[17][idx];
-            float strataHoleFreq = P[18][idx], strataHoleThresh = P[19][idx];
-            float strataTaper = P[20][idx], strataTaperFreq = P[21][idx];
-            float strataTilt = P[22][idx], strataTiltFreq = P[23][idx];
-            float strataDrift = P[24][idx], strataDriftFreq = P[25][idx];
-            float strataPillar = P[26][idx], strataPillarFreq = P[27][idx], strataPillarThresh = P[28][idx];
 
             var pool = Plugin._noisePool!;
             var wg   = args.wg ?? WorldGenerator.instance;
@@ -670,20 +648,6 @@ namespace ProceduralTerrain
                 bandLo = surfH - depthHi;   // bottom of band (deeper)
             }
 
-            // SKYLIGHT: the strata hole-shafts (XZ noise, constant in Y → vertical through every floor) are let
-            // through the solid roof up to open sky, so they read as daylight columns + obvious exits to the surface.
-            float holeN = strataPeriod > 0f ? pool[9].GetNoise(wx * strataHoleFreq, 0f, wz * strataHoleFreq) : -1f;
-            float taperN = (strataPeriod > 0f && strataTaper > 0f) ? pool[8].GetNoise(wx * strataTaperFreq, 0f, wz * strataTaperFreq) : 0f;   // slow XZ → per-region flare in/out
-            float tiltField = (strataPeriod > 0f && strataTilt > 0f) ? strataTilt * pool[11].GetNoise(wx * strataTiltFreq, 0f, wz * strataTiltFreq) : 0f;   // slow XZ height-warp → slabs cant per region
-            // internal support columns: metres of solid forced through the gaps wherever the pillar noise clears the
-            // threshold → a vertical column, constant in XZ (same for every floor), tying the slabs to grounded rock.
-            float pillarSolid = (strataPeriod > 0f && strataPillar > 0f)
-                ? (pool[14].GetNoise(wx * strataPillarFreq, 0f, wz * strataPillarFreq) - strataPillarThresh) * strataPillar
-                : -1f;   // >0 = inside a pillar (metres); <0 = no pillar here
-            // breach allowance uses the MOST-permissive threshold so flare-out mouths can still reach the surface
-            bool  canBreach = strataPeriod > 0f && holeN > (strataHoleThresh - Mathf.Max(0f, strataTaper));
-            float effBandHi = (canBreach && haveSurf) ? surfH + 2f : bandHi;   // hole columns breach the roof to daylight
-
             // Per-mode sea-level attenuation: shrink the tunnel radius (amplitude) as the surface
             // approaches sea level. Must scale amplitude, NOT the output SDF — a carve mode's "off"
             // state is radius->0 (giving a large-negative, solid SDF), not output->0 (which smoothmax
@@ -699,52 +663,8 @@ namespace ProceduralTerrain
             {
                 float wy = args.extLoS + cy * s;
 
-                if (strataPeriod > 0f)
-                {
-                    // STACKED FLOORS as a SMOOTH signed distance — all min/max of linear distances, so ~unit gradient
-                    // everywhere. The coarse-Y upsample then interpolates a clean crossing (no hard -1e4/gate jumps
-                    // to pin the surface to the coarse grid) → the Y-terracing is gone.
-                    float wob = strataWobble != 0f ? strataWobble * pool[10].GetNoise(wx * strataHoleFreq, 0f, wz * strataHoleFreq) : 0f;
-                    float ph  = (wy + wob - tiltField) / strataPeriod; ph -= Mathf.Floor(ph);   // tiltField = regional cant                // 0..1 within a period
-                    float gc  = Mathf.Clamp01(strataGap) * 0.5f;
-                    float dGap = (gc - Mathf.Abs(ph - gc)) * strataPeriod;                        // triangle SDF: + in the gap (air), − in the floor slab
-                    float sdf  = haveSurf ? Mathf.Min(dGap, Mathf.Min(wy - bandLo, bandHi - wy))  // confine floors to the band (smooth edge, no sentinel)
-                                          : dGap;
-                    // SUPPORT COLUMN: force solid (sdf≤−pillarSolid) through the gaps in pillar columns → ties floating
-                    // slabs to grounded rock. Applied BEFORE the shaft block so a coincident skylight still carves through.
-                    if (pillarSolid > 0f) sdf = Mathf.Min(sdf, -pillarSolid);
-                    // skylight shaft: hole columns are air gallery→surface. Only matters above the gallery band
-                    // (below that the gap/floor confinement dominates), so do the extra work only up there.
-                    if (haveSurf && wy > bandHi - strataPeriod)
-                    {
-                        // DRIFT: wander the shaft centre in XZ as it climbs (Y-varying noise) → leaning/meandering
-                        // shafts, not perfectly vertical cutouts. Re-sample the hole field at the drifted point.
-                        float hN = holeN;
-                        if (strataDrift > 0f)
-                        {
-                            float dx = strataDrift * pool[12].GetNoise(wx * strataDriftFreq, wy * strataDriftFreq, wz * strataDriftFreq);
-                            float dz = strataDrift * pool[13].GetNoise(wx * strataDriftFreq, wy * strataDriftFreq, wz * strataDriftFreq);
-                            hN = pool[9].GetNoise((wx + dx) * strataHoleFreq, 0f, (wz + dz) * strataHoleFreq);
-                        }
-                        // TAPER: shift the hole threshold with height over the WHOLE shaft (not a thin top cap) so the
-                        // flare/pinch is visible as a gradient. taperN>0 regions flare out (eth drops → mouth widens),
-                        // taperN<0 pinch in. Breach is driven purely by this per-height test → self-limiting, no roof pock.
-                        float eth = strataHoleThresh;
-                        if (strataTaper > 0f)
-                        {
-                            float rampLo = bandHi - strataPeriod;                       // start at the gallery roof
-                            eth -= taperN * strataTaper * Mathf.Clamp01((wy - rampLo) / Mathf.Max(surfH + 2f - rampLo, 0.001f));
-                        }
-                        if (hN > eth) sdf = Mathf.Max(sdf, Mathf.Min(wy - bandLo, (surfH + 2f) - wy));
-                    }
-                    sdf = Mathf.Min(sdf, wy - altLo);                                             // solid below the sewer-floor cap
-                    if (altHi < 9000f) sdf = Mathf.Min(sdf, altHi - wy);                          // optional hard top cap
-                    outCol[baseIdx + cy] = sdf * 4f * s;
-                    continue;
-                }
-
-                // --- tunnel path (3D noise) keeps its hard band gate ---
-                if (wy < altLo || wy > altHi || wy < bandLo || wy > effBandHi) { outCol[baseIdx + cy] = -1e4f; continue; }
+                // --- tunnel path (3D noise) with its hard band gate ---
+                if (wy < altLo || wy > altHi || wy < bandLo || wy > bandHi) { outCol[baseIdx + cy] = -1e4f; continue; }
                 float bandFac = 1f;
                 if (bandFade > 0f && depthHi > 0f) bandFac = Mathf.Clamp01(Mathf.Min(bandHi - wy, wy - bandLo) / bandFade);
                 if (bandFac <= 0f) { outCol[baseIdx + cy] = -1e4f; continue; }
@@ -764,6 +684,106 @@ namespace ProceduralTerrain
                 float localWidth = Mathf.Max(bandAmp * (1f + wv * wn), 0.001f);
                 float dist       = Mathf.Sqrt(na * na + nb * nb) * 0.7071f;
                 outCol[baseIdx + cy] = (localWidth - dist) / localWidth * 4f * s;
+            }
+        }
+    }
+
+    // ── IsotropicStrata: stacked horizontal floor-galleries ───────────────────
+    // Extracted from IsotropicTunnel (where strataperiod>0 silently reskinned the tunnel carve — a smell).
+    // Carves periodic-Y floor/gap slabs confined to a depth-relative band, with skylight shafts (hole noise),
+    // regional slab tilt, drifting/tapering shafts, and internal support pillars. Behaviour is byte-identical
+    // to the old isotropic_tunnel strata branch — same noise-pool slots (8..14), same formulas, same *4*s out.
+    internal sealed class IsotropicStrata : NativeModeDef
+    {
+        static readonly (string, float)[] _spec = {
+            ("strataperiod", 0f),                    // index 0 = active gate: vertical floor-to-floor spacing (m). 0 = mode off
+            ("stratagap",    0.5f),                  // fraction of each period that's open walkable air
+            ("stratawobble", 0f),                    // XZ height wobble of the floors (m) so they aren't glass-flat
+            ("strataholefreq", 0.02f),               // XZ frequency of the vertical connecting holes (stairwells)
+            ("strataholethresh", 0.6f),              // noise threshold above which a hole opens (higher = fewer)
+            ("stratataper", 0f),                     // skylight MOUTH taper over the whole shaft (0 = constant width)
+            ("stratataperfreq", 0.03f),              // XZ scale of the flare-in/flare-out regions
+            ("stratatilt", 0f),                      // slab TILT: slow XZ height-warp so slabs cant per region (m)
+            ("stratatiltfreq", 0.01f),               // XZ scale of the tilt regions (low = broad regional cant)
+            ("stratadrift", 0f),                     // skylight DRIFT: m of XZ wander the shaft centre picks up climbing
+            ("stratadriftfreq", 0.02f),              // scale of the drift noise
+            ("stratapillar", 0f),                    // internal SUPPORT COLUMNS: m of solid forced through the gaps
+            ("stratapillarfreq", 0.04f),             // XZ frequency of the support columns
+            ("stratapillarthresh", 0.5f),            // noise threshold a column must exceed
+            ("altlo", -10000f),                      // solid below this world-Y (hard floor above the sewer)
+            ("althi", 10000f),                       // optional hard top cap
+            ("depthlo", 0f),                         // band top = surface−depthlo
+            ("depthhi", 0f),                         // band bottom = surface−depthhi (0 = no band → unconfined floors)
+        };
+        protected override (string name, float def)[] ParamSpec => _spec;
+
+        public override void BakeColumn(ref CarveBuffers cb, in BakeCellArgs args)
+        {
+            int pi = PipelineIndex;
+            var P = cb.bkModeParams![pi];
+            int idx = args.cellIdx, baseIdx = idx * args.bh;
+            float[] outCol = cb.bkModeAux![pi][0];
+
+            float strataPeriod = P[0][idx];
+            if (strataPeriod <= 0f) { for (int cy = 0; cy < args.bh; cy++) outCol[baseIdx + cy] = -1e4f; return; }
+            float strataGap = P[1][idx], strataWobble = P[2][idx];
+            float strataHoleFreq = P[3][idx], strataHoleThresh = P[4][idx];
+            float strataTaper = P[5][idx], strataTaperFreq = P[6][idx];
+            float strataTilt = P[7][idx], strataTiltFreq = P[8][idx];
+            float strataDrift = P[9][idx], strataDriftFreq = P[10][idx];
+            float strataPillar = P[11][idx], strataPillarFreq = P[12][idx], strataPillarThresh = P[13][idx];
+            float altLo = P[14][idx], altHi = P[15][idx];
+            float depthLo = P[16][idx], depthHi = P[17][idx];
+
+            var pool = Plugin._noisePool!;
+            var wg   = args.wg ?? WorldGenerator.instance;
+            float wx = args.worldX, wz = args.worldZ, s = args.s;
+
+            float surfH = 0f; bool haveSurf = false;
+            float bandHi = float.MaxValue, bandLo = float.MinValue;
+            if (depthHi > 0f && wg != null)
+            {
+                surfH = Plugin.ComposedSurfaceSample(wx, wz, wg); haveSurf = true;
+                bandHi = surfH - depthLo;
+                bandLo = surfH - depthHi;
+            }
+
+            float holeN      = pool[9].GetNoise(wx * strataHoleFreq, 0f, wz * strataHoleFreq);
+            float taperN     = strataTaper > 0f ? pool[8].GetNoise(wx * strataTaperFreq, 0f, wz * strataTaperFreq) : 0f;
+            float tiltField  = strataTilt  > 0f ? strataTilt * pool[11].GetNoise(wx * strataTiltFreq, 0f, wz * strataTiltFreq) : 0f;
+            float pillarSolid = strataPillar > 0f
+                ? (pool[14].GetNoise(wx * strataPillarFreq, 0f, wz * strataPillarFreq) - strataPillarThresh) * strataPillar
+                : -1f;
+
+            for (int cy = 0; cy < args.bh; cy++)
+            {
+                float wy = args.extLoS + cy * s;
+                float wob = strataWobble != 0f ? strataWobble * pool[10].GetNoise(wx * strataHoleFreq, 0f, wz * strataHoleFreq) : 0f;
+                float ph  = (wy + wob - tiltField) / strataPeriod; ph -= Mathf.Floor(ph);
+                float gc  = Mathf.Clamp01(strataGap) * 0.5f;
+                float dGap = (gc - Mathf.Abs(ph - gc)) * strataPeriod;
+                float sdf  = haveSurf ? Mathf.Min(dGap, Mathf.Min(wy - bandLo, bandHi - wy)) : dGap;
+                if (pillarSolid > 0f) sdf = Mathf.Min(sdf, -pillarSolid);
+                if (haveSurf && wy > bandHi - strataPeriod)
+                {
+                    float hN = holeN;
+                    if (strataDrift > 0f)
+                    {
+                        float dx = strataDrift * pool[12].GetNoise(wx * strataDriftFreq, wy * strataDriftFreq, wz * strataDriftFreq);
+                        float dz = strataDrift * pool[13].GetNoise(wx * strataDriftFreq, wy * strataDriftFreq, wz * strataDriftFreq);
+                        hN = pool[9].GetNoise((wx + dx) * strataHoleFreq, 0f, (wz + dz) * strataHoleFreq);
+                    }
+                    float eth = strataHoleThresh;
+                    if (strataTaper > 0f)
+                    {
+                        float rampLo = bandHi - strataPeriod;
+                        eth -= taperN * strataTaper * Mathf.Clamp01((wy - rampLo) / Mathf.Max(surfH + 2f - rampLo, 0.001f));
+                    }
+                    if (hN > eth) sdf = Mathf.Max(sdf, Mathf.Min(wy - bandLo, (surfH + 2f) - wy));
+                }
+                sdf = Mathf.Min(sdf, wy - altLo);
+                if (altHi < 9000f) sdf = Mathf.Min(sdf, altHi - wy);
+                outCol[baseIdx + cy] = sdf * 4f * s;
             }
         }
     }
@@ -1222,6 +1242,13 @@ namespace ProceduralTerrain
             {
                 DebugViz.ClearAll();
                 Log.LogInfo("[ProceduralTerrain] debug viz cleared");
+            });
+            new Terminal.ConsoleCommand("pt_guardtest", "pt_guardtest — stamp this world's PT version tag to a dummy old version (0.0.0) so the NEXT load trips the world-version guard. Log out and back in to verify it holds you on the loading screen with a mismatch prompt (Yes re-stamps to current).", _ =>
+            {
+                var zs = ZoneSystem.instance;
+                if (zs == null) { Console.instance?.Print("[PT] guardtest: no ZoneSystem (load a world first)."); return; }
+                zs.SetGlobalKey("pt_ver 0.0.0");
+                Console.instance?.Print("[PT] guardtest: world tag set to v0.0.0. Log out and back in — the guard should hold you on the loading screen and prompt.");
             });
             new Terminal.ConsoleCommand("pt_interp", "pt_interp [tricubic|trilinear] — A/B the step>1 bake rehydration interp on the SAME bake (re-serves loaded zones)", args =>
             {

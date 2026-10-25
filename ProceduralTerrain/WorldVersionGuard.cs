@@ -20,11 +20,18 @@ namespace ProceduralTerrain
         static volatile Action _pending = Action.None;
         static string _worldVer = "";          // the mismatched world's tag (empty = untagged)
         static bool _promptShown;              // guard against pushing the popup twice while it's open
+        static volatile bool _awaitingAnswer;  // a prompt is live/pending → HOLD player spawn (loading screen stays)
+
+        // true while a mismatch prompt is unanswered → Game.UpdateRespawn is skipped so the player never spawns
+        // into the world behind the popup. Set the instant we know we'll prompt (in the LoadWorld postfix, before
+        // any respawn tick) so the load can't race ahead of the question.
+        internal static bool BlockSpawn => _awaitingAnswer;
 
         // ZNet.LoadWorld postfix (main thread). existing = __result: true → save loaded, false → brand-new world.
         internal static void OnWorldLoaded(bool existing)
         {
             _promptShown = false;
+            _awaitingAnswer = false;
             if (!existing) { _pending = Action.Stamp; return; }   // fresh world → tag it
 
             var zs = ZoneSystem.instance;
@@ -33,7 +40,8 @@ namespace ProceduralTerrain
             if (ver == Plugin.Version) { _pending = Action.None; return; }   // tag matches installed → fine
 
             _worldVer = ver ?? "";
-            _pending = Action.Prompt;   // absent or mismatched → confirm before the user can wreck it
+            _pending = Action.Prompt;     // absent or mismatched → confirm before the user can wreck it
+            _awaitingAnswer = true;       // hold spawn NOW (before the popup even renders) so we never load in while asking
         }
 
         static void Stamp()
@@ -62,19 +70,20 @@ namespace ProceduralTerrain
                             // no interactive user to confirm — don't silently convert; log loudly and stamp so a
                             // deliberate server setup proceeds, but leave a trail.
                             Plugin.Log.LogWarning($"[PT-guard] DEDICATED: world tag '{_worldVer}' != installed v{Plugin.Version} and no popup available — proceeding and re-stamping. Verify this is intended.");
+                            _awaitingAnswer = false;
                             Stamp();
                         }
-                        return;   // client GUI not ready yet → try again next frame
+                        return;   // client GUI not ready yet → try again next frame (spawn stays held)
                     }
                     _promptShown = true;
                     string installed = Plugin.Version;
                     string text = string.IsNullOrEmpty(_worldVer)
                         ? $"This world has no Procedural Terrain data (installed v{installed}).\nContinuing will permanently alter its terrain — do NOT do this to an existing vanilla world.\n\nAre you sure?"
                         : $"Procedural Terrain version mismatch with world version (world v{_worldVer}, installed v{installed}).\nStructures are at risk; are you sure?";
-                    _pending = Action.None;
+                    _pending = Action.None;   // don't re-push; _awaitingAnswer still holds spawn until a button is clicked
                     UnifiedPopup.Push(new YesNoPopup("Procedural Terrain", text,
-                        yesCallback: () => { UnifiedPopup.Pop(); Stamp(); },                      // consent → re-tag + play
-                        noCallback:  () => { UnifiedPopup.Pop(); Game.instance?.Logout(save: false, changeToStartScene: true); },  // back to menu, DO NOT save → disk world untouched
+                        yesCallback: () => { UnifiedPopup.Pop(); _awaitingAnswer = false; Stamp(); },                      // consent → release spawn + re-tag
+                        noCallback:  () => { UnifiedPopup.Pop(); _awaitingAnswer = false; Game.instance?.Logout(save: false, changeToStartScene: true); },  // back to menu, DO NOT save → disk world untouched
                         localizeText: false));
                     return;
             }
@@ -85,6 +94,14 @@ namespace ProceduralTerrain
     static class ZNetLoadWorldGuard
     {
         static void Postfix(bool __result) => WorldVersionGuard.OnWorldLoaded(__result);
+    }
+
+    // Hold the player's first spawn (keeps the loading screen up, no world entry) until the mismatch prompt is
+    // answered — so we never "load in while asking". Released on Yes (play) or torn down on No (Logout).
+    [HarmonyPatch(typeof(Game), "UpdateRespawn")]
+    static class GameUpdateRespawnGuard
+    {
+        static bool Prefix() => !WorldVersionGuard.BlockSpawn;
     }
 
     // Main-thread pump for the guard (popup/Logout must run on Unity's thread).

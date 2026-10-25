@@ -120,6 +120,7 @@ namespace ProceduralTerrain
             {
                 { "isotropic_formation", () => new IsotropicFormation() },
                 { "isotropic_tunnel",    () => new IsotropicTunnel()    },
+                { "isotropic_strata",    () => new IsotropicStrata()    },
                 { "surface_blobs",       () => new SurfaceBlobs()       },
             };
 
