@@ -176,11 +176,11 @@ namespace ProceduralTerrain
                 { float dx = a.x - zoneCenterPos.x, dz = a.z - zoneCenterPos.z; if (dx * dx + dz * dz <= f2) nearAtriums.Add(a); }
             }
 
-            bool anyLight = false;
-            foreach (var p in objPool)  if (p.LightRange > 0f) anyLight = true;
-            foreach (var p in channels) if (p.LightRange > 0f) anyLight = true;
-            foreach (var p in spwPool)  if (p.LightRange > 0f) anyLight = true;
-            float[]? seedY = anyLight ? ComputeLightSeeds(e, width, s) : null;
+            float maxLR = 0f;
+            foreach (var p in objPool)  if (p.LightRange > maxLR) maxLR = p.LightRange;
+            foreach (var p in channels) if (p.LightRange > maxLR) maxLR = p.LightRange;
+            foreach (var p in spwPool)  if (p.LightRange > maxLR) maxLR = p.LightRange;
+            LitField? litField = maxLR > 0f ? ComputeLitField(e, width, s, maxLR) : null;
 
             // place one rule at a crossing, honoring its cap + spacing + flatness; returns true if placed.
             bool TryPlace(Placement p, int ix, int iz, int ci, bool isFloor, bool isSurface, float cyY, float worldX, float worldZ, float yaw, Vector3? wallNormal = null)
@@ -193,25 +193,10 @@ namespace ProceduralTerrain
                     float cn = Plugin._noisePool[1].GetNoise(worldX * p.ClusterFreq, 0f, worldZ * p.ClusterFreq);
                     if (cn < p.ClusterThresh) return false;
                 }
-                if (p.LightRange > 0f && seedY != null)   // lit iff within LightRange (3D) of a sky-ray-reached seed
+                if (p.LightRange > 0f && litField != null)   // lit iff light reaches here through AIR within LightRange (geodesic, occluded by rock)
                 {
-                    float X = p.LightRange, X2 = X * X;
-                    bool lit = false;
-                    float self = seedY[ix * width + iz];                       // own column's surface (vertical check, cheap)
-                    if (!float.IsNaN(self) && Mathf.Abs(self - cyY) <= X) lit = true;
-                    if (!lit)                                                  // else scan laterally for a near seed (shaft-bottom halo)
-                    {
-                        int R = Mathf.CeilToInt(X / s);
-                        for (int dxi = -R; dxi <= R && !lit; dxi++)
-                        for (int dzi = -R; dzi <= R && !lit; dzi++)
-                        {
-                            int nx = ix + dxi, nz = iz + dzi; if (nx < 0 || nx >= width || nz < 0 || nz >= width) continue;
-                            float ny = seedY[nx * width + nz]; if (float.IsNaN(ny)) continue;
-                            float lx = dxi * s, lz = dzi * s, ldy = ny - cyY;
-                            if (lx * lx + lz * lz + ldy * ldy <= X2) lit = true;
-                        }
-                    }
-                    if (!lit) return false;
+                    int cyVox = Mathf.RoundToInt(cyY / s) - e.extLo;
+                    if (!litField.Lit(ix, iz, cyVox, p.LightRange)) return false;
                 }
                 if (p.BiomePure > 0f && wg.GetBiomeArea(new Vector3(worldX, 0f, worldZ)) == Heightmap.BiomeArea.Edge) return false;  // interior only, off the boundary
                 if (p.AtriumOnly > 0f)   // confine to atrium ROOM: within AtriumOnly metres in 3D of a carved dome centre
@@ -631,39 +616,86 @@ namespace ProceduralTerrain
             return new Vector3(dydx, -1f, dydz).normalized;
         }
 
-        // LIGHT SEEDS: a column is a seed only if its topmost crossing (where a downward sky-ray stops) is a LOCAL
-        // DEPRESSION — ≥OPEN_DEPTH below the highest surface in a small neighbourhood (a shaft/breach into the cave),
-        // NOT the normal roof/ground. Returns per-column seed Y (NaN = not a seed). This is where light actually enters.
-        static float[] ComputeLightSeeds(Plugin.ZoneField e, int width, float s)
+        // GEODESIC LIT-FIELD. Per-voxel distance (metres, through AIR only) from the sky. Seeds = the air voxel just
+        // above every column's topmost crossing (the sky-exposed surface skin); a BFS floods DOWN/through connected air
+        // to a bounded range. A cave voxel is lit iff light could actually WALK there through the void from an opening —
+        // so a roofed chamber stays dark unless a real air shaft connects it, and distance ignores rock (no through-wall
+        // lighting). Replaces the old Euclidean "within X of a surface depression" test that lit pitch-black ceilings.
+        // POC: per-zone only — a mouth across a zone seam doesn't light this zone yet (bounded ~range strip at edges).
+        internal sealed class LitField
         {
-            int n = width * width;
-            var topY = new float[n];
-            for (int ix = 0; ix < width; ix++)
-            for (int iz = 0; iz < width; iz++)
+            public float[] dist = System.Array.Empty<float>(); public int width, yLo, H; public float s;
+            float At(int ix, int iz, int vy)
             {
-                int oc = ix * width + iz; topY[oc] = float.NaN;
-                int start = e.colStart[oc]; if (start < 0) continue;
-                int len = e.colLen[oc], off = e.colOff[oc]; int topK = -1;
-                for (int k = 1; k < len; k++) if ((e.band[off + k - 1] < 0) != (e.band[off + k] < 0)) topK = k;
-                if (topK >= 0) topY[oc] = (e.extLo + start + topK) * s;
+                if (ix < 0 || ix >= width || iz < 0 || iz >= width || vy < 0 || vy >= H) return float.MaxValue;
+                return dist[(ix * width + iz) * H + vy];
             }
-            const float OPEN_DEPTH = 5f; const int RN = 4;
-            var seed = new float[n];
+            // Lit iff the candidate voxel or any 6-neighbour air voxel was reached within `range` metres of sky.
+            public bool Lit(int ix, int iz, int worldCy, float range)
+            {
+                int vy = worldCy - yLo;
+                float best = At(ix, iz, vy);
+                best = Mathf.Min(best, At(ix + 1, iz, vy)); best = Mathf.Min(best, At(ix - 1, iz, vy));
+                best = Mathf.Min(best, At(ix, iz + 1, vy)); best = Mathf.Min(best, At(ix, iz - 1, vy));
+                best = Mathf.Min(best, At(ix, iz, vy + 1)); best = Mathf.Min(best, At(ix, iz, vy - 1));
+                return best <= range;
+            }
+            public float DistAt(int ix, int iz, int worldCy) => At(ix, iz, worldCy - yLo);
+        }
+
+        [ThreadStatic] static float[]? _litScratch;
+        [ThreadStatic] static int[]?   _litQueue;
+
+        static LitField? ComputeLitField(Plugin.ZoneField e, int width, float s, float maxRange)
+        {
+            int yLo = int.MaxValue, yHi = int.MinValue;
+            for (int oc = 0; oc < width * width; oc++)
+            { int st = e.colStart[oc]; if (st < 0) continue; int ln = e.colLen[oc]; if (st < yLo) yLo = st; if (st + ln > yHi) yHi = st + ln; }
+            if (yLo > yHi) return null;
+            int H = yHi - yLo; if (H <= 0) return null;
+            int n = width * width * H;
+            var dist = _litScratch; if (dist == null || dist.Length < n) { dist = new float[n]; _litScratch = dist; }
+            for (int i = 0; i < n; i++) dist[i] = float.MaxValue;
+            var q = _litQueue; if (q == null || q.Length < n) { q = new int[n]; _litQueue = q; }
+            int qh = 0, qt = 0;
+
+            // solidity in the extLo (cy) frame: below a column's run = solid ground, above it = open sky, else read band.
+            bool IsAir(int ix, int iz, int cy)
+            {
+                int oc = ix * width + iz; int st = e.colStart[oc]; if (st < 0) return true;
+                int ln = e.colLen[oc]; if (cy < st) return false; if (cy >= st + ln) return true;
+                return e.band[e.colOff[oc] + (cy - st)] >= 0;
+            }
+
+            // seed the sky-exposed surface air of every column (voxel just above the topmost crossing), dist 0.
             for (int ix = 0; ix < width; ix++)
             for (int iz = 0; iz < width; iz++)
             {
-                int oc = ix * width + iz; seed[oc] = float.NaN;
-                float t = topY[oc]; if (float.IsNaN(t)) continue;
-                float nmax = t;
-                for (int dxi = -RN; dxi <= RN; dxi++)
-                for (int dzi = -RN; dzi <= RN; dzi++)
+                int oc = ix * width + iz; int st = e.colStart[oc]; if (st < 0) continue;
+                int ln = e.colLen[oc], off = e.colOff[oc]; int surfCy = -1;
+                for (int k = 1; k < ln; k++) if ((e.band[off + k - 1] < 0) != (e.band[off + k] < 0)) surfCy = st + k;
+                if (surfCy < 0) continue;
+                int vy = surfCy - yLo; if (vy < 0 || vy >= H) continue;
+                int id = (ix * width + iz) * H + vy; if (dist[id] == float.MaxValue) { dist[id] = 0f; q[qt++] = id; }
+            }
+
+            // uniform-cost BFS (step = s metres) → first visit is the shortest geodesic distance through air.
+            while (qh < qt)
+            {
+                int id = q[qh++]; float d = dist[id];
+                if (d >= maxRange) continue;
+                int cell = id / H, vy = id % H; int ix = cell / width, iz = cell % width; int cy = vy + yLo;
+                void Try(int nix, int niz, int ncy)
                 {
-                    int nx = ix + dxi, nz = iz + dzi; if (nx < 0 || nx >= width || nz < 0 || nz >= width) continue;
-                    float nt = topY[nx * width + nz]; if (!float.IsNaN(nt) && nt > nmax) nmax = nt;
+                    if (nix < 0 || nix >= width || niz < 0 || niz >= width) return;
+                    int nvy = ncy - yLo; if (nvy < 0 || nvy >= H) return;
+                    if (!IsAir(nix, niz, ncy)) return;
+                    int nid = (nix * width + niz) * H + nvy;
+                    if (dist[nid] == float.MaxValue) { dist[nid] = d + s; q[qt++] = nid; }
                 }
-                if (nmax - t >= OPEN_DEPTH) seed[oc] = t;   // a hole below the surrounding terrain → light enters here
+                Try(ix + 1, iz, cy); Try(ix - 1, iz, cy); Try(ix, iz + 1, cy); Try(ix, iz - 1, cy); Try(ix, iz, cy + 1); Try(ix, iz, cy - 1);
             }
-            return seed;
+            return new LitField { dist = dist, width = width, yLo = yLo, H = H, s = s };
         }
 
         // Debug: draw a cyan marker at every light seed within `radius` of center (pt_lightfield).
@@ -677,21 +709,34 @@ namespace ProceduralTerrain
                 var e = kv.Value; int width = e.width;
                 float zcx = (ox + width * 0.5f) * s, zcz = (oz + width * 0.5f) * s, zr = radius + width * s;
                 if ((zcx - center.x) * (zcx - center.x) + (zcz - center.z) * (zcz - center.z) > zr * zr) continue;
-                var seed = ComputeLightSeeds(e, width, s);
+                float vizRange = Mathf.Min(radius, 28f);
+                var lf = ComputeLitField(e, width, s, vizRange);
+                if (lf == null) continue;
                 for (int ix = 0; ix < width; ix++)
                 for (int iz = 0; iz < width; iz++)
                 {
-                    float sy = seed[ix * width + iz]; if (float.IsNaN(sy)) continue;
+                    int oc = ix * width + iz; int st = e.colStart[oc]; if (st < 0) continue;
+                    int ln = e.colLen[oc], off = e.colOff[oc]; int surfCy = -1;
+                    for (int k = 1; k < ln; k++) if ((e.band[off + k - 1] < 0) != (e.band[off + k] < 0)) surfCy = st + k;
+                    if (surfCy < 0) continue;
                     float wx = (ox + ix) * s, wz = (oz + iz) * s;
                     if ((wx - center.x) * (wx - center.x) + (wz - center.z) * (wz - center.z) > r2) continue;
-                    // AddToZone (explicit zone + version bump), NOT Line — Line needs the thread-static _cur that only
-                    // the Carve capture sets; from the console thread it's unset and every marker is silently dropped.
-                    DebugViz.AddToZone(ox, oz, new[] { new Vector3(wx, sy, wz), new Vector3(wx, sy + 4f, wz) }, new Color(0.2f, 0.9f, 1f), 0.3f);
-                    drawn++;
+                    // draw the SUB-SURFACE lit air (below the sky skin) coloured by geodesic distance: cyan = near a mouth,
+                    // fading to deep blue at the range limit. Strided by 2 to keep the marker count sane.
+                    for (int cy = st; cy < surfCy - 1; cy += 2)
+                    {
+                        float d = lf.DistAt(ix, iz, cy);
+                        if (d <= 0.5f || d > vizRange) continue;   // skip the sky seed itself and anything out of range
+                        float t = d / vizRange;
+                        float wy = (e.extLo + cy) * s;
+                        DebugViz.AddToZone(ox, oz, new[] { new Vector3(wx, wy, wz), new Vector3(wx, wy + 1.4f, wz) },
+                            new Color(0.2f + 0.1f * t, 0.9f - 0.6f * t, 1f), 0.3f);
+                        drawn++;
+                    }
                 }
             }
-            Log.LogInfo($"[PT] lightfield: drew {drawn} seed markers within {radius:F0}m");
-            Console.instance?.Print($"[PT] lightfield: {drawn} seed markers (cyan verticals) — these are the ONLY spots light enters. pt_viz_clear to wipe.");
+            Log.LogInfo($"[PT] lightfield: drew {drawn} lit-air markers within {radius:F0}m");
+            Console.instance?.Print($"[PT] lightfield: {drawn} lit-air markers (cyan=near a sky opening → blue=far). These are the sub-surface spots light REACHES through air. pt_viz_clear to wipe.");
         }
 
         // Solidity sign at a voxel for the wall-normal gradient: -1 solid, +1 air, 0 = no data (out of band).
