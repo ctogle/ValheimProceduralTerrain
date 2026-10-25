@@ -270,7 +270,7 @@ namespace ProceduralTerrain
                         int cyAbs = Mathf.RoundToInt(cyY / s) - e.extLo;
                         gn = GradientNormalSnap(e, ix, iz, cyAbs, width, out float distVox, out float gmag);
                         // guard: degenerate gradient (flat coarse facet) or a long snap = unreliable → skip, don't float it
-                        if (gmag < 1.0f || Mathf.Abs(distVox) > 1.2f) { if (_ivyDbg < 20) { _ivyDbg++; Log.LogInfo($"[PT-ivy] #{_ivyDbg} SKIP gm={gmag:F2} snapVox={distVox:F2}"); } return false; }
+                        if (gmag < 1.0f || Mathf.Abs(distVox) > 1.2f) return false;
                         anchor -= gn * (distVox * s);   // SNAP onto the real surface (column x/z is only on-surface for flat spots)
                         pos = anchor;
                     }
@@ -287,7 +287,6 @@ namespace ProceduralTerrain
                                 + tB * ((CCRand(ox + ix, oz + iz, ci, 71) - 0.5f) * 2f * p.JitterPos);
                         pos = anchor;
                     }
-                    if (_ivyDbg < 20) { _ivyDbg++; Log.LogInfo($"[PT-ivy] #{_ivyDbg} {(wallNormal.HasValue ? "WALL" : isFloor ? "FLOOR" : isSurface ? "SURF" : "CEIL")} gn=({gn.x:F2},{gn.y:F2},{gn.z:F2}) pos=({anchor.x:F1},{anchor.y:F1},{anchor.z:F1})"); }
                 }
                 else if (p.Hang)
                 {
@@ -515,9 +514,6 @@ namespace ProceduralTerrain
         }
 
         static int _inertLiveLogged;
-        static int _ivyDbg;
-        static int _pivotDbg;
-        static int _pivotDbgShip;
         static bool SpawnCave(GameObject prefab, Vector3 pos, Quaternion rot, bool ghost, List<GameObject> spawnedObjects, int overrideCreature = 0, bool inert = false, float scaleMul = 1f, Placement? cfg = null)
         {
             try
@@ -526,20 +522,6 @@ namespace ProceduralTerrain
                 var go = UnityEngine.Object.Instantiate(prefab, pos, rot);
                 if (!go.activeSelf) go.SetActive(true);   // some runtime prefabs (dust motes) ship inactive as a template
                 if (scaleMul != 1f) go.transform.localScale *= scaleMul;
-                bool isShip = go.name.StartsWith("shipwreck", StringComparison.OrdinalIgnoreCase);
-                bool isVine = go.name.StartsWith("vines", StringComparison.OrdinalIgnoreCase) || go.name.StartsWith("VineGreen", StringComparison.OrdinalIgnoreCase);
-                // separate budgets so a flood of vines can't starve the shipwreck-pivot capture (and vice-versa)
-                if ((isShip ? _pivotDbgShip : _pivotDbg) < 16 && (isShip || isVine))
-                {
-                    var rnd = go.GetComponentInChildren<Renderer>();
-                    if (rnd != null)
-                    {
-                        Vector3 localCenter = go.transform.InverseTransformPoint(rnd.bounds.center);
-                        Vector3 ext = go.transform.InverseTransformVector(rnd.bounds.size);
-                        if (isShip) _pivotDbgShip++; else _pivotDbg++;
-                        Plugin.Log.LogInfo($"[PT-pivot] {go.name} pivot→centroid(local)=({localCenter.x:F2},{localCenter.y:F2},{localCenter.z:F2}) size(local)=({Mathf.Abs(ext.x):F2},{Mathf.Abs(ext.y):F2},{Mathf.Abs(ext.z):F2})");
-                    }
-                }
                 if (cfg != null) ConfigBird(go, cfg);
                 if (ghost) { spawnedObjects.Add(go); ZNetView.FinishGhostInit(); }
                 if (inert)   // persist the flag (re-stripped on reload) + neutralize this live instance now
