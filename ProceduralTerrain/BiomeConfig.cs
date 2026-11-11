@@ -288,6 +288,28 @@ namespace ProceduralTerrain
             {
                 var profOvr = new Dictionary<string, Dictionary<string, float>>(StringComparer.OrdinalIgnoreCase);
                 namedProfiles[profName] = ParseTerrainProfile(profName, kvs, namedProfiles, profOvr);
+                // Inherit parents' PER-MODE param overrides too (profiles=): the mode list + profile scalars are
+                // already inherited in ParseTerrainProfile, but the mode.param overrides live here and must be
+                // merged so a `profiles=parent` clone actually matches the parent. Child's own overrides win;
+                // among multiple parents, later wins (same as the scalar inheritance).
+                var childOwn = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach (var (m, ps) in profOvr) foreach (var pn in ps.Keys) childOwn.Add(m + "" + pn);
+                foreach (var (k, v) in kvs)
+                {
+                    if (!k.Equals("profiles", StringComparison.OrdinalIgnoreCase)) continue;
+                    foreach (var p in v.Split(','))
+                    {
+                        var pn = p.Trim();
+                        if (pn.Length == 0 || !allProfileParamOverrides.TryGetValue(pn, out var parentOvr)) continue;
+                        foreach (var (mode, pars) in parentOvr)
+                        {
+                            if (!profOvr.TryGetValue(mode, out var childPars))
+                            { childPars = new Dictionary<string, float>(StringComparer.OrdinalIgnoreCase); profOvr[mode] = childPars; }
+                            foreach (var (pname, pval) in pars)
+                                if (!childOwn.Contains(mode + "" + pname)) childPars[pname] = pval;   // parent fills/later-wins, never clobbers child's own
+                        }
+                    }
+                }
                 if (profOvr.Count > 0) allProfileParamOverrides[profName] = profOvr;
             }
             bool ParentsReady(List<(string key, string val)> kvs)
@@ -357,6 +379,8 @@ namespace ProceduralTerrain
                             _pocketRemoval = !(v == "0" || v == "false");
                         if (k == "hidelodmeshes")
                             _hideLodMeshes = (v == "1" || v == "true");
+                        if (k == "hidemist")
+                            _hideMist = (v == "1" || v == "true");
                         if (k == "lodunderground")
                             _lodUnderground = !(v == "0" || v == "false");
                         if (k == "debugviz")

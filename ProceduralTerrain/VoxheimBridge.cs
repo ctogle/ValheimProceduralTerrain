@@ -215,6 +215,7 @@ namespace ProceduralTerrain
             // GC correlation: did serving this zone trigger a collection? (gen0 = churn, gen2 = big pause)
             int _gc0 = GC.CollectionCount(0), _gc1 = GC.CollectionCount(1), _gc2 = GC.CollectionCount(2);
             bool _genThisZone = !haveCache;
+            double carveMs = 0, gwMs = 0;
 
             // Carve/read a PURELY PROCEDURAL baseline — identical for baked and live. Carve internally
             // serves a bake HIT (PopulateSparseFromBake) or carves live; either way the result has NO
@@ -224,7 +225,7 @@ namespace ProceduralTerrain
                 long _tc0 = System.Diagnostics.Stopwatch.GetTimestamp();
                 try { Plugin.Carve(context.Heights, ox, oz, width, context.InitialScanLo, context.InitialScanHi, context.Heights.Scale, context.Heights, context.Floor.Y); }
                 catch (Exception e) { Plugin.Log.LogError($"[PT] Carve ({ox},{oz}): {e.Message}"); return; }
-                double carveMs = (System.Diagnostics.Stopwatch.GetTimestamp() - _tc0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+                carveMs = (System.Diagnostics.Stopwatch.GetTimestamp() - _tc0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
                 if (carveMs > 3.0) Plugin.Log.LogDebug($"[PT-load] Carve ({ox},{oz}) = {carveMs:F2}ms (live/unbaked)");
                 if (!Plugin._sdfCache.TryGetValue(zoneKey, out c)) return;
             }
@@ -235,8 +236,10 @@ namespace ProceduralTerrain
             Voxheim.Core.HeightGrid gwGrid = null, vanGrid = null;
             if (Plugin._applyGroundwork)
             {
+                long _tgw0 = System.Diagnostics.Stopwatch.GetTimestamp();
                 gwGrid = BuildGroundworkedHeights(context, out int nmods, out vanGrid);  // cache-backed; van = PURE vanilla
                 if (gwGrid == null || nmods == 0) { gwGrid = null; }
+                gwMs = (System.Diagnostics.Stopwatch.GetTimestamp() - _tgw0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
             }
 
             builder.SetFloor(context.Floor);
@@ -290,6 +293,14 @@ namespace ProceduralTerrain
             int d0 = GC.CollectionCount(0) - _gc0, d1 = GC.CollectionCount(1) - _gc1, d2 = GC.CollectionCount(2) - _gc2;
             if (d0 > 0 || d1 > 0 || d2 > 0)
                 Plugin.Log.LogDebug($"[PT-gc] zone ({ox},{oz}) load triggered GC: gen0+{d0} gen1+{d1} gen2+{d2}  (gen={_genThisZone})");
+            // HITCH quantifier: one LogInfo line only when a zone's main-thread serve cost blows the frame budget,
+            // with the breakdown so the cause is unambiguous (carve = bake-decode/live-carve, gw = groundwork,
+            // set = Field.Set blit, live = was it unbaked, gen2 = big GC pause). Flat = hitch is outside PT.
+            // Feed the frame watchdog, SPLIT so we can tell what prefetch could actually move off-thread:
+            // carve (prefetch-addressable) vs set=Field.Set blit (unconditional, prefetch can't help) vs gw.
+            PtPerf.CarveMs += carveMs;
+            PtPerf.GwMs    += gwMs;
+            PtPerf.SetMs   += setMs;
         }
 
         // Build a per-zone height grid with overlapping LOCATION terrain ops baked in, using vanilla

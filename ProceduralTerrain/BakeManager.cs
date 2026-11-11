@@ -432,8 +432,8 @@ namespace ProceduralTerrain
                     else { cStart[oc] = first; int len = last - first + 1; cLen[oc] = len; Array.Copy(colV1, first, scratch1, tot, len); tot += len; }
                 }
                 var band1 = new sbyte[tot]; Array.Copy(scratch1, 0, band1, 0, tot);
-                _sdfCache[$"{ox},{oz}"] = new ZoneField { extLo = extLo, bh = bh, width = owned, colStart = cStart, colLen = cLen, colOff = cOff, band = band1 };
-                lock (_surfHCache) _surfHCache[(ox, oz)] = (bw, extLo, s, surfH1);
+                PutSdf($"{ox},{oz}", new ZoneField { extLo = extLo, bh = bh, width = owned, colStart = cStart, colLen = cLen, colOff = cOff, band = band1 });
+                PutSurfH((ox, oz), (bw, extLo, s, surfH1));
                 return true;
             }
 
@@ -587,8 +587,8 @@ namespace ProceduralTerrain
 
             var band = new sbyte[total]; Array.Copy(scratch, 0, band, 0, total);
             string zoneKey = $"{ox},{oz}";
-            _sdfCache[zoneKey] = new ZoneField { extLo = extLo, bh = bh, width = width, colStart = colStart, colLen = colLen, colOff = colOff, band = band };
-            lock (_surfHCache) _surfHCache[(ox, oz)] = (bw, extLo, s, surfH);
+            PutSdf(zoneKey, new ZoneField { extLo = extLo, bh = bh, width = width, colStart = colStart, colLen = colLen, colOff = colOff, band = band });
+            PutSurfH((ox, oz), (bw, extLo, s, surfH));
             long _tpEnd = System.Diagnostics.Stopwatch.GetTimestamp();
             double _yi = yInterpTicks * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
             double _enc = encodeTicks * 1000.0 / System.Diagnostics.Stopwatch.Frequency;

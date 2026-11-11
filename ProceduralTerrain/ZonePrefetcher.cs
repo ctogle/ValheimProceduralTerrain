@@ -113,6 +113,7 @@ namespace ProceduralTerrain
                         var (yLo, yHi) = Plugin.ComputeYBoundsPublic(z.ox, z.oz, ZoneW, s, wg);
                         Plugin.Carve(null, z.ox, z.oz, ZoneW, yLo, yHi);   // bake HIT (fast) if loaded, else live carve
                         Interlocked.Increment(ref _carved);
+                        PtPerf.PrefetchCarve();                            // per-frame prefetch count for the hitch watchdog
                     }
                 }
                 catch (Exception e)

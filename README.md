@@ -1,6 +1,6 @@
 # ProceduralTerrain
 
-> **Work in progress — 0.0.1 preview.** Ships novel default terrain for the first four biomes only; the rest stay near-vanilla for now. Expect breaking config and bake-format changes between versions (retune and rebake). Feedback welcome.
+> **Work in progress — 0.0.2 preview.** Ships novel default terrain for the first four biomes only; the rest stay near-vanilla for now. Expect breaking config and bake-format changes between versions (retune and rebake). [Feedback welcome](https://discord.gg/vuHnDRqfjn).
 
 Procedural terrain system for Valheim built on top of [Voxheim](https://thunderstore.io/c/valheim/p/Voxheim/Voxheim/). Carves caves, overhangs, arches, and raised stone formations into the voxel world using configurable noise-based profiles per biome.
 

@@ -470,6 +470,22 @@ namespace ProceduralTerrain
             ("atriumlumps",   8f),  // satellite stamps per atrium → lumpy, noisy dome instead of one smooth sphere. 0 = single sphere
             ("atriumangularfrac", 0.4f),// fraction of satellites that are ANGULAR (hard-carved superellipsoid) vs round. 0 = all round
             ("atriumangularp",    4f),  // Lp exponent for angular satellites (>2 = boxy; higher = sharper). 4–8 reads clearly
+            // ── Open-top floor carve (Tier 3 variant): gorges ──────────────────────────────
+            // Upward-OPEN, functionally-infinite parabola carved from a SEA-LEVEL datum (+noise), NOT the stamp centre.
+            // For each voxel near the centreline: floorWorldY = base + noise + rise·(d_h/k)^p ; carve EVERYTHING above it
+            // (no upper cap) → open to the sky, width grows with height. Bucketed in XZ only (vertical column).
+            ("opentop",       0f),  // >0: enable the open parabolic gorge carve
+            ("opentopk",      9f),  // half-width (world-units) at height = rise above the datum → gorge WIDTH
+            ("opentopp",      2f),  // floor-profile exponent: 2 = parabola; higher (4–8) = FAT flat floor + steep walls (bell/canyon)
+            ("opentopbase",  30f),  // floor datum world-Y (30 = sea level). The gorge floor sits here, independent of surface height
+            ("opentoprise",  40f),  // height above the datum at which the half-width reaches k → wall steepness (bigger = taller/steeper walls)
+            ("opentopnoise",  6f),  // amplitude (m) of floor undulation added to the datum
+            ("opentopnoisefreq",0.01f), // frequency of the floor-noise
+            ("chainoutward",  0f),  // >0: launch the chain along +N (OUT of the surface into the cavity) — mirror of chaininward. With chainlevel+chainslope the arm then droops DOWNWARD → a buttress/spout that reaches off a wall and drips with gravity
+            ("chaingravity",  0f),  // >0: PROJECTILE mode — constant downward accel per step accumulates vertical speed → a true parabola that reaches out then steepens to near-vertical on impact (replaces the chainlevel/chainslope relax). Bigger = drops sooner/steeper
+            ("chainlaunchup", 0f),  // projectile INITIAL upward velocity (units of horizontal speed): >0 lobs the arc UP then it apexes and descends STEEPLY (a thrown-rope/flying-buttress arch that hits the ground at a sharp angle), instead of a flat launch that only meets the ground shallowly
+            ("chaintaper",    1f),  // radius multiplier at the END of the chain (1 = no taper, uniform tube; 0.2 = thins to 20% at the tip). Keyed on progress-from-ROOT so BRANCHES inherit the thinning (a fork continues getting thinner from where it peeled off, not reset to full)
+            ("canalmeander",  0f),  // routed-canal (chainroute) tube: lateral snake amplitude as a fraction of radius (0 = straight centreline, dead-smooth bore; 0.7 = lazy horizontal wander). Per-mode so plains/swamp sewers stay straight unless opted in
         };
         protected override (string name, float def)[] ParamSpec => _spec;
         public override void BakeColumn(ref CarveBuffers cb, in BakeCellArgs args)
@@ -613,6 +629,11 @@ namespace ProceduralTerrain
             ("altlo", -10000f), ("althi", 10000f),   // absolute world-Y band: carve ONLY within [altlo,althi] (hard floor above the sewer). default = unbounded
             ("depthlo", 0f), ("depthhi", 0f),        // DEPTH-RELATIVE band below the composed surface: carve only in [surf−depthhi, surf−depthlo]. tracks terrain (no world-segmentation). 0 = off
             ("bandfade", 0f),                        // soft ramp (m) at the depth-band edges: sheet width fades 0→full over this → no hard terraced ceiling/floor. 0 = hard edges
+            // PER-MODE floor: re-solidify THIS mode's carve below (surface − floordepth), independent of (and in addition
+            // to) the blended PROFILE floorDepth. Mode params aren't diluted across biome seams, so the tunnel keeps its
+            // own floor even blending into a deeper-floored neighbour → no deep drops dragged in by a mountain's floorDepth.
+            ("floordepth", 0f),                      // 0 = off; >0 = re-solidify below surface−floordepth
+            ("floorfade", 0f),                       // soft taper (m) above the mode floor (0 = hard)
             // (strata floor-galleries extracted to the dedicated isotropic_strata mode)
         };
         protected override (string name, float def)[] ParamSpec => _spec;
@@ -632,6 +653,7 @@ namespace ProceduralTerrain
             float seaAtten = P[7][idx], seaFade = P[8][idx], seaLevel = P[9][idx];
             float altLo = P[10][idx], altHi = P[11][idx];
             float depthLo = P[12][idx], depthHi = P[13][idx], bandFade = P[14][idx];
+            float floorDepthMode = P[15][idx], floorFadeMode = P[16][idx];
 
             var pool = Plugin._noisePool!;
             var wg   = args.wg ?? WorldGenerator.instance;
@@ -647,6 +669,12 @@ namespace ProceduralTerrain
                 bandHi = surfH - depthLo;   // top of band (closer to surface)
                 bandLo = surfH - depthHi;   // bottom of band (deeper)
             }
+            // Per-mode floor anchors to the BASE ground height (what the profile floorDepth uses: hCell − floorDepth),
+            // NOT ComposedSurfaceSample — that sample uses the DOMINANT biome's formation and STEPS up to the mountain
+            // at seams, floating the floor above the real BF surface. GroundHeight is the vanilla 4-corner-blended base:
+            // smooth across seams, so surf−floordepth stays a true 24m below the terrain and never touches the surface.
+            bool haveFloor = floorDepthMode > 0f && wg != null;
+            float modeFloorY = haveFloor ? Plugin.GroundHeight(wx, wz, wg) - floorDepthMode : float.MinValue;
 
             // Per-mode sea-level attenuation: shrink the tunnel radius (amplitude) as the surface
             // approaches sea level. Must scale amplitude, NOT the output SDF — a carve mode's "off"
@@ -683,7 +711,18 @@ namespace ProceduralTerrain
 
                 float localWidth = Mathf.Max(bandAmp * (1f + wv * wn), 0.001f);
                 float dist       = Mathf.Sqrt(na * na + nb * nb) * 0.7071f;
-                outCol[baseIdx + cy] = (localWidth - dist) / localWidth * 4f * s;
+                float o = (localWidth - dist) / localWidth * 4f * s;
+                // Per-mode floor: fade THIS mode's carve (air) to solid below surf−floordepth, over floorfade — the
+                // SAME proportional carve-fade the PROFILE floor applies (baseSDF + (combined−baseSDF)·fade), just
+                // per-mode so BF uses its OWN 24m floor un-blended at seams instead of the neighbour's deeper blend.
+                // floorfade = the gradient depth (24 = BF's, the look you get in pure BF). Solid below the floor.
+                if (haveFloor)
+                {
+                    float ff = floorFadeMode > 0f ? Mathf.Clamp01((wy - modeFloorY) / floorFadeMode) : (wy >= modeFloorY ? 1f : 0f);
+                    if (ff <= 0f) o = -1e4f;          // below the floor → solid
+                    else if (o > 0f) o *= ff;         // in the gradient band → fade the carved air proportionally
+                }
+                outCol[baseIdx + cy] = o;
             }
         }
     }
@@ -696,7 +735,9 @@ namespace ProceduralTerrain
     internal sealed class IsotropicStrata : NativeModeDef
     {
         static readonly (string, float)[] _spec = {
-            ("strataperiod", 0f),                    // index 0 = active gate: vertical floor-to-floor spacing (m). 0 = mode off
+            ("amplitude",    1f),                    // index 0 = fade-to-off amplitude (blend contract): scales gallery OPENNESS; →0 = solid/off.
+                                                     //           Diluted by absent biomes at seams so strata fades out cleanly instead of blending its period.
+            ("strataperiod", 0f),                    // vertical floor-to-floor spacing (m). frequency-class (index>0 → present-averaged, NOT diluted at seams). <=0 = off (must be set explicitly)
             ("stratagap",    0.5f),                  // fraction of each period that's open walkable air
             ("stratawobble", 0f),                    // XZ height wobble of the floors (m) so they aren't glass-flat
             ("strataholefreq", 0.02f),               // XZ frequency of the vertical connecting holes (stairwells)
@@ -724,16 +765,22 @@ namespace ProceduralTerrain
             int idx = args.cellIdx, baseIdx = idx * args.bh;
             float[] outCol = cb.bkModeAux![pi][0];
 
-            float strataPeriod = P[0][idx];
+            float amp = P[0][idx];
+            // amp is the fade-to-off knob (index-0 blend contract). At a biome seam the blend dilutes it toward 0;
+            // amp<=0 means the mode is absent/faded-out here → emit solid, don't carve (prevents partial fragments).
+            if (amp <= 0f) { for (int cy = 0; cy < args.bh; cy++) outCol[baseIdx + cy] = -1e4f; return; }
+            if (amp > 1f) amp = 1f;
+            float strataPeriod = P[1][idx];
             if (strataPeriod <= 0f) { for (int cy = 0; cy < args.bh; cy++) outCol[baseIdx + cy] = -1e4f; return; }
-            float strataGap = P[1][idx], strataWobble = P[2][idx];
-            float strataHoleFreq = P[3][idx], strataHoleThresh = P[4][idx];
-            float strataTaper = P[5][idx], strataTaperFreq = P[6][idx];
-            float strataTilt = P[7][idx], strataTiltFreq = P[8][idx];
-            float strataDrift = P[9][idx], strataDriftFreq = P[10][idx];
-            float strataPillar = P[11][idx], strataPillarFreq = P[12][idx], strataPillarThresh = P[13][idx];
-            float altLo = P[14][idx], altHi = P[15][idx];
-            float depthLo = P[16][idx], depthHi = P[17][idx];
+            float strataGap = P[2][idx] * amp;   // amp scales OPENNESS → amp→0 closes the floors (solid), period UNCHANGED
+            float strataWobble = P[3][idx];
+            float strataHoleFreq = P[4][idx], strataHoleThresh = P[5][idx];
+            float strataTaper = P[6][idx], strataTaperFreq = P[7][idx];
+            float strataTilt = P[8][idx], strataTiltFreq = P[9][idx];
+            float strataDrift = P[10][idx], strataDriftFreq = P[11][idx];
+            float strataPillar = P[12][idx], strataPillarFreq = P[13][idx], strataPillarThresh = P[14][idx];
+            float altLo = P[15][idx], altHi = P[16][idx];
+            float depthLo = P[17][idx], depthHi = P[18][idx];
 
             var pool = Plugin._noisePool!;
             var wg   = args.wg ?? WorldGenerator.instance;
@@ -779,6 +826,7 @@ namespace ProceduralTerrain
                         float rampLo = bandHi - strataPeriod;
                         eth -= taperN * strataTaper * Mathf.Clamp01((wy - rampLo) / Mathf.Max(surfH + 2f - rampLo, 0.001f));
                     }
+                    eth += (1f - amp) * 2f;   // amp-fade the stairwell holes too: at amp→0 the threshold exceeds noise max → no holes (no stray shafts through the closed floors)
                     if (hN > eth) sdf = Mathf.Max(sdf, Mathf.Min(wy - bandLo, (surfH + 2f) - wy));
                 }
                 sdf = Mathf.Min(sdf, wy - altLo);
@@ -903,6 +951,20 @@ namespace ProceduralTerrain
         static volatile ModeDefinition[] _pipeline = Array.Empty<ModeDefinition>();
         // _biomeParams[biome][pipelineIdx][paramIdx] — blendable params per biome per mode
         static volatile Dictionary<Heightmap.Biome, float[][]> _biomeParams = new Dictionary<Heightmap.Biome, float[][]>();
+        // Biome mask (OR of Heightmap.Biome flags) of biomes whose profile runs a mode that carves atriums
+        // (surface_blobs atriumradius, param idx 56, > 0). Mirrors the carve's biomeMask so the nav/viz commands
+        // surface only atriums the carve ACTUALLY emits — not Voronoi junctions in biomes with no sewer (e.g. BF).
+        internal static int AtriumBiomeMask()
+        {
+            int mask = 0;
+            foreach (var kv in _biomeParams)
+            {
+                var bp = kv.Value; if (bp == null) continue;
+                for (int mi = 0; mi < bp.Length; mi++)
+                    if (bp[mi] != null && bp[mi].Length > 56 && bp[mi][56] > 0f) { mask |= (int)kv.Key; break; }
+            }
+            return mask;
+        }
         // Per-biome vegetation interpretation overrides (applied live at PlaceVegetation, restored after — never baked).
         internal struct VegOverride { public float density, widen, forestMax, groupRadius, tiltInherit, randTilt, maxTilt, conformMaxTilt, supportRadius; public bool inForest; public int groupSize; }
         internal static volatile Dictionary<Heightmap.Biome, VegOverride> _vegByBiome = new Dictionary<Heightmap.Biome, VegOverride>();
@@ -924,6 +986,7 @@ namespace ProceduralTerrain
         internal static bool  _islandRemoval       = true;
         internal static bool  _pocketRemoval       = true;
         internal static bool  _hideLodMeshes       = false;  // DEBUG: hide Valheim's distant TerrainLod meshes (clear view of voxel features)
+        internal static bool  _hideMist            = false;  // DEBUG: globally suppress Mistlands ground mist (MistEmitter) so you can see the terrain/sewers
         internal static bool  _lodUnderground      = true;   // auto-hide the distant LOD terrain while the player is underground (in a cave/tunnel)
         internal static volatile bool _playerUnderground;    // updated each Update from player Y vs the carved surface
         const float LOD_UndergroundMargin = 4f;              // metres below surface before we consider the player "underground"
@@ -1124,6 +1187,19 @@ namespace ProceduralTerrain
             public sbyte[] band     = System.Array.Empty<sbyte>(); // packed run densities
         }
         internal static readonly System.Collections.Concurrent.ConcurrentDictionary<string, ZoneField> _sdfCache = new();
+        // FIFO-bounded like _zoneFaceCache: dedicated servers skip prefetch, so every served zone's SDF accumulates
+        // here forever (no eviction = multi-GB heap over a big world). Cap it; an evicted zone just refills on demand
+        // (cheap gunzip from the bake, or a live carve where unbaked — already the miss path). Access is spatially
+        // local (player neighbour ring) so the working set stays far under the cap. See [[pt-investigation-findings-0-0-2]].
+        static readonly System.Collections.Concurrent.ConcurrentQueue<string> _sdfOrder = new();
+        const int SdfCacheCap = 1024;
+        internal static void PutSdf(string key, ZoneField f)
+        {
+            _sdfCache[key] = f;
+            _sdfOrder.Enqueue(key);
+            while (_sdfCache.Count > SdfCacheCap && _sdfOrder.TryDequeue(out var old))
+                if (!old.Equals(key)) _sdfCache.TryRemove(old, out _);
+        }
 
         // Reused (thread-local) scratch for sparse packing — avoids per-zone dense allocations (GC).
         [ThreadStatic] static sbyte[]? _sparseScratch;
@@ -1147,6 +1223,23 @@ namespace ProceduralTerrain
         // Layout: surfH[cx * bw + cz] = world-Y of topmost solid voxel (NaN = no solid in column).
         // Includes overlap region so border columns near zone edges are correct.
         internal static readonly Dictionary<(int ox, int oz), (int bw, int extLo, float s, float[] surfH)> _surfHCache = new();
+        // FIFO-bounded, same rationale as _sdfCache. Not concurrent — callers already hold lock(_surfHCache);
+        // PutSurfH takes it internally, so call it WITHOUT an outer lock.
+        static readonly Queue<(int ox, int oz)> _surfHOrder = new();
+        const int SurfHCacheCap = 1024;
+        internal static void PutSurfH((int ox, int oz) key, (int bw, int extLo, float s, float[] surfH) v)
+        {
+            lock (_surfHCache)
+            {
+                _surfHCache[key] = v;
+                _surfHOrder.Enqueue(key);
+                while (_surfHCache.Count > SurfHCacheCap && _surfHOrder.Count > 0)
+                {
+                    var old = _surfHOrder.Dequeue();
+                    if (!old.Equals(key)) _surfHCache.Remove(old);
+                }
+            }
+        }
 
         // ── Cross-zone grounding face cache ──────────────────────────────────────
         // Indexed by (ox, oz) territory origin.
@@ -1238,6 +1331,16 @@ namespace ProceduralTerrain
             var guardGo = new GameObject("PTWorldGuardDriver");
             DontDestroyOnLoad(guardGo);
             guardGo.AddComponent<WorldGuardDriver>();
+            Log.LogInfo("[ProceduralTerrain] Ready.");
+        }
+
+        // PT commands (re)register from Update, NOT Awake: the game rebuilds the Terminal command table AFTER plugin
+        // Awake (observed Terminal.commands 57→416), dropping anything registered in Awake — every other mod registers
+        // in an InitTerminal hook. The Update self-heal re-adds ours whenever they're missing from Terminal.commands,
+        // so they survive the rebuild (and any later clear by another mod), whenever it happens. Idempotent: the
+        // ConsoleCommand ctor overwrites by name, so re-running is harmless.
+        internal static void RegisterConsoleCommands()
+        {
             new Terminal.ConsoleCommand("pt_viz_clear", "pt_viz_clear — clear the debug brush overlay (seed/path lines)", _ =>
             {
                 DebugViz.ClearAll();
@@ -1589,7 +1692,7 @@ namespace ProceduralTerrain
 
                     // CORRIDOR NETWORK: the actual canals (coast mouths routed inland + unioned) and their junction
                     // atriums — the same object the carve consumes. Canals drawn BLACK, atriums as cyan rings.
-                    var net = LocationVoronoi.GetNetwork(steiner, clearance, 0.6f, atriumMerge, 28f + Math.Max(clearance, 20f), 18f, 30f, 600f, (int)Heightmap.Biome.Plains);
+                    var net = LocationVoronoi.GetNetwork(steiner, clearance, 0.6f, atriumMerge, 28f + Math.Max(clearance, 20f), 18f, 30f, 600f, AtriumBiomeMask());   // only atrium-carving biomes
                     int atriumsShown = 0, canalsShown = 0;
                     var atriumCol = new Color(0.0f, 0.75f, 0.85f);
                     void Ring(int x, int y, float rad, Color c) { int ri = Mathf.CeilToInt(rad); float r0 = (rad - 1.3f) * (rad - 1.3f), r1 = rad * rad; for (int b = -ri; b <= ri; b++) for (int a = -ri; a <= ri; a++) { int d = a * a + b * b; if (d < r0 || d > r1) continue; int xx = x + a, yy = y + b; if (xx >= 0 && yy >= 0 && xx < res && yy < res) px[yy * res + xx] = c; } }
@@ -1636,7 +1739,7 @@ namespace ProceduralTerrain
                     float range = 4000f; if (args.Length >= 2 && float.TryParse(args[1], out float r)) range = r;
                     float merge = 300f;  if (args.Length >= 3 && float.TryParse(args[2], out float mg)) merge = mg;
                     float minClr = 28f + Math.Max(_corridorClearance, 20f);   // matches the sewer carve's dome clearance
-                    var net = LocationVoronoi.GetNetwork(_corridorSteiner, _corridorClearance, 0.6f, merge, minClr, 18f, 30f, 600f, (int)Heightmap.Biome.Plains);
+                    var net = LocationVoronoi.GetNetwork(_corridorSteiner, _corridorClearance, 0.6f, merge, minClr, 18f, 30f, 600f, AtriumBiomeMask());   // only atrium-carving biomes
                     if (net == null) { Log.LogWarning("[PT] atriums: locations not ready (explore/generate first)."); return; }
                     var sites = new List<LocationVoronoi.Atrium>(net.Atriums);
                     var pp2 = new Vector2(player.transform.position.x, player.transform.position.z);
@@ -1664,7 +1767,9 @@ namespace ProceduralTerrain
                     int n = 1; if (args.Length >= 2 && int.TryParse(args[1], out int ni)) n = Math.Max(1, ni);
                     // Use the SERVICE network atriums (global, all of them) — the carve's own source, so teleporting
                     // generates the dome on arrival. (The carved-so-far list only held zones you'd already visited.)
-                    var net = LocationVoronoi.GetNetwork(_corridorSteiner, _corridorClearance, 0.6f, 300f, 28f + Math.Max(_corridorClearance, 20f), 18f, 30f, 600f, (int)Heightmap.Biome.Plains);
+                    // biomeMask = atrium-carving biomes only (plains, mistlands, …), so we never land on a BF Voronoi
+                    // junction where no sewer mode actually carved a dome. (Was 0 = all biomes; before that, hardcoded Plains.)
+                    var net = LocationVoronoi.GetNetwork(_corridorSteiner, _corridorClearance, 0.6f, 300f, 28f + Math.Max(_corridorClearance, 20f), 18f, 30f, 600f, AtriumBiomeMask());
                     if (net == null || net.Atriums.Count == 0) { Log.LogWarning("[PT] gotoatrium: no atriums (locations not ready, or network empty)."); return; }
                     var pp = player.transform.position; var pp2 = new Vector2(pp.x, pp.z);
                     var sorted = new List<LocationVoronoi.Atrium>(net.Atriums);
@@ -2029,8 +2134,18 @@ namespace ProceduralTerrain
                 string msg = $"[PT] saved gradmap_height/smooth/field.png  ({cw}x{cw}px @ 4wu/px, blur={blurWu}wu)";
                 Console.instance?.Print(msg); Log.LogInfo(msg);
             });
+        }
 
-            Log.LogInfo("[ProceduralTerrain] Ready.");
+        // Is our command still in Valheim's live command table? (cached FieldInfo; reflects the protected static dict)
+        static System.Reflection.FieldInfo? _termCmdField;
+        static bool PtCommandsPresent()
+        {
+            try
+            {
+                _termCmdField ??= typeof(Terminal).GetField("commands", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
+                return (_termCmdField?.GetValue(null) as System.Collections.IDictionary)?.Contains("pt_gotoatrium") ?? true;
+            }
+            catch { return true; }   // on error, assume present so we don't spin re-registering
         }
 
         [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
@@ -2043,8 +2158,40 @@ namespace ProceduralTerrain
         internal static int _dumpZonesRemaining = 0;
 
         static int _pollFrame;
+        static long _perfLastTs;
+        static float _mistSweepT;
+        static bool _mistWasHidden;
+        static int _perfGc0, _perfGc2;
+        const double PerfHitchMs = 33.0;   // flag frames slower than ~30fps
+
         void Update()
         {
+            // ── Frame hitch watchdog (EVERY frame; dominator of a main-thread stall) ──────────────
+            {
+                long nowTs = System.Diagnostics.Stopwatch.GetTimestamp();
+                if (_perfLastTs != 0)
+                {
+                    double frameMs = (nowTs - _perfLastTs) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+                    if (frameMs > PerfHitchMs)
+                    {
+                        int g0 = GC.CollectionCount(0) - _perfGc0, g2 = GC.CollectionCount(2) - _perfGc2;
+                        double ptMain = PtPerf.CarveMs + PtPerf.GwMs + PtPerf.SetMs + PtPerf.VegMs + PtPerf.CaveMs;
+                        Log.LogInfo($"[PT-hitch] frame={frameMs:F0}ms  PTmain={ptMain:F1}ms (carve={PtPerf.CarveMs:F1} set={PtPerf.SetMs:F1} gw={PtPerf.GwMs:F1} veg={PtPerf.VegMs:F1} cave={PtPerf.CaveMs:F1})  prefetch={PtPerf.PrefetchCarves}  gc0+{g0} gc2+{g2}");
+                    }
+                }
+                _perfLastTs = nowTs;
+                _perfGc0 = GC.CollectionCount(0); _perfGc2 = GC.CollectionCount(2);
+                PtPerf.ResetFrame();
+            }
+
+            // Self-heal our console commands: the Terminal rebuilds its command table after Awake (and mods may clear
+            // it later), dropping ours — re-add whenever they're missing. Cheap (one dict ContainsKey most frames).
+            if (Console.instance != null && !PtCommandsPresent())
+            {
+                RegisterConsoleCommands();
+                Log.LogInfo("[ProceduralTerrain] (re)registered console commands (self-heal).");
+            }
+
             if (_hotReloadPending)
             {
                 _hotReloadPending = false;
@@ -2067,6 +2214,27 @@ namespace ProceduralTerrain
                 else _playerUnderground = false;
             }
             else _playerUnderground = false;
+
+            // DEBUG: globally suppress the Mistlands ground mist (ParticleMist singleton). The ParticleMist.Update
+            // prefix skips emission + clears the system every frame; this 1 Hz sweep clears any particles already in
+            // flight (e.g. right after the flag flips) and logs once so the log confirms the feature is live. Flip the
+            // cfg back to re-enable (the prefix stops skipping; mist regrows).
+            if (_hideMist)
+            {
+                _mistSweepT += Time.deltaTime;
+                if (_mistSweepT >= 1f)
+                {
+                    _mistSweepT = 0f;
+                    var pm = ParticleMist.instance;
+                    if (pm != null)
+                    {
+                        var ps = pm.GetComponent<ParticleSystem>();
+                        if (ps != null) ps.Clear(true);
+                    }
+                    if (!_mistWasHidden) { Log.LogInfo($"[ProceduralTerrain] hideMist ON — suppressing ParticleMist (instance={(pm != null)})."); _mistWasHidden = true; }
+                }
+            }
+            else if (_mistWasHidden) { _mistWasHidden = false; Log.LogInfo("[ProceduralTerrain] hideMist OFF — mist re-enabled."); }
 
             // Fast-poll while waiting for locations to finish generating (the time-sliced coroutine
             // fills them over several frames); BuildLocationCache no-ops until ZoneSystem reports
