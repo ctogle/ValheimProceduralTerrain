@@ -199,6 +199,7 @@ namespace ProceduralTerrain
                     if (!litField.Lit(ix, iz, cyVox, p.LightRange)) return false;
                 }
                 if (p.BiomePure > 0f && wg.GetBiomeArea(new Vector3(worldX, 0f, worldZ)) == Heightmap.BiomeArea.Edge) return false;  // interior only, off the boundary
+                if (p.MinAboveVanilla > 0f && cyY - Plugin.GroundHeight(worldX, worldZ, wg) < p.MinAboveVanilla) return false;  // only on PT-raised geometry (arches): voxel surface well above the vanilla heightmap
                 if (p.AtriumOnly > 0f)   // confine to atrium ROOM: within AtriumOnly metres in 3D of a carved dome centre
                 {                        // (3D — XZ-only let strata floors ABOVE an atrium pass → elites in the strata)
                     if (nearAtriums == null || nearAtriums.Count == 0) return false;

@@ -1285,7 +1285,9 @@ namespace ProceduralTerrain
                 if (_composeInH == null || _composeInH.Length < cellCount)
                 { _composeInH = new float[cellCount]; _composeInGX = new float[cellCount]; _composeInGZ = new float[cellCount]; _composeInGMag = new float[cellCount]; }
                 if (_composeHCell == null || _composeHCell.Length < cellCount)
-                { _composeHCell = new float[cellCount]; _composeFloorY = new float[cellCount]; }
+                { _composeHCell = new float[cellCount]; }
+                if (_composeModeFloorY == null || _composeModeFloorY.Length < cellCount) _composeModeFloorY = new float[cellCount];
+                for (int c = 0; c < cellCount; c++) _composeModeFloorY[c] = NoModeFloor;   // reset per zone; modes record their per-cell floor during the aux passes
                 float scale2  = _scale ?? 1f;
                 float extLoS2 = extLo * s;
                 float xzStep  = cvXZ * s;                        // XZ world spacing
@@ -1300,9 +1302,7 @@ namespace ProceduralTerrain
                     float wx = (ox - overlap + cxw) * s, wz = (oz - overlap + czw) * s;
                     float hCell = heightGrid != null ? heightGrid[cxw - overlap, czw - overlap] * s
                                 : (wg != null ? GroundHeight(wx, wz, wg) : 0f);
-                    float floorD = (_blendedProfs != null && cell < _blendedProfs.Length) ? _blendedProfs[cell].floorDepth : 0f;
                     _composeHCell![cell]  = hCell;
-                    _composeFloorY![cell] = hCell - floorD;
                     for (int cyc = 0; cyc < ch; cyc++) _runSDF![cbaseC + cyc] = (extLoS2 + cyc * yStep) - hCell;
                 }
 
@@ -2424,7 +2424,7 @@ namespace ProceduralTerrain
                         if (_cb.bkModeParams![mi][0][cell] <= 0f) continue;   // mode inactive here
                         int halfWin = (_blendedProfs != null && cell < _blendedProfs.Length) ? Mathf.RoundToInt(_blendedProfs[cell].composeSmoothY) : 0;
                         int cbaseF = cell * bh, cbaseC = cell * ch;
-                        float hCell = _composeHCell![cell], floorY = _composeFloorY![cell];
+                        float hCell = _composeHCell![cell];
                         for (int cyc = 0; cyc < ch; cyc++)
                         {
                             int cyf = Math.Min(cyc * cvY, bh - 1);
@@ -2437,7 +2437,9 @@ namespace ProceduralTerrain
                                 for (int wy = wlo; wy <= whi; wy++) { sum += aux[cbaseF + wy]; n++; }
                                 raw = (sum / n) * scale2;
                             }
-                            float sdf = Mathf.Min(raw, worldY - floorY);
+                            // No coarse floor clamp here anymore — the profile floor is re-solidified PER COLUMN via
+                            // the _fade stage (uses per-column profFlD), so it's smooth instead of coarse-cell-stepped.
+                            float sdf = raw;
                             ref float r = ref _runSDF![cbaseC + cyc];
                             switch (blend)
                             {
@@ -3233,7 +3235,14 @@ namespace ProceduralTerrain
                         int aa = col.b200 * ch, bb = col.b210 * ch, cc = col.b201 * ch, dd = col.b211 * ch;
                         float lo = Bilerp(_runSDF![aa + cyc0],     _runSDF![bb + cyc0],     _runSDF![cc + cyc0],     _runSDF![dd + cyc0],     col.bfx, col.bfz);
                         float hi = Bilerp(_runSDF![aa + cyc0 + 1], _runSDF![bb + cyc0 + 1], _runSDF![cc + cyc0 + 1], _runSDF![dd + cyc0 + 1], col.bfx, col.bfz);
-                        combined = lo + (hi - lo) * fyc;
+                        // Smoothstep the Y blend like XZ (bfx/bfz) → C1-continuous across coarse-Y levels, killing the
+                        // slope-discontinuity creases that read as horizontal terraces on steep surfaces at coarseY>1.
+                        combined = lo + (hi - lo) * Mathf.SmoothStep(0f, 1f, fyc);
+                        // PER-MODE floor, applied PER COLUMN: bilinear the per-cell floor Y and intersect the carve with
+                        // the half-space above it. Smooth (no coarse-cell terraces) because the floor height is BL'd per
+                        // column, matching how the surface is evaluated. Inactive cells carry NoModeFloor → no clamp.
+                        float mfY = BL(_composeModeFloorY!, col.b200, col.b210, col.b201, col.b211, col.bfx, col.bfz);
+                        if (mfY > -1e8f) combined = Math.Min(combined, worldY - mfY);
                     }
                     else
                     {
@@ -3479,6 +3488,12 @@ namespace ProceduralTerrain
         {
             if (!Plugin._inVegPlacement) return;                             // only instrument/act during veg placement
             bool diag = _diag < 60;
+            // Vanilla-height biomes (e.g. Mistlands, light-touch): leave vanilla's heightmap point untouched so base
+            // veg places on the vanilla ground and ignores PT-added geometry (arches). The snap patch below handles
+            // snap-to-solid veg. Cheap biome lookup, scoped to veg placement.
+            if (Plugin._vegByBiome.Count > 0 && WorldGenerator.instance != null
+                && Plugin._vegByBiome.TryGetValue(WorldGenerator.instance.GetBiome(p.x, p.z), out var vov0) && vov0.vanillaHeight)
+                return;
             if (!Plugin._vegetationConform)
             {
                 if (diag) { _diag++; Plugin.Log.LogInfo($"[PT-veg] CONFORM-DISABLED (vegetationConform=false) at ({p.x:F0},{p.z:F0}) — vanilla placement"); }
@@ -3495,6 +3510,28 @@ namespace ProceduralTerrain
             // Force a horizontal normal so vanilla's own tilt gate drops the tree; otherwise orient to the slope.
             normal = reject ? new Vector3(1f, 0f, 0f) : n;
             if (diag) { _diag++; Plugin.Log.LogInfo($"[PT-veg] CONFORM ({p.x:F0},{p.z:F0}) snapY {oldY:F1}→{sh:F1} n.y={n.y:F2} {(reject ? "REJECT" : "keep")}"); }
+        }
+    }
+
+    // Step 2 of veg placement: m_snapToStaticSolid veg (e.g. Mistlands rocks) re-snaps onto a physical collider AFTER
+    // GetGroundData. PT's carved mesh IS a collider, so rocks would snap up onto arches even when the conform above
+    // deferred to the heightmap. In vanilla-height biomes, if the collider hit is above the vanilla ground (= it's our
+    // PT geometry, not real ground), decline the snap → the rock falls back to the heightmap point. No arch awareness
+    // needed: "above the vanilla heightmap" is exactly "on something PT added."
+    [HarmonyPatch]
+    static class StaticSolidVanillaHeightPatch
+    {
+        static MethodBase? TargetMethod() =>
+            typeof(ZoneSystem).GetMethod("GetStaticSolidHeight",
+                BindingFlags.Public | BindingFlags.Instance, null,
+                new[] { typeof(Vector3), typeof(float).MakeByRefType(), typeof(Vector3).MakeByRefType() }, null);
+
+        static void Postfix(Vector3 p, ref bool __result, ref float height)
+        {
+            if (!__result || !Plugin._inVegPlacement || Plugin._vegByBiome.Count == 0) return;
+            var wg = WorldGenerator.instance; if (wg == null) return;
+            if (!Plugin._vegByBiome.TryGetValue(wg.GetBiome(p.x, p.z), out var vov) || !vov.vanillaHeight) return;
+            if (height - Plugin.GroundHeight(p.x, p.z, wg) > 1.5f) __result = false;   // hit is PT geometry (above vanilla ground) → don't snap to it
         }
     }
 

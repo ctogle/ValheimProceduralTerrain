@@ -176,6 +176,7 @@ namespace ProceduralTerrain
                                 tp.VegMaxTilt   = incl.VegMaxTilt;
                                 tp.VegConformMaxTilt = incl.VegConformMaxTilt;
                                 tp.VegSupportRadius  = incl.VegSupportRadius;
+                                tp.VegVanillaHeight  = incl.VegVanillaHeight;
                                 tp.BlurPasses   = incl.BlurPasses;
                                 tp.PeronaK      = incl.PeronaK;
                                 tp.PeronaLambda = incl.PeronaLambda;
@@ -208,6 +209,7 @@ namespace ProceduralTerrain
                             case "vegmaxtilt": tp.VegMaxTilt = fv; break;
                             case "vegconformmaxtilt": tp.VegConformMaxTilt = fv; break;
                             case "vegsupportradius": tp.VegSupportRadius = fv; break;
+                            case "vegvanillaheight": tp.VegVanillaHeight = fv > 0.5f; break;
                             case "blur_passes":   tp.BlurPasses   = fv; break;
                             case "perona_k":      tp.PeronaK      = fv; break;
                             case "perona_lambda": tp.PeronaLambda = fv; break;
@@ -550,11 +552,13 @@ namespace ProceduralTerrain
             {
                 bool any = tp3.VegDensity != 1f || tp3.VegForestWiden != 0f || tp3.VegInForest
                          || tp3.VegForestMax >= 0f || tp3.VegGroupSize > 0 || tp3.VegGroupRadius >= 0f || tp3.VegTiltInherit >= 0f
-                         || tp3.VegRandTilt >= 0f || tp3.VegMaxTilt >= 0f || tp3.VegConformMaxTilt >= 0f || tp3.VegSupportRadius >= 0f;
+                         || tp3.VegRandTilt >= 0f || tp3.VegMaxTilt >= 0f || tp3.VegConformMaxTilt >= 0f || tp3.VegSupportRadius >= 0f
+                         || tp3.VegVanillaHeight;
                 if (any) vegMap[b3] = new Plugin.VegOverride {
                     density = tp3.VegDensity, widen = tp3.VegForestWiden, inForest = tp3.VegInForest,
                     forestMax = tp3.VegForestMax, groupSize = tp3.VegGroupSize, groupRadius = tp3.VegGroupRadius, tiltInherit = tp3.VegTiltInherit,
-                    randTilt = tp3.VegRandTilt, maxTilt = tp3.VegMaxTilt, conformMaxTilt = tp3.VegConformMaxTilt, supportRadius = tp3.VegSupportRadius };
+                    randTilt = tp3.VegRandTilt, maxTilt = tp3.VegMaxTilt, conformMaxTilt = tp3.VegConformMaxTilt, supportRadius = tp3.VegSupportRadius,
+                    vanillaHeight = tp3.VegVanillaHeight };
             }
             Plugin._vegByBiome = vegMap;
 

@@ -653,7 +653,7 @@ namespace ProceduralTerrain
             float seaAtten = P[7][idx], seaFade = P[8][idx], seaLevel = P[9][idx];
             float altLo = P[10][idx], altHi = P[11][idx];
             float depthLo = P[12][idx], depthHi = P[13][idx], bandFade = P[14][idx];
-            float floorDepthMode = P[15][idx], floorFadeMode = P[16][idx];
+            float floorDepthMode = P[15][idx];   // P[16] floorfade is unused now the floor is applied per-column (plane intersect), kept in the spec for cfg compat
 
             var pool = Plugin._noisePool!;
             var wg   = args.wg ?? WorldGenerator.instance;
@@ -675,6 +675,9 @@ namespace ProceduralTerrain
             // smooth across seams, so surf−floordepth stays a true 24m below the terrain and never touches the surface.
             bool haveFloor = floorDepthMode > 0f && wg != null;
             float modeFloorY = haveFloor ? Plugin.GroundHeight(wx, wz, wg) - floorDepthMode : float.MinValue;
+            // Record the per-mode floor for this cell; the re-solidify is applied PER COLUMN in the compose (bilinear
+            // on the recorded per-cell floor), not here — applying it per-cell made the relief floor coarse-cell-stepped (terraces).
+            if (haveFloor) Plugin.RecordModeFloor(args.cellIdx, modeFloorY);
 
             // Per-mode sea-level attenuation: shrink the tunnel radius (amplitude) as the surface
             // approaches sea level. Must scale amplitude, NOT the output SDF — a carve mode's "off"
@@ -712,16 +715,9 @@ namespace ProceduralTerrain
                 float localWidth = Mathf.Max(bandAmp * (1f + wv * wn), 0.001f);
                 float dist       = Mathf.Sqrt(na * na + nb * nb) * 0.7071f;
                 float o = (localWidth - dist) / localWidth * 4f * s;
-                // Per-mode floor: fade THIS mode's carve (air) to solid below surf−floordepth, over floorfade — the
-                // SAME proportional carve-fade the PROFILE floor applies (baseSDF + (combined−baseSDF)·fade), just
-                // per-mode so BF uses its OWN 24m floor un-blended at seams instead of the neighbour's deeper blend.
-                // floorfade = the gradient depth (24 = BF's, the look you get in pure BF). Solid below the floor.
-                if (haveFloor)
-                {
-                    float ff = floorFadeMode > 0f ? Mathf.Clamp01((wy - modeFloorY) / floorFadeMode) : (wy >= modeFloorY ? 1f : 0f);
-                    if (ff <= 0f) o = -1e4f;          // below the floor → solid
-                    else if (o > 0f) o *= ff;         // in the gradient band → fade the carved air proportionally
-                }
+                // Per-mode floor (surf−floordepth, keeps BF's own un-blended floor at mtn seams) is recorded per cell
+                // above and re-solidified PER COLUMN in the compose — not applied here, so the relief floor is smooth
+                // instead of coarse-cell-stepped (terraces). See RecordModeFloor / the compose per-column clamp.
                 outCol[baseIdx + cy] = o;
             }
         }
@@ -860,6 +856,7 @@ namespace ProceduralTerrain
         public float        VegMaxTilt     = -1f; // if >=0, SET m_maxTilt → cap on ground-tilt (deg); raise so leaning trees aren't clamped upright. -1 = leave vanilla
         public float        VegConformMaxTilt = -1f; // if >=0, per-biome override of the CONFORM slope-reject threshold (global [Vegetation] maxTilt). -1 = use global
         public float        VegSupportRadius  = -1f; // if >=0, per-biome override of the conform footprint support radius (global [Vegetation] supportRadius). -1 = use global
+        public bool         VegVanillaHeight  = false; // if true, place vegetation on the VANILLA heightmap in this biome (skip the voxel-surface conform AND the mesh snap) → base veg ignores PT-added geometry like arches. For light-touch biomes whose surface ≈ vanilla (Mistlands).
 
         // Build the internal CaveProfile from profile-level params only.
         public CaveProfile ToCaveProfile(Dictionary<string, ModeDefinition> modes)
@@ -966,7 +963,7 @@ namespace ProceduralTerrain
             return mask;
         }
         // Per-biome vegetation interpretation overrides (applied live at PlaceVegetation, restored after — never baked).
-        internal struct VegOverride { public float density, widen, forestMax, groupRadius, tiltInherit, randTilt, maxTilt, conformMaxTilt, supportRadius; public bool inForest; public int groupSize; }
+        internal struct VegOverride { public float density, widen, forestMax, groupRadius, tiltInherit, randTilt, maxTilt, conformMaxTilt, supportRadius; public bool inForest; public int groupSize; public bool vanillaHeight; }
         internal static volatile Dictionary<Heightmap.Biome, VegOverride> _vegByBiome = new Dictionary<Heightmap.Biome, VegOverride>();
 
         // ── Location protection ───────────────────────────────────────────────────
@@ -1157,7 +1154,15 @@ namespace ProceduralTerrain
         [ThreadStatic] internal static float[]? _composeInGMag; // slope magnitude
         [ThreadStatic] internal static bool     _composeIncoming; // true while a surface-anchored mode bakes in sequential compose
         [ThreadStatic] static float[]?          _composeHCell;    // per-cell groundworked base height (cached across the per-mode passes)
-        [ThreadStatic] static float[]?          _composeFloorY;   // per-cell floor Y = hCell - floorDepth
+        // Per-cell governing PER-MODE floor Y (max across modes that set a per-mode floordepth), recorded during the
+        // mode aux passes. Applied PER COLUMN (bilinear) in the compose so the floor is smooth, not coarse-cell-stepped.
+        [ThreadStatic] internal static float[]? _composeModeFloorY;
+        internal const float NoModeFloor = -1e9f;
+        internal static void RecordModeFloor(int cell, float floorY)
+        {
+            var a = _composeModeFloorY;
+            if (a != null && (uint)cell < (uint)a.Length && floorY > a[cell]) a[cell] = floorY;
+        }
 
         // SDF-blend (_blendMode==1) retained per-cell contributions, populated in BakeBlendedProfiles,
         // consumed by BakeColumnSdfBlend. Only allocated/filled when _blendMode==1.
@@ -1187,6 +1192,33 @@ namespace ProceduralTerrain
             public sbyte[] band     = System.Array.Empty<sbyte>(); // packed run densities
         }
         internal static readonly System.Collections.Concurrent.ConcurrentDictionary<string, ZoneField> _sdfCache = new();
+
+        // DEBUG: decode the real stored column at a world point → all zero-crossing world-Y values (top surface, relief
+        // floor, cave floors/ceilings), from the sbyte band exactly as meshed. Returns empty if the zone isn't cached.
+        internal static System.Collections.Generic.List<float> DecodeColumnCrossings(float worldX, float worldZ)
+        {
+            var outList = new System.Collections.Generic.List<float>();
+            float s = ActiveScale(); int overlap = _overlap;
+            var (ox, oz) = ZoneOriginFromWorld(worldX, worldZ, s);
+            if (!_sdfCache.TryGetValue($"{ox},{oz}", out var zf)) return outList;
+            int ci = Mathf.RoundToInt(worldX / s) - ox, ri = Mathf.RoundToInt(worldZ / s) - oz;
+            if (ci < 0 || ci >= zf.width || ri < 0 || ri >= zf.width) return outList;
+            int col = ci * zf.width + ri;
+            int start = zf.colStart[col]; if (start < 0) return outList;      // no deviation run → all-solid/all-air column
+            int len = zf.colLen[col], off = zf.colOff[col];
+            sbyte prev = zf.band[off];
+            for (int k = 1; k < len; k++)
+            {
+                sbyte cur = zf.band[off + k];
+                if ((prev < 0) != (cur < 0) && prev != cur)                  // sign change = a surface crossing
+                {
+                    float t = (float)(-prev) / (cur - prev);                 // sub-voxel fraction (same interp Voxheim MC uses)
+                    outList.Add((zf.extLo + (start + k - 1) + t) * s);
+                }
+                prev = cur;
+            }
+            return outList;
+        }
         // FIFO-bounded like _zoneFaceCache: dedicated servers skip prefetch, so every served zone's SDF accumulates
         // here forever (no eviction = multi-GB heap over a big world). Cap it; an evicted zone just refills on demand
         // (cheap gunzip from the bake, or a live carve where unbaked — already the miss path). Access is spatially
@@ -2017,6 +2049,40 @@ namespace ProceduralTerrain
                 }
             },
             optionsFetcher: () => new List<string> { "server" });
+            new Terminal.ConsoleCommand("pt_linedump", "pt_linedump [len] [step] — walk the player's facing line and dump the REAL carved surface + all field crossings (relief floor, caves) per column to pt_linedump.csv, for terrace diagnosis", args =>
+            {
+                try
+                {
+                    var player = Player.m_localPlayer; if (player == null) { Log.LogWarning("[PT] linedump: no player."); return; }
+                    float len = 40f; if (args.Length >= 2 && float.TryParse(args[1], out float l)) len = l;
+                    float step = 0.25f; if (args.Length >= 3 && float.TryParse(args[2], out float st)) step = Mathf.Max(0.05f, st);
+                    var p = player.transform.position;
+                    var fwd = player.transform.forward; fwd.y = 0f;
+                    if (fwd.sqrMagnitude < 1e-4f) fwd = Vector3.forward;
+                    fwd = fwd.normalized;
+                    var wg = WorldGenerator.instance;
+                    var sb = new System.Text.StringBuilder("dist,wx,wz,vanillaH,surfH,crossings(top..bottom)\n");
+                    int n = Mathf.Max(1, Mathf.RoundToInt(len / step));
+                    for (int i = 0; i <= n; i++)
+                    {
+                        float d = i * step;
+                        float wx = p.x + fwd.x * d, wz = p.z + fwd.z * d;
+                        float vh = wg != null ? GroundHeight(wx, wz, wg) : 0f;
+                        float sh = TrySampleSurfaceY(wx, wz, out float s0) ? s0 : float.NaN;
+                        var cr = DecodeColumnCrossings(wx, wz);
+                        cr.Sort((a, b) => b.CompareTo(a));   // top first
+                        sb.Append($"{d:F2},{wx:F2},{wz:F2},{vh:F3},{sh:F3}");
+                        foreach (var c in cr) sb.Append($",{c:F3}");
+                        sb.Append('\n');
+                    }
+                    string dir = System.IO.Path.GetDirectoryName(ConfigPath)!;
+                    string path = System.IO.Path.Combine(dir, "pt_linedump.csv");
+                    System.IO.File.WriteAllText(path, sb.ToString());
+                    var msg = $"[PT] linedump: {n + 1} samples over {len:F0}m from ({p.x:F0},{p.z:F0}) dir ({fwd.x:F2},{fwd.z:F2}) → {path}";
+                    Log.LogInfo(msg); Console.instance?.Print(msg);
+                }
+                catch (Exception e) { Log.LogError($"[PT] linedump: {e}"); }
+            });
             new Terminal.ConsoleCommand("pt_loc_probe", "pt_loc_probe [x z] — print nearby locations and location protection factor at world pos (default: player pos)", args =>
             {
                 float wx, wz;

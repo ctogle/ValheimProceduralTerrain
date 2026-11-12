@@ -44,6 +44,7 @@ namespace ProceduralTerrain
         public float RandTilt   = 0f;    // extra random tilt (deg) about a random horizontal axis → varied X/Z orientation (roots don't all lie the same way). Y-yaw is always random.
         public float BiomePure  = 0f;    // >0: place only in the biome INTERIOR — WorldGenerator.GetBiomeArea != Edge (i.e. the point isn't near a boundary with an adjacent biome). 0 = off
         public float AtriumOnly = 0f;    // >0: place only within this many metres (XZ) of a carved atrium centre → confine rare loot/encounters to the atrium rooms. 0 = off
+        public float MinAboveVanilla = 0f; // >0: place only where the voxel surface here is >this many metres ABOVE the vanilla heightmap → confine to PT-RAISED geometry (arches/formations), not normal ground. 0 = off
         public bool  Hang       = false; // place on CEILING crossings (air below, solid above) and orient +Y along the down-pointing ceiling normal → hanging roots/ivy; Embed sinks the base UP into the ceiling.
         public bool  NoAlign    = false; // skip surface-normal alignment → identity + yaw (+ rot offset). For prefabs already authored hanging/standing (e.g. crypt roots) that a flip would break.
         public bool  FaceNormal = false; // align the prop's FORWARD (+Z) to the surface normal (LookRotation), not its up — for flat decals/ivy whose visible face is +Z. yaw rolls about the normal.
@@ -187,6 +188,7 @@ namespace ProceduralTerrain
                     case "randtilt":  p.RandTilt  = F(v, p.RandTilt); break;
                     case "biomepure": p.BiomePure = F(v, p.BiomePure); break;
                     case "atriumonly":p.AtriumOnly= F(v, p.AtriumOnly); break;
+                    case "minabovevanilla":p.MinAboveVanilla= F(v, p.MinAboveVanilla); break;
                     case "hang":      p.Hang      = (v == "1" || v.Equals("true", StringComparison.OrdinalIgnoreCase)); break;
                     case "noalign":   p.NoAlign   = (v == "1" || v.Equals("true", StringComparison.OrdinalIgnoreCase)); break;
                     case "facenormal":p.FaceNormal= (v == "1" || v.Equals("true", StringComparison.OrdinalIgnoreCase)); break;
