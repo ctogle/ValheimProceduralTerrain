@@ -29,6 +29,7 @@ EXCLUDED = {
     "veggroupradius", "vegtiltinherit", "vegrandtilt", "vegmaxtilt",
     "vegconformmaxtilt", "vegsupportradius", "vegetationconform", "seed",
     "prefetch", "prefetchradius", "prefetchthreads", "cavecontent", "lodunderground",
+    "hidemist", "vizmode",   # render/debug-only — change no baked voxel
 }
 
 MASK = 0xFFFFFFFF

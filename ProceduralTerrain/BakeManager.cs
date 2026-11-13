@@ -34,6 +34,7 @@ namespace ProceduralTerrain
             "disablevegetation", "applygroundwork", "protectlocations", "flatplanelocations", "locdomeheight", "locbandfade", "vegdensity", "vegforestwiden", "veginforest", "vegforestmax", "veggroupsize", "veggroupradius", "vegtiltinherit", "vegrandtilt", "vegmaxtilt", "vegconformmaxtilt", "vegsupportradius",
             "vegetationconform", "vegmaxtilt", "seed",
             "prefetch", "prefetchradius", "prefetchthreads", "cavecontent", "lodunderground",
+            "hidemist", "vizmode",   // render/debug-only — suppress mist / select viz mode; change no baked voxel
         };
 
         internal static uint ComputeCfgHash()
