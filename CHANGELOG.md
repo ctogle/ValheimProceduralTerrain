@@ -2,6 +2,7 @@
 
 ## 0.0.2
 
+- ⚠️ **Breaking: upgrading from 0.0.1 destroys existing worlds — please start a new world. Sorry!**
 - Plains cave content: ivy, shipwreck debris, seagull colonies, fuling patrols.
 - Ivy lit only where daylight reaches through open air.
 - Warns before loading a world with a mismatched/missing terrain version (protects vanilla saves).
