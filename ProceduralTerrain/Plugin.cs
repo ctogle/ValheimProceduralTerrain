@@ -905,7 +905,7 @@ namespace ProceduralTerrain
     [BepInDependency("com.bogey.voxheim", BepInDependency.DependencyFlags.SoftDependency)]
     public partial class Plugin : BaseUnityPlugin
     {
-        internal const string Version = "0.0.1";   // single source of truth — also the world version tag (see WorldVersionGuard)
+        internal const string Version = "0.0.2";   // single source of truth — also the world version tag (see WorldVersionGuard)
         internal static ManualLogSource Log = null!;
 
         // HeightGrid scale delegate. Built in BuildDelegates.

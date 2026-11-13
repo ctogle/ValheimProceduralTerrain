@@ -47,17 +47,24 @@ namespace ProceduralTerrain
             uint hash = 2166136261u;
             foreach (var rawLine in File.ReadAllLines(path))
             {
+                // Strip comments (full-line + inline) and trailing whitespace before hashing: comments are
+                // documentation, not terrain-determining, so editing them must NOT invalidate a bake. Lines that
+                // become empty (comment-only or blank) are skipped entirely, so adding/removing doc lines is also
+                // hash-neutral. (NOTE: tools/rename_bake.py mirrors this exactly — keep the two in lockstep.)
+                int hashPos = rawLine.IndexOf('#');
+                string line = (hashPos >= 0 ? rawLine.Substring(0, hashPos) : rawLine).TrimEnd();
+                if (line.Length == 0) continue;
                 // Exclude live/render-only + location-overlay + seed knobs by EXACT key (not line-prefix, which
                 // collided: seed vs seedFrac/seedR/seeds, coarseXZ vs bakeCoarseXZ). These don't affect baked bytes
                 // (the bake is purely procedural; groundwork/protection/vegetation/seed are applied live or keyed
                 // into the filename separately), so tuning them must not invalidate a bake.
-                int eq = rawLine.IndexOf('=');
+                int eq = line.IndexOf('=');
                 if (eq > 0)
                 {
-                    string key = rawLine.Substring(0, eq).Trim().ToLowerInvariant();
+                    string key = line.Substring(0, eq).Trim().ToLowerInvariant();
                     if (_hashExcludedKeys.Contains(key)) continue;
                 }
-                foreach (char c in rawLine) hash = (hash ^ (byte)c) * 16777619u;
+                foreach (char c in line) hash = (hash ^ (byte)c) * 16777619u;
                 hash = (hash ^ (byte)'\n') * 16777619u;
             }
             return hash;
