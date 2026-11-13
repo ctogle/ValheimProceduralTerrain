@@ -24,6 +24,10 @@ Two steps:
 
 A bake is tied to **(world seed + config)** — the same seed string and the same cfg always produce the same terrain, so a bake made for them is valid on any world that matches. Change either and it no longer matches, and you'll rebake.
 
+### Skip the bake — grab the prebaked world
+
+Don't want to wait on a bake? Create a world with the seed **`Vaaltorin`**, download the `.bin` from the [latest release](https://github.com/ctogle/ValheimProceduralTerrain/releases/latest), and drop it into `BepInEx/config/ProceduralTerrain/`. It loads instantly — no baking. (Matches only the shipped default config on that seed; edit the terrain config or pick another seed and the mod just bakes its own.)
+
 ### Dedicated servers
 
 Bake on the server once (`pt_bake`, admin-only). It runs in the background. When a client connects, if it doesn't already have the matching bake it **downloads it from the server** on join (with a progress bar); clients that already have an identical copy skip the download.
