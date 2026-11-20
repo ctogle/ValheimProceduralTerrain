@@ -16,10 +16,6 @@
     <VoxheimPath>$(BepInExPath)\plugins\Voxheim-Voxheim</VoxheimPath>
   </PropertyGroup>
 
-  <ItemGroup>
-    <PackageReference Include="MoonSharp" Version="1.2.1.0" />
-  </ItemGroup>
-
   <!-- Default configs embedded in the DLL; the plugin writes them to the config dir on first launch. -->
   <ItemGroup>
     <EmbeddedResource Include="..\configs\biomes.cfg" LogicalName="ProceduralTerrain.biomes.cfg" />

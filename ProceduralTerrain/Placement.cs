@@ -145,11 +145,14 @@ namespace ProceduralTerrain
             var inv = System.Globalization.CultureInfo.InvariantCulture;
             var p = new Placement { Name = name };
             bool haveKind = false;
+            bool enabled = true;
             float F(string v, float d) => float.TryParse(v, System.Globalization.NumberStyles.Float, inv, out var f) ? f : d;
             foreach (var (k, v) in kvs)
             {
                 switch (k)
                 {
+                    case "enabled":
+                        enabled = !(v == "0" || v.Equals("false", StringComparison.OrdinalIgnoreCase)); break;
                     case "kind":
                         if (v.Equals("spawner", StringComparison.OrdinalIgnoreCase)) p.Kind = PlacementKind.Spawner;
                         else if (v.Equals("object", StringComparison.OrdinalIgnoreCase)) p.Kind = PlacementKind.Object;
@@ -216,6 +219,7 @@ namespace ProceduralTerrain
                     case "clusterthresh":p.ClusterThresh = F(v, p.ClusterThresh); break;
                 }
             }
+            if (!enabled) { Log.LogInfo($"[PT-cave] placement '{name}': enabled=false — skipped."); return null; }
             if (!haveKind) { Log.LogWarning($"[PT-cave] placement '{name}': missing kind= (object|spawner)."); return null; }
             if (p.Biomes.Count == 0) { Log.LogWarning($"[PT-cave] placement '{name}': no biome= — rule is inert."); return null; }
             if (p.PrefabCands.Length == 0) { Log.LogWarning($"[PT-cave] placement '{name}': no prefab=/chassis=."); return null; }

@@ -782,9 +782,6 @@ namespace ProceduralTerrain
             lock (_etaLock) { _etaLastN = 0; _etaLastSec = 0f; _etaEmaSecPerZone = 0f; }
             Plugin._bakeProgressTotal = toCarve.Count;
             Plugin._bakeProgressDone  = 0;
-            // Pre-warm Script pool so bake threads don't all create Scripts simultaneously.
-            foreach (var mode in Plugin._pipeline.OfType<LuaModeDef>())
-                mode.WarmPool(threads);
 
             // Gather preserved existing zones (incremental bakes) as compressed blocks BEFORE truncating the
             // output file — un-recarved zones get block-copied into the new file so they survive. Zero for a

@@ -153,203 +153,7 @@ namespace ProceduralTerrain
         }
     }
 
-    // ── Mode Lua: user-defined Lua bake function ──────────────────────────────
-
-    internal sealed class LuaModeDef : ModeDefinition
-    {
-        public string FilePath = "";
-        // Blend/BlendK inherited from ModeDefinition.
-
-        // Pool entry: a Script plus its reusable params table and output buffer. Reused per BakeColumn so
-        // the hot path allocates nothing — the output column is written into a CLR float[] (wrapped as
-        // MoonSharp userdata) instead of a fresh per-call table, which was the bake's dominant GC source.
-        internal sealed class LuaEntry
-        {
-            public MoonSharp.Interpreter.Script s = null!;
-            public MoonSharp.Interpreter.Table  p = null!;
-            public float[]  outBuf = System.Array.Empty<float>();
-            public MoonSharp.Interpreter.DynValue outUD = MoonSharp.Interpreter.DynValue.Nil;
-        }
-
-        static LuaModeDef()
-        {
-            // float[] element get/set from Lua (0-based) — lets bake() write its column into a shared buffer.
-            if (!MoonSharp.Interpreter.UserData.IsTypeRegistered(typeof(float[])))
-                MoonSharp.Interpreter.UserData.RegisterType<float[]>();
-        }
-
-        System.Collections.Concurrent.ConcurrentBag<LuaEntry>? _scriptPool;
-        string? _luaSrc;
-        string[] _dynParamNames  = Array.Empty<string>();
-        float[]  _dynDefaults    = Array.Empty<float>();
-
-        public override int    ParamCount => _dynParamNames.Length;
-        public override string[] ParamNames => _dynParamNames;
-        public override float GetDefaultParam(int i) => i < _dynDefaults.Length ? _dynDefaults[i] : 0f;
-
-        // Surface-anchored lua modes (radial ridges/rings) ride on the injected bed height (terrain_h0).
-        // Setting surfaceAnchored=true in [Mode] gives them the same full-res baseline correction as
-        // native formation — replacing the coarse-baked bed with a per-column one, killing bed faceting.
-        // Baseline = GroundHeight (exactly what th0 is), so the correction cancels cleanly.
-        public bool SurfaceAnchoredFlag;
-        public override bool SurfaceAnchored => SurfaceAnchoredFlag;
-        public override float SampleBaselineFull(ref CarveBuffers cb, in ColumnCtx col, WorldGenerator? wg)
-            => Plugin.GroundHeight(col.worldX, col.worldZ, wg ?? WorldGenerator.instance);
-
-        public override bool NeedsGradField => false;
-        public override float GradBlurRadius
-        {
-            get
-            {
-                for (int i = 0; i < _dynParamNames.Length; i++)
-                    if (_dynParamNames[i] == "blurradius") return _dynDefaults[i];
-                return 128f;
-            }
-        }
-
-        // Called from ParseModeDefinition after all fields are set.
-        public void SetDynParams(List<(string name, float def)> plist)
-        {
-            _dynParamNames = new string[plist.Count];
-            _dynDefaults   = new float[plist.Count];
-            for (int i = 0; i < plist.Count; i++)
-            {
-                _dynParamNames[i] = plist[i].name;
-                _dynDefaults[i]   = plist[i].def;
-            }
-        }
-
-        LuaEntry CreateEntry()
-        {
-            var s = new MoonSharp.Interpreter.Script(MoonSharp.Interpreter.CoreModules.Preset_HardSandbox);
-            int nc = Plugin._noiseCount;
-            for (int k = 0; k < nc; k++)
-            {
-                int kk = k;
-                s.Globals[$"n{kk + 1}"] = (Func<float,float,float,float>)((x, y, z) =>
-                    Plugin._noisePool != null ? Plugin._noisePool[kk].GetNoise(x, y, z) : 0f);
-            }
-            s.Globals["log"]        = (Action<string>)(msg => Plugin.Log.LogInfo($"[lua] {msg}"));
-            s.Globals["lerp"]       = (Func<float,float,float,float>)Mathf.Lerp;
-            s.Globals["smoothstep"] = (Func<float,float,float,float>)Mathf.SmoothStep;
-            s.Globals["terrain_h"]  = (Func<float,float,float>)((x, z) =>
-                { var w = WorldGenerator.instance; return w != null ? Plugin.GroundHeight(x, z, w) : 0f; });
-            s.DoString(_luaSrc!);
-            // Pre-allocate params table — reused each BakeColumn, values updated in place.
-            return new LuaEntry { s = s, p = new MoonSharp.Interpreter.Table(s) };
-        }
-
-        LuaEntry RentEntry()
-        {
-            if (_scriptPool != null && _scriptPool.TryTake(out var e)) return e;
-            return CreateEntry();
-        }
-
-        void ReturnEntry(LuaEntry e) => _scriptPool?.Add(e);
-
-        public void WarmPool(int count)
-        {
-            if (_scriptPool == null || _luaSrc == null) return;
-            int have = _scriptPool.Count;
-            for (int i = have; i < count; i++)
-                try { _scriptPool.Add(CreateEntry()); }
-                catch { break; }
-        }
-
-        public void LoadScript()
-        {
-            try
-            {
-                if (!System.IO.File.Exists(FilePath))
-                {
-                    Plugin.Log.LogWarning($"[ProceduralTerrain] LuaMode '{Name}': file not found: {FilePath}");
-                    return;
-                }
-                _luaSrc = System.IO.File.ReadAllText(FilePath);
-                // Create one entry eagerly to validate the source; pool is pre-seeded with it.
-                var first = CreateEntry();
-                _scriptPool = new System.Collections.Concurrent.ConcurrentBag<LuaEntry>();
-                _scriptPool.Add(first);
-                Plugin.Log.LogInfo($"[ProceduralTerrain] LuaMode '{Name}': loaded {FilePath}");
-            }
-            catch (Exception ex)
-            {
-                Plugin.Log.LogError($"[ProceduralTerrain] LuaMode '{Name}': LoadScript failed: {ex.Message}");
-                _scriptPool = null;
-                _luaSrc = null;
-            }
-        }
-
-
-        // BakeBegin (aux slot alloc) inherited from ModeDefinition.
-
-        public override void BakeColumn(ref CarveBuffers cb, in BakeCellArgs args)
-        {
-            if (_scriptPool == null) return;
-            int pi = PipelineIndex;
-            int idx = args.cellIdx;
-            float amp = cb.bkModeParams![pi][0][idx];
-            int baseIdx = idx * args.bh;
-            float[]? auxBuf = cb.bkModeAux![pi][0];
-            var wg2 = args.wg ?? WorldGenerator.instance;
-
-            // Bed height (terrain_h0), vanilla-blended. For surface-anchored modes, store it as the
-            // baseline UNCONDITIONALLY — before the amp<=0 gate — so the full-res correction is defined
-            // at every cell (amp gates application, not existence; else stale baselines → boundary spikes).
-            // Sequential compose: a surface-anchored mode reads the COMPOSED surface (the running field
-            // of PRIOR modes) as its bed + frame, so it conforms to what's already there. Else vanilla.
-            bool inc = Plugin._composeIncoming && SurfaceAnchoredFlag
-                       && Plugin._composeInH != null && idx < Plugin._composeInH.Length;
-            float th0 = inc ? Plugin._composeInH![idx]
-                            : (wg2 != null ? Plugin.GroundHeight(args.worldX, args.worldZ, wg2) : 0f);
-            if (SurfaceAnchoredFlag && cb.bkModeBaseline != null && pi < cb.bkModeBaseline.Length && cb.bkModeBaseline[pi] != null)
-                cb.bkModeBaseline[pi]![idx] = th0;
-
-            if (amp <= 0f)
-            {
-                for (int cy = 0; cy < args.bh; cy++) auxBuf![baseIdx + cy] = 0f;
-                return;
-            }
-
-            (float dirx, float dirz, float mag) = inc
-                ? (Plugin._composeInGX![idx], Plugin._composeInGZ![idx], Plugin._composeInGMag![idx])
-                : (wg2 != null ? Plugin.ZoneGradCache.Sample(wg2, args.worldX, args.worldZ, GradBlurRadius) : (0f, 0f, 0f));
-
-            var e = RentEntry();
-            var s = e.s; var p = e.p;
-            try
-            {
-                // Mutate pre-allocated params table in place — avoids per-cell Table allocation.
-                for (int i = 0; i < _dynParamNames.Length; i++)
-                    p[_dynParamNames[i]] = (double)cb.bkModeParams![pi][i][idx];
-                p["grad_dirx"]   = (double)dirx;
-                p["grad_dirz"]   = (double)dirz;
-                p["grad_mag"]    = (double)mag;
-                p["terrain_h0"]  = (double)th0;
-
-                // Reusable CLR output buffer (wrapped as userdata) — bake() writes its column into this
-                // (0-based) instead of returning a fresh table, so the hot path allocates nothing.
-                if (e.outBuf.Length < args.bh)
-                {
-                    e.outBuf = new float[args.bh];
-                    e.outUD  = MoonSharp.Interpreter.UserData.Create(e.outBuf);
-                }
-
-                var res = s.Call(s.Globals["bake"], args.worldX, args.worldZ, p, args.extLoS, (double)args.s, args.bh, e.outUD);
-
-                // Buffer-write modes return nil; legacy modes still return a table (read that instead).
-                var tbl = res.Table;
-                if (tbl != null)
-                    for (int cy = 0; cy < args.bh; cy++)
-                        auxBuf![baseIdx + cy] = (float)(tbl.Get(cy + 1).CastToNumber() ?? 0.0);
-                else
-                    for (int cy = 0; cy < args.bh; cy++) auxBuf![baseIdx + cy] = e.outBuf[cy];
-            }
-            catch { for (int cy = 0; cy < args.bh; cy++) auxBuf![baseIdx + cy] = 0f; }
-            finally { ReturnEntry(e); }
-        }
-        // PrepareColumn / ComputeVoxel (interpolate + floor + blend) inherited from ModeDefinition.
-    }
+    // (Lua/MoonSharp mode support removed in 0.0.3 — all shipped modes are native C#.)
 
     // ── Native (C#) mode base ─────────────────────────────────────────────────
     // Same contract as a Lua mode — implement BakeColumn — but the column formula is native C#, so
@@ -508,6 +312,10 @@ namespace ProceduralTerrain
             ("twistfrequency", 0.008f), ("ampvary", 0.2f), ("ampfrequency", 0.005f), ("flare", 0.6f),
             ("yoffset", 0f), ("smoothradius", 0f), ("gradfade", 0f), ("yanchor", 0f),
             ("seaatten", 1f), ("seafade", 0f), ("sealevel", 30f),
+            // basebuffer (m): weld the formation SOLID for this depth just BELOW its anchor so it locks into the
+            // vanilla surface instead of floating a hair above it (the warp shifts addh above local ground → a
+            // "pinch gap" seam at the base). 0 = off. Appended last → existing param indices unchanged.
+            ("basebuffer", 0f),
         };
         protected override (string name, float def)[] ParamSpec => _spec;
 
@@ -555,6 +363,7 @@ namespace ProceduralTerrain
             float ampVary   = P[9][idx],  ampFreq  = P[10][idx], flare    = P[11][idx], yoffset = P[12][idx];
             float smoothR   = P[13][idx], gradFade = P[14][idx], yanchor  = P[15][idx];
             float seaAtten  = P[16][idx], seaFade  = P[17][idx], seaLevel = P[18][idx];
+            float baseBuffer = P[19][idx];
 
             var pool = Plugin._noisePool!;
             var wg   = args.wg ?? WorldGenerator.instance;
@@ -610,7 +419,13 @@ namespace ProceduralTerrain
                 float n    = pool[7].GetNoise((wx * c - wz * ss) * freq, sy * freq, (wx * ss + wz * c) * freq);
                 float ft   = Mathf.Clamp01(rely / Mathf.Max(lamp, 0.001f));
                 float efft = threshold - flare * (4f * ft * (1f - ft));
-                outCol[baseIdx + cy] = rely - (n - efft) * lamp;
+                float v    = rely - (n - efft) * lamp;
+                // Pinch-gap weld: for a band just below the anchor, force the field at least as solid as a plain
+                // downward ramp (min with rely, which is <0 there) so noise can't punch a void between the
+                // formation base and the vanilla surface it should fuse into. Below the band the SDF is already solid.
+                if (baseBuffer > 0f && rely < 0f && rely > -baseBuffer)
+                    v = Mathf.Min(v, rely);
+                outCol[baseIdx + cy] = v;
             }
         }
     }
@@ -942,7 +757,6 @@ namespace ProceduralTerrain
             = BuildDefaultProfiles();
         static volatile bool _hotReloadPending;
         static DateTime _configLastWrite = DateTime.MinValue;
-        static DateTime _luaLastWrite    = DateTime.MinValue;
 
         // ── Pipeline ──────────────────────────────────────────────────────────────
         static volatile ModeDefinition[] _pipeline = Array.Empty<ModeDefinition>();
@@ -1057,6 +871,7 @@ namespace ProceduralTerrain
             public float[] colCross  = null;
             public byte[]  colNCross = null;
             public float   crossSlope;
+            public int[]   colXOff   = null;   // lazy prefix-sum of (colNCross&0x7F) into colCross; built on first surface query
         }
         // Staged: sparse SDF written by Carve() when within bakeRadius.
         static readonly System.Collections.Concurrent.ConcurrentDictionary<(int, int), BakeZone> _bakePending = new();
@@ -2232,6 +2047,10 @@ namespace ProceduralTerrain
 
         void Update()
         {
+            // ── FarLands: register our far-terrain height delta once the bake is loaded (self-guards; cheap no-op after) ──
+            if (FarLandsBridge.IsPresent && (_bakeData != null || _bakeIndex != null))
+                FarLandsBridge.TryRegister();
+
             // ── Frame hitch watchdog (EVERY frame; dominator of a main-thread stall) ──────────────
             {
                 long nowTs = System.Diagnostics.Stopwatch.GetTimestamp();
@@ -2313,11 +2132,9 @@ namespace ProceduralTerrain
 
             WatchPlacementConfigReload();   // independent file; no recarve needed
 
-            var t    = File.GetLastWriteTimeUtc(ConfigPath);
-            var tLua = LatestLuaWrite();
-            if (t == _configLastWrite && tLua == _luaLastWrite) return;
+            var t = File.GetLastWriteTimeUtc(ConfigPath);
+            if (t == _configLastWrite) return;
             _configLastWrite = t;
-            _luaLastWrite    = tLua;
             LoadBiomeConfig();
             RecarveAll();
         }

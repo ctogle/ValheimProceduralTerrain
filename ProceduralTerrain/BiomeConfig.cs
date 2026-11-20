@@ -60,41 +60,15 @@ namespace ProceduralTerrain
             }
             if (typeStr == null) { Log.LogWarning($"[ProceduralTerrain] Mode '{name}': missing or invalid type."); return null; }
 
-            // Handle Lua mode separately
+            // Lua modes were removed in 0.0.3 — a config still asking for one is now an error, not a fallback.
             if (typeStr == "LUA")
             {
-                var luaDef = new LuaModeDef { Name = name };
-                var dynParams = new List<(string name, float def)>();
-                string? fileVal = null, blendVal = null, blendKStr = null;
-                foreach (var (k, v) in kvs)
-                {
-                    if (k == "type") continue;
-                    if (k == "file")    { fileVal  = v.Trim(); continue; }
-                    if (k == "blend")   { blendVal  = v.Trim().ToLowerInvariant(); continue; }
-                    if (k == "blend_k") { blendKStr = v.Trim(); continue; }
-                    if (k == "surfaceanchored") { luaDef.SurfaceAnchoredFlag = v.Trim() == "1" || v.Trim().ToLowerInvariant() == "true"; continue; }
-                    if (float.TryParse(v, System.Globalization.NumberStyles.Float, inv, out float fv))
-                    {
-                        if (k == "amplitude") { luaDef.Amplitude = fv; }
-                        else dynParams.Add((k, fv));
-                    }
-                }
-                if (blendVal  != null) luaDef.Blend  = blendVal;
-                if (blendKStr != null && float.TryParse(blendKStr, System.Globalization.NumberStyles.Float, inv, out float bk)) luaDef.BlendK = bk;
-                // Ensure amplitude is index 0
-                var orderedParams = new List<(string name, float def)>();
-                orderedParams.Add(("amplitude", luaDef.Amplitude));
-                foreach (var p in dynParams) if (p.name != "amplitude") orderedParams.Add(p);
-                luaDef.SetDynParams(orderedParams);
-                if (fileVal != null)
-                    luaDef.FilePath = System.IO.Path.Combine(System.IO.Path.GetDirectoryName(ConfigPath)!, "modes", fileVal);
-                luaDef.LoadScript();
-                return luaDef;
+                Log.LogWarning($"[ProceduralTerrain] Mode '{name}': type=lua is no longer supported (Lua/MoonSharp removed). Use a native mode.");
+                return null;
             }
 
-            // Native (C#) modes: same [Mode:*] contract as Lua, selected by type name. This is what lets
-            // a mode be swapped between its Lua prototype and its C# port by editing `type=` and saving
-            // (config hot-reload rebuilds the pipeline). Params are set generically by name via SetParam.
+            // Native (C#) modes: same [Mode:*] contract, selected by type name. Params are set generically
+            // by name via SetParam (config hot-reload rebuilds the pipeline).
             if (_nativeModes.TryGetValue(typeStr, out var factory))
             {
                 var nd = factory(); nd.Name = name;
@@ -109,7 +83,7 @@ namespace ProceduralTerrain
                 return nd;
             }
 
-            Log.LogWarning($"[ProceduralTerrain] Mode '{name}': unknown type '{typeStr}' (expected 'lua' or a native mode name).");
+            Log.LogWarning($"[ProceduralTerrain] Mode '{name}': unknown type '{typeStr}' (expected a native mode name).");
             return null;
         }
 
@@ -614,20 +588,6 @@ namespace ProceduralTerrain
         static void WatchBiomeConfig()
         {
             _configLastWrite = File.GetLastWriteTimeUtc(ConfigPath);
-            _luaLastWrite    = LatestLuaWrite();
-        }
-
-        static DateTime LatestLuaWrite()
-        {
-            var dir = Path.Combine(Path.GetDirectoryName(ConfigPath)!, "modes");
-            if (!Directory.Exists(dir)) return DateTime.MinValue;
-            var t = DateTime.MinValue;
-            foreach (var f in Directory.GetFiles(dir, "*.lua"))
-            {
-                var ft = File.GetLastWriteTimeUtc(f);
-                if (ft > t) t = ft;
-            }
-            return t;
         }
 
         // ── Noise initialisation ──────────────────────────────────────────────────

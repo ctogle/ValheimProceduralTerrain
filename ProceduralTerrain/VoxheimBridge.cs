@@ -202,6 +202,7 @@ namespace ProceduralTerrain
     {
         public string Id       => "com.ctogle.procedural_terrain";
         public string Revision => "1";
+        static int _surfCheckN;   // [0.0.3 diag] sample rate for the FarLands surface comparison
 
         public void Generate(Voxheim.Core.VoxelBaselineContext context, Voxheim.Core.VoxelBaselineBuilder builder)
         {
@@ -301,6 +302,38 @@ namespace ProceduralTerrain
             PtPerf.CarveMs += carveMs;
             PtPerf.GwMs    += gwMs;
             PtPerf.SetMs   += setMs;
+
+            // [0.0.3 diag] FarLands rock-dupe: the surface we feed FarLands (TryGetBakeSurfaceY, bake crossing)
+            // vs the LIVE surface real content conforms to (TrySampleSurfaceY). Sampled at a few columns across
+            // the zone so a HEIGHT-PROPORTIONAL divergence (scale bug) vs a flat offset is visible. Both are only
+            // valid once the zone's surfH is cached (just populated by Carve above), so this runs post-serve.
+            if ((++_surfCheckN) % 20 == 0)
+            {
+                for (int s = 0; s < 3; s++)
+                {
+                    float sx = ox + (s == 0 ? 2 : s == 1 ? width / 2 : width - 3);
+                    float sz = oz + width / 2;
+                    bool okB = Plugin.TryGetBakeSurfaceY(sx, sz, out float bakeY);
+                    bool okL = Plugin.TrySampleSurfaceY(sx, sz, out float liveY);
+                    // Also: what FarLands actually CAPTURES for near terrain (the loaded Heightmap.m_heights,
+                    // via GetWorldHeight) vs plain vanilla (WorldGenerator). The meters-high far rocks mean
+                    // FarLands' surface != PT's — this shows which source it is and the real gap.
+                    var pos = new Vector3(sx, 0f, sz);
+                    var hm = Heightmap.FindHeightmap(pos);
+                    float hmH = float.NaN; if (hm != null) hm.GetWorldHeight(pos, out hmH);
+                    float vanH = WorldGenerator.instance != null ? WorldGenerator.instance.GetHeight(sx, sz) : float.NaN;
+                    if (okB && okL)
+                        Plugin.Log.LogInfo($"[PT-surfcheck] ({sx:F0},{sz:F0}) ptBake={bakeY:F2} ptLive={liveY:F2} hmapCaptured={hmH:F2} vanilla={vanH:F2} | hmap-vs-live={(hmH - liveY):F2}");
+                }
+            }
+
+            // [0.0.3 diag] per-ZONE serve cost (not frame-aggregated → immune to the PtPerf/HitchMonitor frame-order
+            // skew). This runs inside Voxheim's main-thread Activate phase, so a fat line here IS the `activate` hitch.
+            // Logs only zones that blow the budget, with the split so we can see bake-decode vs groundwork vs blit,
+            // and whether the zone was live-carved (bake miss) vs served from the bake.
+            double serveMs = carveMs + gwMs + setMs;
+            if (serveMs > 6.0)
+                Plugin.Log.LogInfo($"[PT-serve] zone ({ox},{oz}) = {serveMs:F1}ms  carve={carveMs:F1} gw={gwMs:F1} set={setMs:F1}  live={_genThisZone} gc2+{d2}");
         }
 
         // Build a per-zone height grid with overlapping LOCATION terrain ops baked in, using vanilla
@@ -338,7 +371,15 @@ namespace ProceduralTerrain
             // actually finds modifiers (changed>0). It's authority-only and returns empty on a client, so an empty
             // result must NOT short-circuit: we fall through to the LIVE transient gather below, which reads the
             // real placed TerrainModifier objects (rotation-correct, and the path that works local/server-live).
-            if (TryVoxheimGroundwork(centerX, centerZ, width, scale, out var effDet, out var baseDet, out int changedDet)
+            // The AuthorityHeadlessExtractor is authority-only — on a CLIENT (connected to a dedicated server)
+            // it does ~full-zone work and then returns empty, so we always fall through to the live gather below
+            // anyway. That pre-compute measured up to 180ms/zone of PURE WASTE on the client (the dominant
+            // location-zone serve hitch). Only the authority (host / listen-server) can get a non-empty result,
+            // so skip the extractor entirely when we're not it — behaviour-neutral (the live path is unchanged).
+            bool isAuthority = ZNet.instance == null || ZNet.instance.IsServer();
+            long _tExt = System.Diagnostics.Stopwatch.GetTimestamp();
+            if (isAuthority
+                && TryVoxheimGroundwork(centerX, centerZ, width, scale, out var effDet, out var baseDet, out int changedDet)
                 && effDet != null && baseDet != null && changedDet > 0)
             {
                 if ((++Plugin._gwExtractorOk) % 25 == 1)
@@ -350,6 +391,7 @@ namespace ProceduralTerrain
                 Plugin._groundworkCache[gwKey] = (gGrid, vGrid, nmods);
                 return gGrid;
             }
+            double extMs = (System.Diagnostics.Stopwatch.GetTimestamp() - _tExt) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
 
             // LIVE transient gather — the workhorse (restored). Reads spawned TerrainModifier objects for this zone.
             var center  = new Vector3(centerX, centerY, centerZ);
@@ -390,8 +432,10 @@ namespace ProceduralTerrain
             var hmb = HeightmapBuilder.instance;
             if (hmb == null) return null;
             HeightmapBuilder.HMBuildData bd;
+            long _tReq = System.Diagnostics.Stopwatch.GetTimestamp();
             try { bd = hmb.RequestTerrainSync(center, width, scale, false, wg); }
             catch (Exception e) { Plugin.Log.LogError($"[PT] HMBuildData: {e.Message}"); return null; }
+            double reqMs = (System.Diagnostics.Stopwatch.GetTimestamp() - _tReq) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
             if (bd == null || bd.m_baseHeights == null || bd.m_cornerBiomes == null || bd.m_cornerBiomes.Length != 4) return null;
 
             var hArr = bd.m_baseHeights.ToArray();
@@ -406,7 +450,13 @@ namespace ProceduralTerrain
                     (Voxheim.Core.HeadlessBiome)(int)bd.m_cornerBiomes[2].Biome,
                     (Voxheim.Core.HeadlessBiome)(int)bd.m_cornerBiomes[3].Biome,
                     hArr, mods, null, null, 8f, seed);
+                long _tApply = System.Diagnostics.Stopwatch.GetTimestamp();
                 Voxheim.Core.HeadlessBaselineBuilder.ApplyGroundworkInPlace(hArr, mods, input);
+                double applyMs = (System.Diagnostics.Stopwatch.GetTimestamp() - _tApply) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+                // [0.0.3 diag] split the gw cost: RequestTerrainSync (vanilla base heights, ~constant/zone) vs
+                // ApplyGroundworkInPlace (modifier application, scales with nmods). Logged when either is non-trivial.
+                if (extMs + reqMs + applyMs > 5.0)
+                    Plugin.Log.LogInfo($"[PT-gwsplit] zone {gwKey} mods={mods.Count}/{all.Count} | extractor={extMs:F1}ms requestTerrain={reqMs:F1}ms applyGroundwork={applyMs:F1}ms");
             }
             catch (Exception e) { Plugin.Log.LogError($"[PT] groundwork build: {e.Message}"); return null; }
 

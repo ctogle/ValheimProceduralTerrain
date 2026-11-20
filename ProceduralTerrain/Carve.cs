@@ -1082,6 +1082,44 @@ namespace ProceduralTerrain
             return $"({ox},{oz}) present[{present}]";
         }
 
+        // Surface Y at a world point read straight from the BAKE (whole-world, deterministic) — unlike
+        // TrySampleSurfaceY which only knows generated/visited zones (_surfHCache). Used by the FarLands bridge
+        // to feed distant terrain where no zone is loaded. v6 crossings bakes only (current format); step==1.
+        // Returns false if the zone isn't in the bake, the layout is unsupported, or the column has no surface.
+        internal static bool TryGetBakeSurfaceY(float worldX, float worldZ, out float sh)
+        {
+            sh = 0f;
+            float s = ActiveScale();
+            var (ox, oz) = ZoneOriginFromWorld(worldX, worldZ, s);
+            if (!TryGetBakeZone(ox, oz, out var e) || e == null) return false;
+            if (e.colCross == null) return false;            // v5 dense layout not supported here
+            int owned = e.nsx;
+            if (e.nsz != owned || owned <= 0) return false;  // expect the step==1 owned WxW grid
+            int ix = Mathf.RoundToInt(worldX / s) - ox;
+            int iz = Mathf.RoundToInt(worldZ / s) - oz;
+            if (ix < 0 || ix >= owned || iz < 0 || iz >= e.nsz) return false;
+            int col = ix * e.nsz + iz;
+            int ncols = e.nsx * e.nsz;
+            // lazily build the per-column prefix-sum into colCross (counts are the low 7 bits of colNCross)
+            var xoff = e.colXOff;
+            if (xoff == null)
+            {
+                xoff = new int[ncols + 1];
+                for (int c = 0; c < ncols; c++) xoff[c + 1] = xoff[c] + (e.colNCross[c] & 0x7F);
+                e.colXOff = xoff;   // benign race: all threads compute the same array
+            }
+            int nc = e.colNCross[col] & 0x7F;
+            if (nc == 0) return false;                       // no crossing in this column → no clean surface
+            // crossings are sorted ascending and stored in bakCy units (relative to e.extLo); the topmost is
+            // the surface. FLOOR to the highest SOLID voxel so this matches the LIVE surface real content conforms
+            // to (TrySampleSurfaceY/PopulateSparseFromBake use `(extLo+cy)*s` at the last solid cy = floor(crossing)).
+            // Returning the raw sub-voxel crossing left it up to ~1m HIGH → FarLands far rocks floated above the
+            // real ones (the duplicate-rock bug). world Y = (floor(crossing) + e.extLo) * s.
+            float top = e.colCross[xoff[col] + nc - 1];
+            sh = ((float)Math.Floor(top) + e.extLo) * s;
+            return true;
+        }
+
         // Raw voxel surface Y at a world point (highest solid), or false if that zone's surfH isn't cached yet.
         // Used by the vegetation-conform patch to snap height and build a finite-diff surface normal.
         internal static bool TrySampleSurfaceY(float worldX, float worldZ, out float sh)
@@ -2364,7 +2402,7 @@ namespace ProceduralTerrain
                         continue;
                     }
 
-                    bool anchored = mode is LuaModeDef lm && lm.SurfaceAnchoredFlag;
+                    bool anchored = mode.SurfaceAnchored;
 
                     if (anchored)
                     {
