@@ -60,12 +60,12 @@ namespace ProceduralTerrain
                 else
                     Plugin.Log.LogWarning("[PT-FarLands] PlayerEdited not found — can't guard against double-count in captured zones.");
 
-                Func<float, float, float, float> delta = Delta;
-                Func<float, float, float, float, float, uint> print = Print;
-                // paint and cleared are null: PT changes neither ground paint nor tree clearing.
-                _handle = add.Invoke(null, new object[] { "ProceduralTerrain", delta, null, print, null });
+                // Delta NOT registered: PlayerEdited gate proved unreliable (captured wilderness zones return false
+                // → delta double-counts on top of the m_heights write → 2× rock dupes return). m_heights-write
+                // delivers PT to near/captured zones; far reverts to vanilla until we have a RELIABLE captured-zone
+                // gate (our own written-zone set) or extend voxel coverage instead. Bridge stays inert for now.
                 _registered = true;
-                Plugin.Log.LogInfo("[PT-FarLands] Registered PT height delta with FarLands — distant terrain will follow PT's surface.");
+                Plugin.Log.LogInfo("[PT-FarLands] delta NOT registered (PlayerEdited gate unreliable → dupes); PT via m_heights only.");
             }
             catch (Exception e)
             {

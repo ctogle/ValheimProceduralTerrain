@@ -2051,6 +2051,7 @@ namespace ProceduralTerrain
             if (FarLandsBridge.IsPresent && (_bakeData != null || _bakeIndex != null))
                 FarLandsBridge.TryRegister();
 
+
             // ── Frame hitch watchdog (EVERY frame; dominator of a main-thread stall) ──────────────
             {
                 long nowTs = System.Diagnostics.Stopwatch.GetTimestamp();

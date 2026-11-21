@@ -202,7 +202,6 @@ namespace ProceduralTerrain
     {
         public string Id       => "com.ctogle.procedural_terrain";
         public string Revision => "1";
-        static int _surfCheckN;   // [0.0.3 diag] sample rate for the FarLands surface comparison
 
         public void Generate(Voxheim.Core.VoxelBaselineContext context, Voxheim.Core.VoxelBaselineBuilder builder)
         {
@@ -303,29 +302,13 @@ namespace ProceduralTerrain
             PtPerf.GwMs    += gwMs;
             PtPerf.SetMs   += setMs;
 
-            // [0.0.3 diag] FarLands rock-dupe: the surface we feed FarLands (TryGetBakeSurfaceY, bake crossing)
-            // vs the LIVE surface real content conforms to (TrySampleSurfaceY). Sampled at a few columns across
-            // the zone so a HEIGHT-PROPORTIONAL divergence (scale bug) vs a flat offset is visible. Both are only
-            // valid once the zone's surfH is cached (just populated by Carve above), so this runs post-serve.
-            if ((++_surfCheckN) % 20 == 0)
-            {
-                for (int s = 0; s < 3; s++)
-                {
-                    float sx = ox + (s == 0 ? 2 : s == 1 ? width / 2 : width - 3);
-                    float sz = oz + width / 2;
-                    bool okB = Plugin.TryGetBakeSurfaceY(sx, sz, out float bakeY);
-                    bool okL = Plugin.TrySampleSurfaceY(sx, sz, out float liveY);
-                    // Also: what FarLands actually CAPTURES for near terrain (the loaded Heightmap.m_heights,
-                    // via GetWorldHeight) vs plain vanilla (WorldGenerator). The meters-high far rocks mean
-                    // FarLands' surface != PT's — this shows which source it is and the real gap.
-                    var pos = new Vector3(sx, 0f, sz);
-                    var hm = Heightmap.FindHeightmap(pos);
-                    float hmH = float.NaN; if (hm != null) hm.GetWorldHeight(pos, out hmH);
-                    float vanH = WorldGenerator.instance != null ? WorldGenerator.instance.GetHeight(sx, sz) : float.NaN;
-                    if (okB && okL)
-                        Plugin.Log.LogInfo($"[PT-surfcheck] ({sx:F0},{sz:F0}) ptBake={bakeY:F2} ptLive={liveY:F2} hmapCaptured={hmH:F2} vanilla={vanH:F2} | hmap-vs-live={(hmH - liveY):F2}");
-                }
-            }
+            // ── m_heights write (surface-of-truth): push PT's top surface into the vanilla Heightmap so 2D
+            // consumers (FarLands' capture, the minimap, anything reading Heightmap.GetWorldHeight) inherit the
+            // REAL surface instead of vanilla — removing the need for bespoke bridges. worldY = m_heights[i] +
+            // transform.position.y, so we store (surfaceY - baseY). Uses the live surfH (TrySampleSurfaceY) = the
+            // exact surface real content conforms to. The voxel field regenerates from the ABSOLUTE bake, so this
+            // write never feeds back into PT's own generation (base-fill decouple pending for the unbaked path).
+            WritePtSurfaceToHeightmap(context);
 
             // [0.0.3 diag] per-ZONE serve cost (not frame-aggregated → immune to the PtPerf/HitchMonitor frame-order
             // skew). This runs inside Voxheim's main-thread Activate phase, so a fat line here IS the `activate` hitch.
@@ -335,6 +318,33 @@ namespace ProceduralTerrain
             if (serveMs > 6.0)
                 Plugin.Log.LogInfo($"[PT-serve] zone ({ox},{oz}) = {serveMs:F1}ms  carve={carveMs:F1} gw={gwMs:F1} set={setMs:F1}  live={_genThisZone} gc2+{d2}");
         }
+
+        // Write PT's top surface into the zone's vanilla Heightmap.m_heights so 2D consumers inherit it.
+        // worldY(vertex) = m_heights[idx] + hmap.transform.position.y  →  m_heights[idx] = surfaceY - baseY.
+        static void WritePtSurfaceToHeightmap(Voxheim.Core.VoxelBaselineContext context)
+        {
+            try
+            {
+                var hm = Heightmap.FindHeightmap(new Vector3(context.CenterX, context.CenterY, context.CenterZ));
+                if (hm == null) return;
+                int w = hm.m_width, num = w + 1;         // m_heights is private; write via public SetHeight(x,y,h)
+                var tp = hm.transform.position;
+                float half = w * hm.m_scale * 0.5f;
+                int wrote = 0;
+                for (int yy = 0; yy < num; yy++)
+                for (int xx = 0; xx < num; xx++)
+                {
+                    float wx = tp.x - half + xx * hm.m_scale;
+                    float wz = tp.z - half + yy * hm.m_scale;
+                    if (Plugin.TrySampleSurfaceY(wx, wz, out float sh))
+                    { hm.SetHeight(xx, yy, sh - tp.y); wrote++; }   // raw m_heights value; worldY = this + tp.y
+                }
+                if ((++_mhWriteN) % 25 == 1)
+                    Plugin.Log.LogInfo($"[PT-mheights] wrote {wrote}/{num * num} verts into Heightmap at ({tp.x:F0},{tp.z:F0}) (base={tp.y:F1})");
+            }
+            catch (Exception e) { Plugin.Log.LogWarning($"[PT-mheights] write failed: {e.Message}"); }
+        }
+        static int _mhWriteN;
 
         // Build a per-zone height grid with overlapping LOCATION terrain ops baked in, using vanilla
         // HMBuildData (base heights + corner biomes) + Voxheim's ApplyGroundworkInPlace. Returns null
