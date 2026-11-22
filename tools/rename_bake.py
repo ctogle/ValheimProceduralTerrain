@@ -29,6 +29,8 @@ EXCLUDED = {
     "veggroupradius", "vegtiltinherit", "vegrandtilt", "vegmaxtilt",
     "vegconformmaxtilt", "vegsupportradius", "vegetationconform", "seed",
     "prefetch", "prefetchradius", "prefetchthreads", "cavecontent", "lodunderground",
+    "rollingbake", "rollinghud", "rollingthreads", "rollingradius", "rollingmovestep",
+    "rollingflushzones", "rollingflushseconds", "bakeautodownload",
     "hidemist", "vizmode",   # render/debug-only — change no baked voxel
 }
 
@@ -37,27 +39,33 @@ FNV_OFFSET = 2166136261
 FNV_PRIME = 16777619
 
 def compute_cfg_hash(path):
-    # .NET File.ReadAllLines: splits on \r\n / \r / \n, strips the terminator.
+    # Mirror BakeManager.ComputeCfgHash: hash the PARSED config — one (section, key, value) triple per
+    # generation-affecting assignment, value whitespace stripped, sorted (ordinal), then FNV-1a.
+    # Order-independent + format-robust + section-scoped. KEEP IN LOCKSTEP with the C#.
     raw = open(path, "rb").read().decode("utf-8", "replace")
     lines = raw.replace("\r\n", "\n").replace("\r", "\n").split("\n")
-    # split() leaves a trailing "" if the file ends with \n; ReadAllLines does NOT
-    # yield that final empty line, so drop one trailing empty to match.
-    if lines and lines[-1] == "":
-        lines.pop()
-    h = FNV_OFFSET
-    for raw in lines:
-        # Mirror BakeManager.ComputeCfgHash: strip comments (full-line + inline) + trailing whitespace,
-        # skip now-empty lines, then hash only key=value content. KEEP IN LOCKSTEP with the C#.
-        hpos = raw.find("#")
-        line = (raw[:hpos] if hpos >= 0 else raw).rstrip()
+    triples = []
+    section = ""
+    for ln in lines:
+        hpos = ln.find("#")
+        line = (ln[:hpos] if hpos >= 0 else ln).strip()
         if not line:
             continue
+        if line[0] == "[" and line[-1] == "]":
+            section = line[1:-1].strip().lower()
+            continue
         eq = line.find("=")
-        if eq > 0:
-            key = line[:eq].strip().lower()
-            if key in EXCLUDED:
-                continue
-        for ch in line:
+        if eq <= 0:
+            continue
+        key = line[:eq].strip().lower()
+        if key in EXCLUDED:
+            continue
+        val = "".join(c for c in line[eq + 1:] if not c.isspace())
+        triples.append(section + "\x1f" + key + "\x1f" + val)
+    triples.sort()
+    h = FNV_OFFSET
+    for t in triples:
+        for ch in t:
             h = ((h ^ (ord(ch) & 0xFF)) * FNV_PRIME) & MASK
         h = ((h ^ 0x0A) * FNV_PRIME) & MASK
     return h

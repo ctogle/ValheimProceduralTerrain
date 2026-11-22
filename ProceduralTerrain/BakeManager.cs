@@ -43,30 +43,40 @@ namespace ProceduralTerrain
             if (_serverCfgHash.HasValue) return _serverCfgHash.Value;
             string path = ConfigPath;
             if (!File.Exists(path)) return 0u;
-            // Hash only content that affects BAKED bytes. Live-only knobs (coarseXZ/coarseY now drive the live
-            // carve, not the bake; debug/render toggles; bakeRadius selects which zones, not their content) are
-            // excluded so tuning them doesn't invalidate an existing bake.
-            uint hash = 2166136261u;
+            // Hash the PARSED generation config, not the raw text. We collect one (section, key, value) triple per
+            // generation-affecting assignment, normalise each, SORT them, then FNV-1a the canonical result. Effects:
+            //  • ORDER-independent — reordering lines or whole [sections] is terrain-neutral → same hash.
+            //  • FORMAT-robust — `amp=16` ≡ `amp = 16` (whitespace stripped from the value; this cfg has no
+            //    space-significant values — numbers / bools / names / comma-lists).
+            //  • SECTION-scoped — the same key in two different profiles/modes can't collide (would be unsafe:
+            //    different terrain, same hash). Section + key are the dedup identity.
+            //  • List VALUE order is preserved (modes=a,b,c ≠ modes=c,b,a — that order IS terrain-significant).
+            // Live/render/client-only keys + seed are excluded (they don't change baked bytes). Comments are ignored.
+            // (This REPLACES the old text-line hash; tools/rename_bake.py must be updated to mirror it, and existing
+            //  bakes keyed with the old hash are orphaned — rebake.)
+            var triples = new List<string>();
+            string section = "";
             foreach (var rawLine in File.ReadAllLines(path))
             {
-                // Strip comments (full-line + inline) and trailing whitespace before hashing: comments are
-                // documentation, not terrain-determining, so editing them must NOT invalidate a bake. Lines that
-                // become empty (comment-only or blank) are skipped entirely, so adding/removing doc lines is also
-                // hash-neutral. (NOTE: tools/rename_bake.py mirrors this exactly — keep the two in lockstep.)
                 int hashPos = rawLine.IndexOf('#');
-                string line = (hashPos >= 0 ? rawLine.Substring(0, hashPos) : rawLine).TrimEnd();
+                string line = (hashPos >= 0 ? rawLine.Substring(0, hashPos) : rawLine).Trim();
                 if (line.Length == 0) continue;
-                // Exclude live/render-only + location-overlay + seed knobs by EXACT key (not line-prefix, which
-                // collided: seed vs seedFrac/seedR/seeds, coarseXZ vs bakeCoarseXZ). These don't affect baked bytes
-                // (the bake is purely procedural; groundwork/protection/vegetation/seed are applied live or keyed
-                // into the filename separately), so tuning them must not invalidate a bake.
+                if (line[0] == '[' && line[line.Length - 1] == ']') { section = line.Substring(1, line.Length - 2).Trim().ToLowerInvariant(); continue; }
                 int eq = line.IndexOf('=');
-                if (eq > 0)
-                {
-                    string key = line.Substring(0, eq).Trim().ToLowerInvariant();
-                    if (_hashExcludedKeys.Contains(key)) continue;
-                }
-                foreach (char c in line) hash = (hash ^ (byte)c) * 16777619u;
+                if (eq <= 0) continue;   // not an assignment
+                string key = line.Substring(0, eq).Trim().ToLowerInvariant();
+                if (_hashExcludedKeys.Contains(key)) continue;
+                // Value: strip ALL whitespace (format-robust; preserves element order of comma-lists).
+                string raw = line.Substring(eq + 1);
+                var sb = new System.Text.StringBuilder(raw.Length);
+                foreach (char ch in raw) if (!char.IsWhiteSpace(ch)) sb.Append(ch);
+                triples.Add(section + "\x1f" + key + "\x1f" + sb);
+            }
+            triples.Sort(StringComparer.Ordinal);
+            uint hash = 2166136261u;
+            foreach (var t in triples)
+            {
+                foreach (char c in t) hash = (hash ^ (byte)c) * 16777619u;
                 hash = (hash ^ (byte)'\n') * 16777619u;
             }
             return hash;
