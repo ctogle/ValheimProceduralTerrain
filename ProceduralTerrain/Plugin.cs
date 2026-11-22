@@ -838,7 +838,6 @@ namespace ProceduralTerrain
         // ── Bake download (client receiving from server) ──────────────────────────
         internal static bool   _bakeDownloadActive;
         internal static bool   _bakeAutoDownload;   // [Debug] bakeautodownload: auto-pull the server bake on connect. Default OFF — rolling bake fills locally; download is opt-in via pt_download (the RPC transfer is slow/throttled for big bakes).
-        internal static bool   _brickFill = true;    // [Debug] brickfill: fill fully-solid 16³ bricks as homogeneous (no per-voxel write) on serve → cuts the deep-interior blit hitch. On by default.
         internal static int    _bakeChunksExpected;
         internal static int    _bakeChunksReceived;
         internal static System.IO.MemoryStream? _bakeDownloadBuffer;
@@ -1013,7 +1012,6 @@ namespace ProceduralTerrain
             public int[]   colLen   = System.Array.Empty<int>();   // run length (voxels)
             public int[]   colOff   = System.Array.Empty<int>();   // offset into band[]
             public sbyte[] band     = System.Array.Empty<sbyte>(); // packed run densities
-            public int     floorY   = int.MinValue;                // SolidFloorRule Y the band was computed against; the serve MUST SetFloor to this (else holes). int.MinValue = passthrough (use context floor).
         }
         internal static readonly System.Collections.Concurrent.ConcurrentDictionary<string, ZoneField> _sdfCache = new();
 

@@ -349,8 +349,6 @@ namespace ProceduralTerrain
                             RollingBake.FlushSeconds = Mathf.Clamp(rfs, 1f, 120f);
                         if (k == "bakeautodownload")
                             Plugin._bakeAutoDownload = (v == "1" || v == "true");
-                        if (k == "brickfill")
-                            Plugin._brickFill = !(v == "0" || v == "false");
                         if (k == "protectlocations")
                             _protectLocations = !(v == "0" || v == "false");
                         if (k == "locdomeheight" && float.TryParse(v, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float ldh))

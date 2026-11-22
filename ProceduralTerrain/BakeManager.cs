@@ -34,7 +34,7 @@ namespace ProceduralTerrain
             "disablevegetation", "applygroundwork", "protectlocations", "flatplanelocations", "locdomeheight", "locbandfade", "vegdensity", "vegforestwiden", "veginforest", "vegforestmax", "veggroupsize", "veggroupradius", "vegtiltinherit", "vegrandtilt", "vegmaxtilt", "vegconformmaxtilt", "vegsupportradius",
             "vegetationconform", "vegmaxtilt", "seed",
             "prefetch", "prefetchradius", "prefetchthreads", "cavecontent", "lodunderground",
-            "rollingbake", "rollinghud", "rollingthreads", "rollingradius", "rollingmovestep", "rollingflushzones", "rollingflushseconds", "bakeautodownload", "brickfill",
+            "rollingbake", "rollinghud", "rollingthreads", "rollingradius", "rollingmovestep", "rollingflushzones", "rollingflushseconds", "bakeautodownload",
             "hidemist", "vizmode",   // render/debug-only — suppress mist / select viz mode; change no baked voxel
         };
 
@@ -452,7 +452,7 @@ namespace ProceduralTerrain
                     else { cStart[oc] = first; int len = last - first + 1; cLen[oc] = len; Array.Copy(colV1, first, scratch1, tot, len); tot += len; }
                 }
                 var band1 = new sbyte[tot]; Array.Copy(scratch1, 0, band1, 0, tot);
-                PutSdf($"{ox},{oz}", new ZoneField { extLo = extLo, bh = bh, width = owned, colStart = cStart, colLen = cLen, colOff = cOff, band = band1, floorY = fY });
+                PutSdf($"{ox},{oz}", new ZoneField { extLo = extLo, bh = bh, width = owned, colStart = cStart, colLen = cLen, colOff = cOff, band = band1 });
                 PutSurfH((ox, oz), (bw, extLo, s, surfH1));
                 return true;
             }
