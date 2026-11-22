@@ -26,16 +26,21 @@ namespace ProceduralTerrain
         static int   _etaLastN;
         static float _etaLastSec, _etaEmaSecPerZone;
 
-        // Keys excluded from the bake hash: live/render-only, location-overlay (applied live, never baked), and
-        // the seed (captured in the bake filename's seed field). Exact-match so param names can't collide.
+        // Keys in biomes.cfg that must NOT affect the bake CONTENT hash. The big client/render/debug set is GONE —
+        // those live in client.cfg now (never in this file, so nothing to exclude; see pt-cfg-client-server-split).
+        // What remains is the coherent residual:
+        //   • seed — determines terrain but is keyed into the bake FILENAME separately, not the content hash.
+        //   • live-overlay — applied at load (groundwork/location protection), NOT baked into the .bin bytes.
+        //   • placement keys — actually defined in placements.cfg, not biomes.cfg; listed as a dead-but-safe guard.
+        // (Fully eliminating this list means sectioning seed→[World] + overlay→[Location] and hashing generation
+        //  sections only — the remaining follow-up.)
         static readonly HashSet<string> _hashExcludedKeys = new(StringComparer.OrdinalIgnoreCase)
         {
-            "coarsexz", "coarsey", "bakeradius", "debugviz", "debugvizocclude", "vegviz", "vegvizradius", "hidelodmeshes",
-            "disablevegetation", "applygroundwork", "protectlocations", "flatplanelocations", "locdomeheight", "locbandfade", "vegdensity", "vegforestwiden", "veginforest", "vegforestmax", "veggroupsize", "veggroupradius", "vegtiltinherit", "vegrandtilt", "vegmaxtilt", "vegconformmaxtilt", "vegsupportradius",
-            "vegetationconform", "vegmaxtilt", "seed",
-            "prefetch", "prefetchradius", "prefetchthreads", "cavecontent", "lodunderground",
-            "rollingbake", "rollinghud", "rollingthreads", "rollingradius", "rollingmovestep", "rollingflushzones", "rollingflushseconds", "bakeautodownload",
-            "hidemist", "vizmode",   // render/debug-only — suppress mist / select viz mode; change no baked voxel
+            "seed",
+            "applygroundwork", "protectlocations", "flatplanelocations", "locdomeheight", "locbandfade",
+            "disablevegetation", "vegdensity", "vegforestwiden", "veginforest", "vegforestmax", "veggroupsize",
+            "veggroupradius", "vegtiltinherit", "vegrandtilt", "vegmaxtilt", "vegconformmaxtilt", "vegsupportradius",
+            "vegetationconform", "cavecontent",
         };
 
         internal static uint ComputeCfgHash()

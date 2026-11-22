@@ -21,17 +21,14 @@ Usage:
 import sys, os, glob, argparse
 
 # Mirror of BakeManager._hashExcludedKeys (BakeManager.cs:31-37). KEEP IN SYNC.
+# Keep in lockstep with BakeManager._hashExcludedKeys. Client/render/debug keys now live in client.cfg (not
+# biomes.cfg) so they're not here. Residual = seed (filename-keyed) + live-overlay + placement-file (dead-safe).
 EXCLUDED = {
-    "coarsexz", "coarsey", "bakeradius", "debugviz", "debugvizocclude", "vegviz",
-    "vegvizradius", "hidelodmeshes", "disablevegetation", "applygroundwork",
-    "protectlocations", "flatplanelocations", "locdomeheight", "locbandfade",
-    "vegdensity", "vegforestwiden", "veginforest", "vegforestmax", "veggroupsize",
-    "veggroupradius", "vegtiltinherit", "vegrandtilt", "vegmaxtilt",
-    "vegconformmaxtilt", "vegsupportradius", "vegetationconform", "seed",
-    "prefetch", "prefetchradius", "prefetchthreads", "cavecontent", "lodunderground",
-    "rollingbake", "rollinghud", "rollingthreads", "rollingradius", "rollingmovestep",
-    "rollingflushzones", "rollingflushseconds", "bakeautodownload",
-    "hidemist", "vizmode",   # render/debug-only — change no baked voxel
+    "seed",
+    "applygroundwork", "protectlocations", "flatplanelocations", "locdomeheight", "locbandfade",
+    "disablevegetation", "vegdensity", "vegforestwiden", "veginforest", "vegforestmax", "veggroupsize",
+    "veggroupradius", "vegtiltinherit", "vegrandtilt", "vegmaxtilt", "vegconformmaxtilt", "vegsupportradius",
+    "vegetationconform", "cavecontent",
 }
 
 MASK = 0xFFFFFFFF

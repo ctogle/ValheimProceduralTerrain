@@ -235,7 +235,7 @@ namespace ProceduralTerrain
         static void EnsureClientConfig()
         {
             string cpath = ClientConfigPath;
-            if (File.Exists(cpath)) return;
+            if (File.Exists(cpath)) { StripClientKeysFromBiomes(); return; }   // already migrated — just ensure biomes.cfg is clean
             var secMap = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
             var order  = new List<string>();
             try
@@ -263,16 +263,51 @@ namespace ProceduralTerrain
             sb.AppendLine("# NEVER synced from a server and NEVER part of the cfg hash — your settings always win.");
             sb.AppendLine("# Terrain-shaping params live in biomes.cfg, which the server imposes when you connect.");
             sb.AppendLine();
-            if (order.Count == 0) sb.AppendLine("[Debug]");
             foreach (var sec in order) { sb.AppendLine($"[{sec}]"); foreach (var ln in secMap[sec]) sb.AppendLine(ln); }
             int migrated = 0; foreach (var l in secMap.Values) migrated += l.Count;
+            // Fresh install (nothing to migrate from a clean biomes.cfg) → write the shipped default client.cfg.
+            string content = migrated > 0 ? sb.ToString() : ReadEmbeddedConfig("ProceduralTerrain.client.cfg");
+            if (string.IsNullOrEmpty(content)) content = sb.ToString() + "[Debug]\n";
             try
             {
                 Directory.CreateDirectory(PTConfigDir);
-                File.WriteAllText(cpath, sb.ToString());
-                Log.LogInfo($"[ProceduralTerrain] Created client.cfg ({migrated} client keys migrated from biomes.cfg).");
+                File.WriteAllText(cpath, content);
+                Log.LogInfo($"[ProceduralTerrain] Created client.cfg ({(migrated > 0 ? $"{migrated} keys migrated from biomes.cfg" : "shipped defaults")}).");
             }
             catch (Exception e) { Log.LogWarning($"[ProceduralTerrain] client.cfg create failed: {e.Message}"); }
+            StripClientKeysFromBiomes();   // now move them fully OUT of biomes.cfg (terrain-only; client.cfg owns them)
+        }
+
+        // Remove client keys from the LOCAL biomes.cfg so it's purely terrain-generation. Idempotent (no-op once
+        // clean). Line-surgical: drops only key=value lines whose key is a client key, keeping everything else
+        // verbatim. Hash-NEUTRAL — client keys were already excluded, so removing them doesn't change the cfgHash.
+        static void StripClientKeysFromBiomes()
+        {
+            try
+            {
+                string bpath = ConfigPath;
+                if (!File.Exists(bpath)) return;
+                var lines = File.ReadAllLines(bpath);
+                var kept = new List<string>(lines.Length);
+                bool changed = false;
+                foreach (var raw in lines)
+                {
+                    string noComment = raw; int h = noComment.IndexOf('#'); if (h >= 0) noComment = noComment.Substring(0, h);
+                    string t = noComment.Trim();
+                    if (t.Length > 0 && t[0] != '[')
+                    {
+                        int eq = t.IndexOf('=');
+                        if (eq > 0 && _clientKeys.Contains(t.Substring(0, eq).Trim().ToLowerInvariant())) { changed = true; continue; }
+                    }
+                    kept.Add(raw);
+                }
+                if (changed)
+                {
+                    File.WriteAllLines(bpath, kept);
+                    Log.LogInfo("[ProceduralTerrain] Stripped client keys from biomes.cfg (now terrain-only; set them in client.cfg).");
+                }
+            }
+            catch (Exception e) { Log.LogWarning($"[ProceduralTerrain] biomes.cfg strip failed: {e.Message}"); }
         }
 
         internal static void LoadBiomeConfig()

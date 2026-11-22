@@ -19,6 +19,7 @@
   <!-- Default configs embedded in the DLL; the plugin writes them to the config dir on first launch. -->
   <ItemGroup>
     <EmbeddedResource Include="..\configs\biomes.cfg" LogicalName="ProceduralTerrain.biomes.cfg" />
+    <EmbeddedResource Include="..\configs\client.cfg" LogicalName="ProceduralTerrain.client.cfg" />
     <EmbeddedResource Include="..\configs\placements.cfg" LogicalName="ProceduralTerrain.placements.cfg" />
   </ItemGroup>
 
