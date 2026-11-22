@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 """
-rename_bake.py — recompute a PT bake's cfg-hash from biomes.cfg and rename the
-bake file(s) to the new hash, WITHOUT rebaking.
+rename_bake.py — DEPRECATED (2026-11-22).
 
-Use this ONLY when a biomes.cfg edit changes the hash but provably does NOT change
-the baked terrain (e.g. renaming a profile, repointing an assignment to an
-IDENTICAL-body profile, or editing a comment). The hash is a conservative cache
-key over the raw config text; it busts on any textual change. When you KNOW the
-terrain is unchanged, the baked bytes are still valid — only the filename key
-needs to catch up.
+ComputeCfgHash no longer hashes the cfg TEXT — it hashes the RESOLVED in-memory
+generation structure (pipeline + per-biome resolved params + globals), which can
+only be computed by the C# runtime, NOT replicated offline here. So this script's
+compute_cfg_hash is NO LONGER ACCURATE and will print a WRONG hash.
 
-Replicates BakeManager.ComputeCfgHash exactly (FNV-1a over every line of
-biomes.cfg, skipping _hashExcludedKeys by exact lowercased key before '=').
+It's also largely unnecessary now: the new hash is default-normalised and
+format/order-robust, so terrain-NEUTRAL edits (reformatting, reordering, writing a
+default value, renaming a profile) don't change it — there's nothing to re-key.
+To read a world's current hash, use the in-game `pt_bakeinfo` command.
+
+The header-patch + rename plumbing below still works IF you already know the
+target hash, but DO NOT trust compute_cfg_hash.
 
 Usage:
   rename_bake.py <biomes.cfg>                 # dry-run: print new hash + planned renames

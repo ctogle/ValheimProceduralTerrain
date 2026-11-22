@@ -26,64 +26,68 @@ namespace ProceduralTerrain
         static int   _etaLastN;
         static float _etaLastSec, _etaEmaSecPerZone;
 
-        // Keys in biomes.cfg that must NOT affect the bake CONTENT hash. The big client/render/debug set is GONE —
-        // those live in client.cfg now (never in this file, so nothing to exclude; see pt-cfg-client-server-split).
-        // What remains is the coherent residual:
-        //   • seed — determines terrain but is keyed into the bake FILENAME separately, not the content hash.
-        //   • live-overlay — applied at load (groundwork/location protection), NOT baked into the .bin bytes.
-        //   • placement keys — actually defined in placements.cfg, not biomes.cfg; listed as a dead-but-safe guard.
-        // (Fully eliminating this list means sectioning seed→[World] + overlay→[Location] and hashing generation
-        //  sections only — the remaining follow-up.)
-        static readonly HashSet<string> _hashExcludedKeys = new(StringComparer.OrdinalIgnoreCase)
-        {
-            "seed",
-            "applygroundwork", "protectlocations", "flatplanelocations", "locdomeheight", "locbandfade",
-            "disablevegetation", "vegdensity", "vegforestwiden", "veginforest", "vegforestmax", "veggroupsize",
-            "veggroupradius", "vegtiltinherit", "vegrandtilt", "vegmaxtilt", "vegconformmaxtilt", "vegsupportradius",
-            "vegetationconform", "cavecontent",
-        };
-
+        // Bake content hash = a digest of the RESOLVED generation structure the carve actually consumes — the
+        // pipeline, each biome's resolved per-mode param arrays + profile scalars, and the generation globals. NOT
+        // the cfg text. Why this is the right model (no blocklist, no rename tool):
+        //   • Vegetation (_vegByBiome), location overlay (_applyGroundwork/_protectLocations/…), seed (keyed into the
+        //     bake FILENAME), and client knobs (client.cfg) live in SEPARATE structures → excluded BY CONSTRUCTION.
+        //   • Params are RESOLVED (defaults + profile inheritance + overrides already applied) → writing foo=<default>
+        //     hashes identically to omitting it, and reformatting/reordering can't matter.
+        //   • It's an INCLUSION of exactly the carve's inputs, not a negative exclusion list — so a "moot" value can
+        //     never invalidate the cache. Risk: a NEW generation global must be added to the globals block below, or
+        //     two different terrains could share a hash. Keep that block complete.
+        // On a client, overridden by the server's hash (_serverCfgHash). Requires LoadBiomeConfig to have run.
         internal static uint ComputeCfgHash()
         {
             if (_serverCfgHash.HasValue) return _serverCfgHash.Value;
-            string path = ConfigPath;
-            if (!File.Exists(path)) return 0u;
-            // Hash the PARSED generation config, not the raw text. We collect one (section, key, value) triple per
-            // generation-affecting assignment, normalise each, SORT them, then FNV-1a the canonical result. Effects:
-            //  • ORDER-independent — reordering lines or whole [sections] is terrain-neutral → same hash.
-            //  • FORMAT-robust — `amp=16` ≡ `amp = 16` (whitespace stripped from the value; this cfg has no
-            //    space-significant values — numbers / bools / names / comma-lists).
-            //  • SECTION-scoped — the same key in two different profiles/modes can't collide (would be unsafe:
-            //    different terrain, same hash). Section + key are the dedup identity.
-            //  • List VALUE order is preserved (modes=a,b,c ≠ modes=c,b,a — that order IS terrain-significant).
-            // Live/render/client-only keys + seed are excluded (they don't change baked bytes). Comments are ignored.
-            // (This REPLACES the old text-line hash; tools/rename_bake.py must be updated to mirror it, and existing
-            //  bakes keyed with the old hash are orphaned — rebake.)
-            var triples = new List<string>();
-            string section = "";
-            foreach (var rawLine in File.ReadAllLines(path))
+            var ci = System.Globalization.CultureInfo.InvariantCulture;
+            var sb = new System.Text.StringBuilder(4096);
+
+            // Pipeline (ordered; composition order + per-mode blend ARE terrain-significant).
+            sb.Append("P:");
+            if (_pipeline != null) foreach (var m in _pipeline)
+                sb.Append(m.Name).Append('/').Append(m.Blend).Append('/').Append(m.BlendK.ToString("R", ci)).Append(',');
+            sb.Append('\n');
+
+            // Per biome (sorted by enum value): resolved mode-param arrays + CaveProfile scalars.
+            var bp = _biomeParams;
+            if (bp != null)
             {
-                int hashPos = rawLine.IndexOf('#');
-                string line = (hashPos >= 0 ? rawLine.Substring(0, hashPos) : rawLine).Trim();
-                if (line.Length == 0) continue;
-                if (line[0] == '[' && line[line.Length - 1] == ']') { section = line.Substring(1, line.Length - 2).Trim().ToLowerInvariant(); continue; }
-                int eq = line.IndexOf('=');
-                if (eq <= 0) continue;   // not an assignment
-                string key = line.Substring(0, eq).Trim().ToLowerInvariant();
-                if (_hashExcludedKeys.Contains(key)) continue;
-                // Value: strip ALL whitespace (format-robust; preserves element order of comma-lists).
-                string raw = line.Substring(eq + 1);
-                var sb = new System.Text.StringBuilder(raw.Length);
-                foreach (char ch in raw) if (!char.IsWhiteSpace(ch)) sb.Append(ch);
-                triples.Add(section + "\x1f" + key + "\x1f" + sb);
+                var biomes = new List<Heightmap.Biome>(bp.Keys);
+                biomes.Sort((a, b) => ((int)a).CompareTo((int)b));
+                foreach (var biome in biomes)
+                {
+                    sb.Append((int)biome).Append(':');
+                    var mp = bp[biome];
+                    if (mp != null) for (int mi = 0; mi < mp.Length; mi++)
+                    {
+                        sb.Append(mi).Append('=');
+                        if (mp[mi] == null) sb.Append('~');
+                        else foreach (var p in mp[mi]) sb.Append(p.ToString("R", ci)).Append(',');
+                        sb.Append(';');
+                    }
+                    if (_biomeProfiles != null && _biomeProfiles.TryGetValue(biome, out var cp))
+                        sb.Append('|').Append(cp.blur_passes.ToString("R", ci)).Append(',').Append(cp.perona_k.ToString("R", ci)).Append(',')
+                          .Append(cp.perona_lambda.ToString("R", ci)).Append(',').Append(cp.floorDepth.ToString("R", ci)).Append(',')
+                          .Append(cp.floorFade.ToString("R", ci)).Append(',').Append(cp.floorLevel.ToString("R", ci)).Append(',')
+                          .Append(cp.extendUp.ToString("R", ci)).Append(',').Append(cp.composeSmoothY.ToString("R", ci));
+                    sb.Append('\n');
+                }
             }
-            triples.Sort(StringComparer.Ordinal);
+
+            // Generation globals — the carve's non-per-biome inputs. ADD NEW GENERATION GLOBALS HERE.
+            sb.Append("G:")
+              .Append(_corridorGraph ? 1 : 0).Append(',').Append(_corridorSteiner.ToString("R", ci)).Append(',').Append(_corridorClearance.ToString("R", ci)).Append(',')
+              .Append(_islandRemoval ? 1 : 0).Append(',').Append(_pocketRemoval ? 1 : 0).Append(',').Append(_overlap).Append(',').Append(_fieldDepthLo.ToString("R", ci)).Append(',')
+              .Append(_biomeBlendRadius.ToString("R", ci)).Append(',').Append(_biomeBlendSmooth ? 1 : 0).Append(',').Append(_transitionBlurPasses).Append(',').Append(_fixpointMaxZones).Append(',')
+              .Append(_coastFade.ToString("R", ci)).Append(',').Append(_coastStrength.ToString("R", ci)).Append(',')
+              .Append(_riverProtect.ToString("R", ci)).Append(',').Append(_riverCore.ToString("R", ci)).Append(',').Append(_riverEdge.ToString("R", ci)).Append(',').Append(_riverDomeHeight.ToString("R", ci)).Append(',').Append(_riverBandFade.ToString("R", ci)).Append(',')
+              .Append(_blendMode).Append(',').Append(_composeMode).Append(',').Append(_eikonal ? 1 : 0).Append(',')
+              .Append(_bakeCoarseXZ).Append(',').Append(_bakeCoarseY).Append(',').Append(_bakeStep).Append(',').Append(_noiseCount).Append(',')
+              .Append(_surfaceFullRes ? 1 : 0).Append(',').Append(_vanillaHeight ? 1 : 0);
+
             uint hash = 2166136261u;
-            foreach (var t in triples)
-            {
-                foreach (char c in t) hash = (hash ^ (byte)c) * 16777619u;
-                hash = (hash ^ (byte)'\n') * 16777619u;
-            }
+            for (int i = 0; i < sb.Length; i++) hash = (hash ^ (byte)sb[i]) * 16777619u;
             return hash;
         }
 

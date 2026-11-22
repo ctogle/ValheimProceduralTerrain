@@ -49,6 +49,7 @@ namespace ProceduralTerrain
             "rollingflushseconds", "bakeautodownload", "prefetch", "prefetchradius", "prefetchthreads",
             "coarsexz", "coarsey", "debugviz", "debugvizocclude", "vegviz", "vegvizradius", "vizmode",
             "hidelodmeshes", "hidemist", "lodunderground", "bakeradius", "compressbake", "bakevanilla", "bakeformat",
+            "seed",   // local world-creation override — moot on a server (world already exists), never inherited → client-local
         };
 
         // Read an embedded default config (configs/*.cfg, embedded at build). Empty string if absent.
