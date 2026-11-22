@@ -299,10 +299,17 @@ namespace ProceduralTerrain
                     int len = c.colLen[col];
                     if (len == 0) { sBot[idx] = int.MaxValue; sTop[idx] = int.MinValue; continue; }
                     int start = c.colStart[col], off = c.colOff[col];
-                    if (c.band[off] != -127) { sBot[idx] = int.MaxValue; sTop[idx] = int.MinValue; continue; }
-                    int lead = 0; while (lead < len && c.band[off + lead] == -127) lead++;   // strict -127 run from the bottom (stops at surface transition / cave)
-                    sBot[idx] = c.extLo + start;
-                    sTop[idx] = c.extLo + start + lead - 1;
+                    // LONGEST contiguous -127 run (the solid body [floor..surface]) — NOT just the leading one: a
+                    // cave reaching the field bottom makes the band start with air, so an anchored scan misses it.
+                    int bestLo = -1, bestLen = 0, curLo = -1, curLen = 0;
+                    for (int k = 0; k < len; k++)
+                    {
+                        if (c.band[off + k] == -127) { if (curLen == 0) curLo = k; curLen++; if (curLen > bestLen) { bestLen = curLen; bestLo = curLo; } }
+                        else curLen = 0;
+                    }
+                    if (bestLen == 0) { sBot[idx] = int.MaxValue; sTop[idx] = int.MinValue; continue; }
+                    sBot[idx] = c.extLo + start + bestLo;
+                    sTop[idx] = c.extLo + start + bestLo + bestLen - 1;
                 }
                 int byLo = c.extLo >> 4, byHi = (c.extLo + c.bh - 1) >> 4;
                 int bx0 = ox >> 4, bx1 = (ox + width - 1) >> 4, bz0 = oz >> 4, bz1 = (oz + width - 1) >> 4;
@@ -463,7 +470,12 @@ namespace ProceduralTerrain
             // anyway. That pre-compute measured up to 180ms/zone of PURE WASTE on the client (the dominant
             // location-zone serve hitch). Only the authority (host / listen-server) can get a non-empty result,
             // so skip the extractor entirely when we're not it — behaviour-neutral (the live path is unchanged).
-            bool isAuthority = ZNet.instance == null || ZNet.instance.IsServer();
+            // DEDICATED-only: the AuthorityHeadlessExtractor needs the headless ZDO/registry state and returns
+            // EMPTY on a listen/local game (measured: extractorOk=0 over hundreds of calls) — where it then costs
+            // 7-15ms of pure waste before we fall through to the live gather below (which works there). Only a
+            // dedicated server actually benefits (its live GetAllInstances gather is unreliable). Behaviour-neutral
+            // off-dedicated: the live path was already doing all the real work.
+            bool isAuthority = ZNet.instance != null && ZNet.instance.IsDedicated();
             long _tExt = System.Diagnostics.Stopwatch.GetTimestamp();
             if (isAuthority
                 && TryVoxheimGroundwork(centerX, centerZ, width, scale, out var effDet, out var baseDet, out int changedDet)
