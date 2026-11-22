@@ -36,6 +36,20 @@ namespace ProceduralTerrain
             Path.Combine(BepInEx.Paths.ConfigPath, "ProceduralTerrain");
         internal static string ConfigPath =>
             Path.Combine(PTConfigDir, "biomes.cfg");
+        // Client/runtime config: knobs that DON'T affect the generated terrain the server defines (rolling bake,
+        // prefetch, live render quality, debug viz, local bake-file encoding). ALWAYS local — never synced from the
+        // server, never in the cfg hash — so a client's prefs always win over whatever a server's biomes.cfg carries.
+        internal static string ClientConfigPath =>
+            Path.Combine(PTConfigDir, "client.cfg");
+        // Keys that belong in client.cfg (used by the first-run migration out of biomes.cfg). If it affects PT
+        // GENERATION it is NOT here — it stays in biomes.cfg (the rule).
+        internal static readonly HashSet<string> _clientKeys = new(StringComparer.OrdinalIgnoreCase)
+        {
+            "rollingbake", "rollinghud", "rollingthreads", "rollingradius", "rollingmovestep", "rollingflushzones",
+            "rollingflushseconds", "bakeautodownload", "prefetch", "prefetchradius", "prefetchthreads",
+            "coarsexz", "coarsey", "debugviz", "debugvizocclude", "vegviz", "vegvizradius", "vizmode",
+            "hidelodmeshes", "hidemist", "lodunderground", "bakeradius", "compressbake", "bakevanilla", "bakeformat",
+        };
 
         // Read an embedded default config (configs/*.cfg, embedded at build). Empty string if absent.
         internal static string ReadEmbeddedConfig(string logicalName)
@@ -196,6 +210,71 @@ namespace ProceduralTerrain
             return tp;
         }
 
+        // Parse cfg lines into (section, key-values) and APPEND to `sections`. Shared by biomes.cfg + client.cfg.
+        static void ParseSectionsInto(string[] lines, List<(string name, List<(string key, string val)> kvs)> sections)
+        {
+            List<(string, string)>? cur = null;
+            foreach (string raw in lines)
+            {
+                string line = raw.Trim();
+                if (line.Length == 0 || line[0] == '#') continue;
+                if (line[0] == '[') { cur = new List<(string, string)>(); sections.Add((line.Trim('[', ']').Trim(), cur)); continue; }
+                if (cur == null) continue;
+                int eq = line.IndexOf('=');
+                if (eq < 0) continue;
+                var rawVal = line.Substring(eq + 1);
+                var hashIdx = rawVal.IndexOf('#');
+                if (hashIdx >= 0) rawVal = rawVal.Substring(0, hashIdx);
+                cur.Add((line.Substring(0, eq).Trim().ToLowerInvariant(), rawVal.Trim()));
+            }
+        }
+
+        // First run: create client.cfg, MIGRATING any client keys found in the LOCAL biomes.cfg into it (grouped by
+        // their original section), so existing users keep their rolling/debug/quality prefs. Non-destructive — we
+        // leave them in biomes.cfg too (client.cfg is parsed last and wins; client keys don't affect the hash).
+        static void EnsureClientConfig()
+        {
+            string cpath = ClientConfigPath;
+            if (File.Exists(cpath)) return;
+            var secMap = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+            var order  = new List<string>();
+            try
+            {
+                string bpath = ConfigPath;   // the LOCAL biomes.cfg (never the server's)
+                string curSec = "Debug";
+                if (File.Exists(bpath))
+                    foreach (var raw in File.ReadAllLines(bpath))
+                    {
+                        string line = raw; int h = line.IndexOf('#'); if (h >= 0) line = line.Substring(0, h);
+                        line = line.Trim();
+                        if (line.Length == 0) continue;
+                        if (line[0] == '[') { curSec = line.Trim('[', ']').Trim(); continue; }
+                        int eq = line.IndexOf('='); if (eq <= 0) continue;
+                        string key = line.Substring(0, eq).Trim().ToLowerInvariant();
+                        if (!_clientKeys.Contains(key)) continue;
+                        if (!secMap.TryGetValue(curSec, out var l)) { l = new List<string>(); secMap[curSec] = l; order.Add(curSec); }
+                        l.Add($"{key} = {line.Substring(eq + 1).Trim()}");
+                    }
+            }
+            catch { }
+            var sb = new System.Text.StringBuilder();
+            sb.AppendLine("# ProceduralTerrain CLIENT config — local runtime knobs that do NOT affect generated terrain");
+            sb.AppendLine("# (rolling bake, prefetch, live render quality, debug viz, local bake-file encoding).");
+            sb.AppendLine("# NEVER synced from a server and NEVER part of the cfg hash — your settings always win.");
+            sb.AppendLine("# Terrain-shaping params live in biomes.cfg, which the server imposes when you connect.");
+            sb.AppendLine();
+            if (order.Count == 0) sb.AppendLine("[Debug]");
+            foreach (var sec in order) { sb.AppendLine($"[{sec}]"); foreach (var ln in secMap[sec]) sb.AppendLine(ln); }
+            int migrated = 0; foreach (var l in secMap.Values) migrated += l.Count;
+            try
+            {
+                Directory.CreateDirectory(PTConfigDir);
+                File.WriteAllText(cpath, sb.ToString());
+                Log.LogInfo($"[ProceduralTerrain] Created client.cfg ({migrated} client keys migrated from biomes.cfg).");
+            }
+            catch (Exception e) { Log.LogWarning($"[ProceduralTerrain] client.cfg create failed: {e.Message}"); }
+        }
+
         internal static void LoadBiomeConfig()
         {
             string[] lines;
@@ -215,27 +294,13 @@ namespace ProceduralTerrain
                 lines = File.ReadAllLines(path);
             }
 
-            // Collect all sections into raw key-value lists.
+            // Collect all sections. biomes.cfg (server-imposed when connected to a server) first, then APPEND
+            // client.cfg (ALWAYS local) — parsed LAST so the client's runtime knobs (rolling/prefetch/quality/debug)
+            // win over anything a server's biomes.cfg might carry. client.cfg is never in the cfg hash.
             var sections = new List<(string name, List<(string key, string val)> kvs)>();
-            List<(string, string)>? cur = null;
-            foreach (string raw in lines)
-            {
-                string line = raw.Trim();
-                if (line.Length == 0 || line[0] == '#') continue;
-                if (line[0] == '[')
-                {
-                    cur = new List<(string, string)>();
-                    sections.Add((line.Trim('[', ']').Trim(), cur));
-                    continue;
-                }
-                if (cur == null) continue;
-                int eq = line.IndexOf('=');
-                if (eq < 0) continue;
-                var rawVal = line.Substring(eq + 1);
-                var hashIdx = rawVal.IndexOf('#');
-                if (hashIdx >= 0) rawVal = rawVal.Substring(0, hashIdx);
-                cur.Add((line.Substring(0, eq).Trim().ToLowerInvariant(), rawVal.Trim()));
-            }
+            ParseSectionsInto(lines, sections);
+            EnsureClientConfig();   // first run: create client.cfg, migrating client keys out of biomes.cfg
+            if (File.Exists(ClientConfigPath)) ParseSectionsInto(File.ReadAllLines(ClientConfigPath), sections);
 
             // Pass 1: Mode definitions [Mode:name]
             var modeDefs = new Dictionary<string, ModeDefinition>(StringComparer.OrdinalIgnoreCase);

@@ -757,6 +757,7 @@ namespace ProceduralTerrain
             = BuildDefaultProfiles();
         static volatile bool _hotReloadPending;
         static DateTime _configLastWrite = DateTime.MinValue;
+        static DateTime _clientConfigLastWrite = DateTime.MinValue;
 
         // ── Pipeline ──────────────────────────────────────────────────────────────
         static volatile ModeDefinition[] _pipeline = Array.Empty<ModeDefinition>();
@@ -2335,9 +2336,10 @@ namespace ProceduralTerrain
 
             WatchPlacementConfigReload();   // independent file; no recarve needed
 
-            var t = File.GetLastWriteTimeUtc(ConfigPath);
-            if (t == _configLastWrite) return;
-            _configLastWrite = t;
+            var t  = File.GetLastWriteTimeUtc(ConfigPath);
+            var ct = File.Exists(ClientConfigPath) ? File.GetLastWriteTimeUtc(ClientConfigPath) : DateTime.MinValue;
+            if (t == _configLastWrite && ct == _clientConfigLastWrite) return;   // watch client.cfg too
+            _configLastWrite = t; _clientConfigLastWrite = ct;
             LoadBiomeConfig();
             RecarveAll();
         }
