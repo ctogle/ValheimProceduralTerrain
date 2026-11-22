@@ -130,11 +130,19 @@ namespace ProceduralTerrain
                 _hotReloadPending = true;
                 Log.LogInfo($"[ProceduralTerrain] Received {_locationPositions.Count} location instances from server — rebuilt {rebuilt} into m_locationInstances ({noType} unknown type) — scheduling recarve.");
             }
-            // Server connection confirmed — query for bake file now that peer is established.
-            var query = new ZPackage();
-            query.Write(ComputeCfgHash());
-            ZRoutedRpc.instance.InvokeRoutedRPC(sender, "PTBakeQuery", query);
-            Log.LogInfo($"[ProceduralTerrain] Sent PTBakeQuery to server (cfgHash={ComputeCfgHash():X8}).");
+            // Server connection confirmed. Auto-download the bake only if opted in — otherwise rolling bake fills
+            // locally and the user pulls on demand with pt_download (the RPC transfer is slow for large bakes).
+            if (_bakeAutoDownload) SendBakeQuery("auto on connect");
+        }
+
+        // Client → server: ask what bake the server has (→ RPC_BakeInfo → optional download → merge). Server/host
+        // already has the file, so this is a no-op there. Called on connect (if auto) and from pt_download.
+        internal static void SendBakeQuery(string reason)
+        {
+            if (ZNet.instance == null || ZNet.instance.IsServer()) return;
+            var q = new ZPackage(); q.Write(ComputeCfgHash());
+            ZRoutedRpc.instance.InvokeRoutedRPC(ZRoutedRpc.Everybody, "PTBakeQuery", q);   // only the server has the handler
+            Log.LogInfo($"[ProceduralTerrain] Sent PTBakeQuery to server ({reason}, cfgHash={ComputeCfgHash():X8}).");
         }
 
         // ── Bake progress RPC (server→all clients) ───────────────────────────────
@@ -157,12 +165,8 @@ namespace ProceduralTerrain
                 // Bake just finished server-side. A client that joined mid-bake was told "not available" and is on
                 // live — re-query now so it downloads the completed file. Guard to clients (the server/host already
                 // has the file; self-querying would make it stream its own bake to itself).
-                if (ZNet.instance != null && !ZNet.instance.IsServer())
-                {
-                    var q = new ZPackage(); q.Write(ComputeCfgHash());
-                    ZRoutedRpc.instance.InvokeRoutedRPC(sender, "PTBakeQuery", q);
-                    Log.LogInfo("[ProceduralTerrain] Bake complete — re-querying server to download it.");
-                }
+                if (_bakeAutoDownload && ZNet.instance != null && !ZNet.instance.IsServer())
+                    SendBakeQuery("server bake complete");
             }
         }
 
@@ -262,6 +266,9 @@ namespace ProceduralTerrain
         internal static void RPC_BakeExecute(long sender, ZPackage pkg)
         {
             float radius = pkg.ReadSingle();
+            // Centre coords are optional (older clients send radius only); read them only if present.
+            float centerX = 0f, centerZ = 0f;
+            if (pkg.Size() - pkg.GetPos() >= 8) { centerX = pkg.ReadSingle(); centerZ = pkg.ReadSingle(); }
             // Admin check: allow server itself (sender==0) or whitelisted Steam IDs.
             bool isAdmin = sender == 0L;
             if (!isAdmin)
@@ -275,8 +282,28 @@ namespace ProceduralTerrain
                 Log.LogWarning($"[ProceduralTerrain] Bake request from non-admin peer {sender} rejected.");
                 return;
             }
-            Log.LogInfo($"[ProceduralTerrain] Bake request accepted from peer {sender} — running server-side (background).");
-            System.Threading.Tasks.Task.Run(() => WriteBakeFile(radius));
+            Log.LogInfo($"[ProceduralTerrain] Bake request accepted from peer {sender} — running server-side (background). centre={(centerX != 0f || centerZ != 0f ? $"{centerX:F0},{centerZ:F0}" : "origin")}");
+            _bakeInProgress = true;
+            _bakeCts?.Dispose();
+            _bakeCts = new System.Threading.CancellationTokenSource();
+            System.Threading.Tasks.Task.Run(() => WriteBakeFile(radius, centerX, centerZ))
+                .ContinueWith(_ => { _bakeInProgress = false; });
+        }
+
+        // Server: a client (admin) asked to cancel the running bake. Same admin gate as RPC_BakeExecute.
+        internal static void RPC_BakeCancel(long sender, ZPackage pkg)
+        {
+            bool isAdmin = sender == 0L;
+            if (!isAdmin)
+            {
+                var peer = ZNet.instance?.GetPeer(sender);
+                var userId = peer?.m_rpc?.GetSocket()?.GetHostName();
+                isAdmin = userId != null && (ZNet.instance?.GetAdminList()?.Contains(userId) ?? false);
+            }
+            if (!isAdmin) { Log.LogWarning($"[ProceduralTerrain] Bake cancel from non-admin peer {sender} rejected."); return; }
+            if (!_bakeInProgress || _bakeCts == null) { Log.LogInfo($"[ProceduralTerrain] Bake cancel from {sender}: no bake in progress."); return; }
+            _bakeCts.Cancel();
+            Log.LogInfo($"[ProceduralTerrain] Bake cancel accepted from peer {sender} — finalizing partial bake.");
         }
 
         // ── Bake file RPC (server→client transfer) ────────────────────────────────
@@ -373,6 +400,7 @@ namespace ProceduralTerrain
             _bakeChunksExpected  = (int)Math.Ceiling((double)size / BakeChunkSize);
             _bakeChunksReceived  = 0;
             _bakeDownloadActive  = true;
+            RollingBake.Stop();   // release the rolling write handle on this file so the download can own + promote it
             _bakeDownloadTimer   = System.Diagnostics.Stopwatch.StartNew();
             BakeProgressUI.Show();
             ZRoutedRpc.instance.InvokeRoutedRPC(sender, "PTBakeRequest", new ZPackage());
@@ -407,12 +435,11 @@ namespace ProceduralTerrain
             }
             int  seed    = Plugin.WorldSeed();
             uint cfgHash = ComputeCfgHash();
-            string path  = BakeFilePath(seed, cfgHash);
-            System.IO.Directory.CreateDirectory(PTConfigDir);
-            CloseBakeStream();   // release any open read handle before overwriting the file
-            File.WriteAllBytes(path, data);
+            // Write to a .part file, union in any rolled-only zones, then atomically promote (RollingBake.Stop at
+            // download start already released the rolling handle). Never leaves a half-written file at the real path.
+            RollingMergeAndPromoteDownload(data, seed, cfgHash);
             long ms = _bakeDownloadTimer?.ElapsedMilliseconds ?? 0;
-            Log.LogInfo($"[ProceduralTerrain] Bake downloaded in {ms / 1000.0:F1}s — written to {path}. Reloading.");
+            Log.LogInfo($"[ProceduralTerrain] Bake downloaded in {ms / 1000.0:F1}s. Reloading.");
             _bakeData = null;
             _bakeLoadAttempted = false;
             _hotReloadPending  = true;
@@ -428,6 +455,7 @@ namespace ProceduralTerrain
             if (ZNet.instance.IsServer())
             {
                 ZRoutedRpc.instance.Register<ZPackage>("PTBakeExecute", Plugin.RPC_BakeExecute);
+                ZRoutedRpc.instance.Register<ZPackage>("PTBakeCancel",  Plugin.RPC_BakeCancel);
                 ZRoutedRpc.instance.Register<ZPackage>("PTBakeQuery",   Plugin.RPC_BakeQuery);
                 ZRoutedRpc.instance.Register<ZPackage>("PTBakeRequest", Plugin.RPC_BakeRequest);
                 ZRoutedRpc.instance.Register<ZPackage>("PTClearBake",   Plugin.RPC_ClearBake);

@@ -34,6 +34,7 @@ namespace ProceduralTerrain
             "disablevegetation", "applygroundwork", "protectlocations", "flatplanelocations", "locdomeheight", "locbandfade", "vegdensity", "vegforestwiden", "veginforest", "vegforestmax", "veggroupsize", "veggroupradius", "vegtiltinherit", "vegrandtilt", "vegmaxtilt", "vegconformmaxtilt", "vegsupportradius",
             "vegetationconform", "vegmaxtilt", "seed",
             "prefetch", "prefetchradius", "prefetchthreads", "cavecontent", "lodunderground",
+            "rollingbake", "rollinghud", "rollingthreads", "rollingradius", "rollingmovestep", "rollingflushzones", "rollingflushseconds", "bakeautodownload", "brickfill",
             "hidemist", "vizmode",   // render/debug-only — suppress mist / select viz mode; change no baked voxel
         };
 
@@ -82,6 +83,17 @@ namespace ProceduralTerrain
         // _bakePending. Guarded by _bakeStreamLock. Set up / torn down in WriteBakeFile.
         static Stream _bakeWriteStream;
         static List<(int ox, int oz, long off, int len)> _bakeWriteIndex;
+
+        // ── Rolling bake: capture + incremental append ────────────────────────────
+        // A rolling-bake worker sets _rollCapturing (ThreadStatic) around a Carve; StageBakeEntry routes the
+        // produced BakeZone into _rollCaptured instead of the file/pending dict, so the worker can serialize +
+        // append it itself. Zero effect when rolling is off (ThreadStatic default false).
+        [ThreadStatic] internal static bool _rollCapturing;
+        [ThreadStatic] internal static BakeZone _rollCaptured;
+        // Live index of the rolling file (mirror of _bakeIndex as full entries) + where the zone-block region ends
+        // (= the current on-disk index start, which each flush overwrites). Guarded by _bakeStreamLock.
+        static List<(int ox, int oz, long off, int len)> _rollIndex;
+        static long _rollZoneDataEnd;
 
         // Serialize + gzip one zone into a self-contained block (same layout as the inline v4 writer).
         static byte[] SerializeZoneBlock(int ox, int oz, BakeZone z)
@@ -440,7 +452,7 @@ namespace ProceduralTerrain
                     else { cStart[oc] = first; int len = last - first + 1; cLen[oc] = len; Array.Copy(colV1, first, scratch1, tot, len); tot += len; }
                 }
                 var band1 = new sbyte[tot]; Array.Copy(scratch1, 0, band1, 0, tot);
-                PutSdf($"{ox},{oz}", new ZoneField { extLo = extLo, bh = bh, width = owned, colStart = cStart, colLen = cLen, colOff = cOff, band = band1 });
+                PutSdf($"{ox},{oz}", new ZoneField { extLo = extLo, bh = bh, width = owned, colStart = cStart, colLen = cLen, colOff = cOff, band = band1, floorY = fY });
                 PutSurfH((ox, oz), (bw, extLo, s, surfH1));
                 return true;
             }
@@ -716,6 +728,8 @@ namespace ProceduralTerrain
             // call here is a LIVE carve (a connected player generating a zone while the server bakes in the
             // background); it must NOT write into the bake file — that races the workers and corrupts the stream —
             // so it falls to the in-RAM staging dict instead, same as a non-bake live carve.
+            // Rolling-bake capture: a rolling worker wants the zone handed back (it serializes + appends itself).
+            if (_rollCapturing) { _rollCaptured = z; return; }
             bool bakeWorker = _bakeWriteStream != null
                 && System.Threading.Thread.CurrentThread.ManagedThreadId != _mainThreadId;
             if (bakeWorker)
@@ -731,7 +745,227 @@ namespace ProceduralTerrain
             else _bakePending[(ox, oz)] = z;
         }
 
-        static void WriteBakeFile(float radius)
+        // ── Rolling-bake plumbing (called by RollingBake.cs; keeps all file/carve internals here) ──────────────
+        // Open (or create) the cfgHash-keyed bake for live append. Reopens the serve handle read/write so the same
+        // _bakeStream + _bakeStreamLock serve reads AND rolling appends (existing zone blocks never move → reads are
+        // always of a stable region; only the trailing index is overwritten, under the lock). Returns false if the
+        // world isn't ready. Idempotent-ish: safe to call once per world-arm.
+        internal static bool RollingBakeOpen()
+        {
+            var wg = WorldGenerator.instance;
+            if (wg == null) return false;
+            if (_scale == null || _scale.Value <= 0f) _scale = ActiveScale();
+            int seed = Plugin.WorldSeed();
+            uint cfg = ComputeCfgHash();
+            string path = BakeFilePath(seed, cfg);
+            lock (_bakeStreamLock)
+            {
+                if (File.Exists(path))
+                {
+                    EnsureBakeLoaded();   // populate _bakeIndex + _bakeStream (read handle) if not already
+                    try { _bakeStream?.Dispose(); } catch { }
+                    _bakeStream = new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.Read, 1 << 20);
+                    // footer (last 8 bytes) = index offset = where the zone-block region ends.
+                    _bakeStream.Seek(-8, SeekOrigin.End);
+                    var fr = new BinaryReader(_bakeStream, System.Text.Encoding.UTF8, true);
+                    _rollZoneDataEnd = fr.ReadInt64();
+                    _rollIndex = new List<(int, int, long, int)>(_bakeIndex?.Count ?? 0);
+                    if (_bakeIndex != null) foreach (var kv in _bakeIndex) _rollIndex.Add((kv.Key.Item1, kv.Key.Item2, kv.Value.off, kv.Value.len));
+                    _bakeCrossings = _bakeFileV6;   // append in the file's existing format
+                    Plugin.Log.LogInfo($"[PT-rolling] opened existing bake ({_rollIndex.Count} zones, v{(_bakeFileV6 ? 6 : 5)}) for append → {path}");
+                }
+                else
+                {
+                    Directory.CreateDirectory(PTConfigDir);
+                    _bakeStream = new FileStream(path, FileMode.Create, FileAccess.ReadWrite, FileShare.Read, 1 << 20);
+                    var bw = new BinaryWriter(_bakeStream, System.Text.Encoding.UTF8, true);
+                    bw.Write(0x564F5846u);
+                    bw.Write((ushort)(_bakeCrossings ? 6 : 5));
+                    bw.Write((ulong)(uint)seed);
+                    bw.Write(cfg);
+                    bw.Write((uint)0);           // zone count (patched each flush)
+                    bw.Flush();
+                    _rollZoneDataEnd = _bakeStream.Position;   // 22
+                    _rollIndex = new List<(int, int, long, int)>();
+                    _bakeData = null;
+                    _bakeIndex = new Dictionary<(int, int), (long off, int len)>();
+                    _bakeFileStep = _bakeStep;
+                    Plugin._bakeFileV6 = _bakeCrossings;
+                    _bakeLoadAttempted = true;   // we now OWN the (RW) handle — stop the serve loader from reopening it read-only and clobbering our writes
+                    RollingWriteIndexFooterLocked();   // make the empty file valid/loadable
+                    Plugin.Log.LogInfo($"[PT-rolling] created new bake (v{(_bakeCrossings ? 6 : 5)}) → {path}");
+                }
+            }
+            return true;
+        }
+
+        internal static List<(int ox, int oz)> RollingPersistedKeys()
+        {
+            var r = new List<(int, int)>();
+            lock (_bakeStreamLock) if (_rollIndex != null) foreach (var e in _rollIndex) r.Add((e.ox, e.oz));
+            return r;
+        }
+
+        // Carve one zone for persistence; returns its serialized block, or false if the zone is unmodified (nothing
+        // to bake — it live-carves cheaply). Runs on a rolling worker thread (ThreadStatic capture is thread-local).
+        internal static bool RollingCarveBlock(int ox, int oz, out byte[] blk)
+        {
+            blk = null;
+            var wg = WorldGenerator.instance;
+            if (wg == null) return false;
+            float s = ActiveScale();
+            // Carve at BAKE resolution (full), not the live coarse res — thread-local so concurrent main-thread live
+            // carves keep their own coarse res. Matches what WriteBakeFile does globally for a full pt_bake.
+            _coarseOverrideXZ = _bakeCoarseXZ; _coarseOverrideY = _bakeCoarseY;
+            _rollCapturing = true; _rollCaptured = null;
+            try
+            {
+                var (yLo, yHi) = ComputeYBoundsPublic(ox, oz, 64, s, wg);
+                Carve(null, ox, oz, 64, yLo, yHi);
+            }
+            finally { _rollCapturing = false; _coarseOverrideXZ = 0; _coarseOverrideY = 0; }
+            var z = _rollCaptured; _rollCaptured = null;
+            if (z == null) return false;
+            blk = SerializeZoneBlock(ox, oz, z);
+            return true;
+        }
+
+        // Atomically append a batch of carved blocks, rewrite the (small) index + footer, and update the serve index.
+        // The file is a complete valid bake after every call; a crash between calls only loses the un-flushed RAM batch.
+        internal static int RollingBakeFlush(List<(int ox, int oz, byte[] blk)> blocks)
+        {
+            if (blocks == null || blocks.Count == 0) return 0;
+            lock (_bakeStreamLock)
+            {
+                if (_bakeStream == null || _rollIndex == null) return 0;
+                _bakeStream.Seek(_rollZoneDataEnd, SeekOrigin.Begin);   // overwrite the old trailing index with new blocks
+                var bw = new BinaryWriter(_bakeStream, System.Text.Encoding.UTF8, true);
+                var added = new List<(int ox, int oz, long off, int len)>(blocks.Count);
+                foreach (var (ox, oz, blk) in blocks)
+                {
+                    long off = _bakeStream.Position;
+                    bw.Write(blk, 0, blk.Length);
+                    added.Add((ox, oz, off, blk.Length));
+                    _rollIndex.Add((ox, oz, off, blk.Length));
+                }
+                _rollZoneDataEnd = _bakeStream.Position;
+                RollingWriteIndexFooterLocked();
+                if (_bakeIndex != null) foreach (var e in added) _bakeIndex[(e.ox, e.oz)] = (e.off, e.len);
+            }
+            return blocks.Count;
+        }
+
+        // Write the full index + footer at _rollZoneDataEnd and patch the header zone count. Caller holds _bakeStreamLock.
+        static void RollingWriteIndexFooterLocked()
+        {
+            _bakeStream.Seek(_rollZoneDataEnd, SeekOrigin.Begin);
+            var bw = new BinaryWriter(_bakeStream, System.Text.Encoding.UTF8, true);
+            foreach (var e in _rollIndex) { bw.Write(e.ox); bw.Write(e.oz); bw.Write(e.off); bw.Write(e.len); }
+            bw.Write(_rollZoneDataEnd);           // footer: index offset
+            bw.Flush();
+            _bakeStream.SetLength(_bakeStream.Position);   // drop any leftover from a previously-longer index
+            _bakeStream.Seek(18, SeekOrigin.Begin);        // countPos (magic4+ver2+seed8+cfg4)
+            bw.Write((uint)_rollIndex.Count);
+            bw.Flush();
+        }
+
+        internal static void RollingBakeClose()
+        {
+            lock (_bakeStreamLock)
+            {
+                try { if (_bakeStream != null && _rollIndex != null) RollingWriteIndexFooterLocked(); } catch { }
+                _rollIndex = null;
+            }
+        }
+
+        // Read the (ox,oz)→(off,len) index of a streamed v5/v6 bake from an open stream. Sets indexOff/ver.
+        static Dictionary<(int, int), (long off, int len)> ReadStreamedIndex(Stream fs, out long indexOff, out ushort ver)
+        {
+            var br = new BinaryReader(fs, System.Text.Encoding.UTF8, true);
+            fs.Seek(0, SeekOrigin.Begin);
+            if (br.ReadUInt32() != 0x564F5846u) throw new InvalidDataException("bad magic");
+            ver = br.ReadUInt16();
+            br.ReadUInt64(); br.ReadUInt32();     // seed, cfgHash
+            int cnt = (int)br.ReadUInt32();
+            fs.Seek(-8, SeekOrigin.End);
+            indexOff = br.ReadInt64();
+            var d = new Dictionary<(int, int), (long, int)>(Math.Max(0, cnt));
+            fs.Seek(indexOff, SeekOrigin.Begin);
+            for (int i = 0; i < cnt; i++)
+            {
+                int ox = br.ReadInt32(), oz = br.ReadInt32();
+                long off = br.ReadInt64(); int len = br.ReadInt32();
+                d[(ox, oz)] = (off, len);
+            }
+            return d;
+        }
+
+        // Finalize a server-bake download: write to a .part file, UNION in any rolled-only zones from an existing
+        // local bake (same seed+cfgHash → identical deterministic zones; we keep ones the server didn't send, e.g.
+        // rolled ahead of the server's bake radius), then atomically promote over the real path. Caller must have
+        // stopped the rolling worker first so nothing holds the file. Merge only within the same format version.
+        internal static void RollingMergeAndPromoteDownload(byte[] serverData, int seed, uint cfgHash)
+        {
+            string path = BakeFilePath(seed, cfgHash);
+            string part = path + ".part";
+            Directory.CreateDirectory(PTConfigDir);
+            lock (_bakeStreamLock)
+            {
+                File.WriteAllBytes(part, serverData);
+                int added = 0;
+                try
+                {
+                    if (File.Exists(path))
+                    {
+                        using var rolled = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 20);
+                        using var partfs = new FileStream(part, FileMode.Open, FileAccess.ReadWrite, FileShare.None, 1 << 20);
+                        var srv = ReadStreamedIndex(partfs, out long srvIndexOff, out ushort srvVer);
+                        var rol = ReadStreamedIndex(rolled, out _, out ushort rolVer);
+                        if (srvVer == rolVer)
+                        {
+                            var extra = new List<KeyValuePair<(int, int), (long off, int len)>>();
+                            foreach (var kv in rol) if (!srv.ContainsKey(kv.Key)) extra.Add(kv);
+                            if (extra.Count > 0)
+                            {
+                                var full = new List<(int ox, int oz, long off, int len)>(srv.Count + extra.Count);
+                                foreach (var kv in srv) full.Add((kv.Key.Item1, kv.Key.Item2, kv.Value.off, kv.Value.len));
+                                partfs.Seek(srvIndexOff, SeekOrigin.Begin);   // overwrite the server index with the rolled-only blocks
+                                var bw = new BinaryWriter(partfs, System.Text.Encoding.UTF8, true);
+                                foreach (var kv in extra)
+                                {
+                                    long off = partfs.Position;
+                                    var buf = new byte[kv.Value.len];
+                                    rolled.Seek(kv.Value.off, SeekOrigin.Begin);
+                                    int rd = 0; while (rd < buf.Length) { int r = rolled.Read(buf, rd, buf.Length - rd); if (r <= 0) break; rd += r; }
+                                    bw.Write(buf, 0, buf.Length);
+                                    full.Add((kv.Key.Item1, kv.Key.Item2, off, buf.Length));
+                                }
+                                long newIndexOff = partfs.Position;
+                                foreach (var e in full) { bw.Write(e.ox); bw.Write(e.oz); bw.Write(e.off); bw.Write(e.len); }
+                                bw.Write(newIndexOff);
+                                bw.Flush();
+                                partfs.SetLength(partfs.Position);
+                                partfs.Seek(18, SeekOrigin.Begin); bw.Write((uint)full.Count); bw.Flush();
+                                added = extra.Count;
+                            }
+                        }
+                        else Log.LogWarning($"[ProceduralTerrain] bake merge skipped: rolled v{rolVer} != server v{srvVer} — taking server bake.");
+                    }
+                }
+                catch (Exception e) { Log.LogWarning($"[ProceduralTerrain] bake merge failed ({e.Message}) — taking server bake as-is."); }
+
+                CloseBakeStream();   // release any read handle on the real path before replacing it
+                if (File.Exists(path)) File.Delete(path);
+                File.Move(part, path);
+                Log.LogInfo($"[ProceduralTerrain] bake download promoted{(added > 0 ? $" (merged {added} rolled-only zones)" : "")} → {path}");
+            }
+        }
+
+        static void WriteBakeFile(float radius) => WriteBakeFile(radius, 0f, 0f);
+
+        // centerX/centerZ: world-space centre of the baked disc (0,0 = world origin, the default). pt_bake [radius] player
+        // passes the player's position so you can bake a region around wherever you are instead of spawn.
+        static void WriteBakeFile(float radius, float centerX, float centerZ)
         {
             var wg = WorldGenerator.instance;
             if (wg == null) { Log.LogWarning("[ProceduralTerrain] bake: WorldGenerator not ready."); return; }
@@ -755,6 +989,13 @@ namespace ProceduralTerrain
             int gridOffset = ((-(int)(32f / s)) % zoneW + zoneW) % zoneW;
             Log.LogDebug($"[ProceduralTerrain] bake: zone grid offset={gridOffset}");
 
+            // Centre the disc on (centerX,centerZ): find the nearest zone-origin index to it, then iterate the
+            // ±zoneR ring around that index (default 0,0 → centre zone = origin). Voxel-coord centre = world/scale.
+            int centerOX = (int)Math.Round((centerX / s - gridOffset) / zoneW);
+            int centerOZ = (int)Math.Round((centerZ / s - gridOffset) / zoneW);
+            if (centerX != 0f || centerZ != 0f)
+                Log.LogInfo($"[ProceduralTerrain] bake: centred on world ({centerX:F0},{centerZ:F0}) → zone index ({centerOX},{centerOZ}).");
+
             // Discard all cached bake data so every zone gets re-carved fresh.
             _bakePending.Clear();
             _bakeData = null;
@@ -764,10 +1005,11 @@ namespace ProceduralTerrain
             for (int dox = -zoneR; dox <= zoneR; dox++)
             for (int doz = -zoneR; doz <= zoneR; doz++)
             {
-                int ox = dox * zoneW + gridOffset;
-                int oz = doz * zoneW + gridOffset;
+                int ox = (centerOX + dox) * zoneW + gridOffset;
+                int oz = (centerOZ + doz) * zoneW + gridOffset;
                 float wx = ox * s, wz = oz * s;
-                if (radius > 0f && wx * wx + wz * wz > radius * radius) continue;
+                float ddx = wx - centerX, ddz = wz - centerZ;
+                if (radius > 0f && ddx * ddx + ddz * ddz > radius * radius) continue;
                 if (_bakeFileStep == _bakeStep && IsZoneBaked(ox, oz)) continue;
                 toCarve.Add((ox, oz));
             }
@@ -779,6 +1021,7 @@ namespace ProceduralTerrain
             Log.LogInfo($"[ProceduralTerrain] bake: {toCarve.Count} zones to carve (radius={radius:F0}m, threads={threads})...");
             var bakeSw = System.Diagnostics.Stopwatch.StartNew();
             int doneCount = 0;
+            bool cancelled = false;
             lock (_etaLock) { _etaLastN = 0; _etaLastSec = 0f; _etaEmaSecPerZone = 0f; }
             Plugin._bakeProgressTotal = toCarve.Count;
             Plugin._bakeProgressDone  = 0;
@@ -831,6 +1074,7 @@ namespace ProceduralTerrain
                 int liveCoarseXZ = Plugin._coarseXZ, liveCoarseY = Plugin._coarseY;
                 Plugin._coarseXZ = Plugin._bakeCoarseXZ; Plugin._coarseY = Plugin._bakeCoarseY;
                 Log.LogInfo($"[ProceduralTerrain] bake carve res: coarseXZ={Plugin._coarseXZ} coarseY={Plugin._coarseY} (live was {liveCoarseXZ}/{liveCoarseY})");
+                BakeStats.Begin(toCarve.Count);
                 try
                 {
                     // NoBuffering dynamic partitioner: hand out ONE zone at a time so an idle worker immediately
@@ -839,7 +1083,7 @@ namespace ProceduralTerrain
                     // a few workers while the rest idle → long tail). Spreads slow zones across all cores.
                     System.Threading.Tasks.Parallel.ForEach(
                         System.Collections.Concurrent.Partitioner.Create(toCarve, System.Collections.Concurrent.EnumerablePartitionerOptions.NoBuffering),
-                        new System.Threading.Tasks.ParallelOptions { MaxDegreeOfParallelism = threads },
+                        new System.Threading.Tasks.ParallelOptions { MaxDegreeOfParallelism = threads, CancellationToken = Plugin._bakeCts?.Token ?? System.Threading.CancellationToken.None },
                         zone =>
                         {
                             var (zox, zoz) = zone;
@@ -848,6 +1092,7 @@ namespace ProceduralTerrain
                             // to the bake caller and (if unhandled) silently kills the process — no [PT] Carve,
                             // since that catch only covers the live main-thread path. Log the zone + full stack so
                             // a managed failure (e.g. an indexing bug at fine coarseXZ) is diagnosable, not fatal.
+                            var zsw = System.Diagnostics.Stopwatch.StartNew();
                             try
                             {
                                 // Purely procedural carve — groundwork is a live overlay applied at load, not baked.
@@ -857,7 +1102,9 @@ namespace ProceduralTerrain
                             {
                                 Log.LogError($"[ProceduralTerrain] bake Carve threw at zone ({zox},{zoz}) coarseXZ={Plugin._coarseXZ} coarseY={Plugin._coarseY}: {ce.GetType().Name}: {ce.Message}\n{ce.StackTrace}");
                             }
+                            zsw.Stop();
                             int n = System.Threading.Interlocked.Increment(ref doneCount);
+                            BakeStats.Record(n - 1, zox, zoz, zsw.ElapsedTicks * 1000f / System.Diagnostics.Stopwatch.Frequency);
                             Plugin._bakeProgressDone = n;
                             if (n % 50 == 0 || n == toCarve.Count)
                             {
@@ -888,6 +1135,14 @@ namespace ProceduralTerrain
                                 catch (Exception pe) { Log.LogWarning($"[ProceduralTerrain] bake progress report failed (continuing): {pe.Message}"); }
                             }
                         });
+                }
+                catch (OperationCanceledException)
+                {
+                    // pt_cancel: fall through to the index/footer write below so the zones carved so far land as a
+                    // VALID, loadable partial bake (the NoBuffering partitioner hands out zones densely → the
+                    // completed set is a contiguous prefix, not scattered holes).
+                    cancelled = true;
+                    Log.LogInfo($"[ProceduralTerrain] bake cancelled after {index.Count} zones; finalizing partial bake.");
                 }
                 catch (Exception bex)
                 {
@@ -929,11 +1184,17 @@ namespace ProceduralTerrain
             long bakeSecs = bakeSw.ElapsedMilliseconds / 1000;
             float zps = bakeSecs > 0 ? index.Count / (float)bakeSecs : 0f;
             Log.LogInfo($"[ProceduralTerrain] Bake written (v{(_bakeCrossings ? 6 : 5)} streamed): {index.Count} zones in {bakeSecs / 60}:{bakeSecs % 60:00} ({zps:F1} zones/s), radius={radius:F0}m → {path}");
+            // Sidecar stats JSON (never affects the .bin / serve path). index.Count includes preserved zones; the
+            // per-zone timing array only covers freshly carved zones (toCarve), so pass both.
+            BakeStats.Write(path, seed, cfgHash, toCarve.Count, index.Count - toCarve.Count,
+                            bakeSw.Elapsed.TotalSeconds, threads, Plugin._bakeCoarseXZ, Plugin._bakeCoarseY,
+                            radius, centerX, centerZ, _bakeCrossings, cancelled);
         }
 
         // ── Hot-reload: re-run the full voxel pipeline on every loaded zone ───────
         internal static void ResetWorldState()
         {
+            RollingBake.Stop();   // flush + join the rolling worker BEFORE CloseBakeStream disposes _bakeStream
             LoadBiomeConfig();
             _bakePending.Clear();
             _bakeData = null;
@@ -1012,6 +1273,7 @@ public class BakeProgressUI : MonoBehaviour
     static GUIStyle? _boxStyle;
     static GUIStyle? _textStyle;
     static GUIStyle? _captionStyle;
+    static GUIStyle? _hudStyle;
     static bool _stylesInit;
     static Texture2D? _bgTex;
     static Texture2D? _barBgTex;
@@ -1049,7 +1311,8 @@ public class BakeProgressUI : MonoBehaviour
 
     void OnGUI()
     {
-        if (!Plugin._bakeDownloadActive && !Plugin._bakeInProgress) return;
+        bool rollingHud = RollingBake.ShowHud && RollingBake.IsRunning;
+        if (!Plugin._bakeDownloadActive && !Plugin._bakeInProgress && !rollingHud) return;
         if (!_stylesInit)
         {
             _stylesInit = true;
@@ -1077,39 +1340,90 @@ public class BakeProgressUI : MonoBehaviour
                 fontSize  = 11,
                 alignment = TextAnchor.MiddleCenter
             };
+            _hudStyle = new GUIStyle
+            {
+                normal    = { textColor = new Color(0.98f, 0.86f, 0.55f) },
+                fontStyle = FontStyle.Bold,
+                fontSize  = 15,
+                alignment = TextAnchor.MiddleLeft
+            };
         }
 
-        float pct; string label, sublabel;
-        if (Plugin._bakeDownloadActive)
+        // Centre dialog: only for the blocking full bake / download (not the background rolling bake).
+        if (Plugin._bakeDownloadActive || Plugin._bakeInProgress)
         {
-            pct      = Plugin._bakeChunksExpected > 0 ? (float)Plugin._bakeChunksReceived / Plugin._bakeChunksExpected : 0f;
-            long elS = (Plugin._bakeDownloadTimer?.ElapsedMilliseconds ?? 0) / 1000;
-            float eta = pct > 0.01f ? elS / pct * (1f - pct) : 0f;
-            label    = $"Downloading world terrain…  {pct * 100f:F0}%";
-            sublabel = eta > 0 ? $"ETA {Plugin.FmtMMSS(eta)}  ·  {Plugin.FmtMMSS(elS)} elapsed" : "Connecting…";
+            float pct; string label, sublabel;
+            if (Plugin._bakeDownloadActive)
+            {
+                pct      = Plugin._bakeChunksExpected > 0 ? (float)Plugin._bakeChunksReceived / Plugin._bakeChunksExpected : 0f;
+                long elS = (Plugin._bakeDownloadTimer?.ElapsedMilliseconds ?? 0) / 1000;
+                float eta = pct > 0.01f ? elS / pct * (1f - pct) : 0f;
+                label    = $"Downloading world terrain…  {pct * 100f:F0}%";
+                sublabel = eta > 0 ? $"ETA {Plugin.FmtMMSS(eta)}  ·  {Plugin.FmtMMSS(elS)} elapsed" : "Connecting…";
+            }
+            else
+            {
+                pct      = Plugin._bakeProgressTotal > 0 ? (float)Plugin._bakeProgressDone / Plugin._bakeProgressTotal : 0f;
+                long elS = (Plugin._bakeProgressTimer?.ElapsedMilliseconds ?? 0) / 1000;
+                float eta = pct > 0.01f ? elS / pct * (1f - pct) : 0f;
+                label    = $"Baking terrain…  {pct * 100f:F0}%";
+                sublabel = eta > 0 ? $"ETA {Plugin.FmtMMSS(eta)}  ·  {Plugin.FmtMMSS(elS)} elapsed  ({Plugin._bakeProgressDone}/{Plugin._bakeProgressTotal} zones)" : "Starting…";
+            }
+
+            float w = 420f, h = 90f;
+            float x = (Screen.width - w) * 0.5f;
+            float y = 20f;
+            GUI.Box(new Rect(x, y, w, h), GUIContent.none, _boxStyle);
+            GUI.Label(new Rect(x, y + 6f,  w, 18f), "ProceduralTerrain", _captionStyle);
+            GUI.Label(new Rect(x, y + 24f, w, 26f), label,    _textStyle);
+            GUI.Label(new Rect(x, y + 50f, w, 22f), sublabel, _textStyle);
+            float barX = x + 16f, barW = w - 32f, barY = y + 76f, barH = 8f;
+            GUI.DrawTexture(new Rect(barX, barY, barW, barH), _barBgTex);
+            if (pct > 0f) GUI.DrawTexture(new Rect(barX, barY, barW * pct, barH), _barFillTex);
         }
-        else
+
+        // Rolling-bake debug HUD: compact corner panel. Queue depth is the "keeping up?" signal — if it climbs and
+        // stays high, rolling is falling behind your movement (bump threads/flush, or you're outrunning it).
+        if (rollingHud)
         {
-            pct      = Plugin._bakeProgressTotal > 0 ? (float)Plugin._bakeProgressDone / Plugin._bakeProgressTotal : 0f;
-            long elS = (Plugin._bakeProgressTimer?.ElapsedMilliseconds ?? 0) / 1000;
-            float eta = pct > 0.01f ? elS / pct * (1f - pct) : 0f;
-            label    = $"Baking terrain…  {pct * 100f:F0}%";
-            sublabel = eta > 0 ? $"ETA {Plugin.FmtMMSS(eta)}  ·  {Plugin.FmtMMSS(elS)} elapsed  ({Plugin._bakeProgressDone}/{Plugin._bakeProgressTotal} zones)" : "Starting…";
+            double el = RollingBake.ElapsedSec;
+            double rate = el > 0.1 ? RollingBake.Carved / el : 0;
+            int q = RollingBake.QueueDepth;
+
+            // Total zones persisted in THIS world's bake file (resumes across sessions), and a rough % of the whole
+            // world. Denominator ≈ a 10km-radius world's zone count (π·R²/64²); includes ocean, so land-only bakes
+            // cap below 100% — it's a progress feel, not an exact target.
+            int totalBaked = (Plugin._bakeData?.Count ?? 0) + (Plugin._bakeIndex?.Count ?? 0);
+            const float WORLD_ZONES = 76700f;
+            float pct = 100f * totalBaked / WORLD_ZONES;
+
+            // Is the zone the player stands in backed by a full-res bake, or only the coarse live carve?
+            bool haveZone = false, zoneBaked = false;
+            var pl = Player.m_localPlayer;
+            if (pl != null)
+            {
+                var pp = pl.transform.position;
+                var (zox, zoz) = Plugin.ZoneOriginFromWorld(pp.x, pp.z, Plugin.ActiveScale());
+                zoneBaked = Plugin.IsZoneBaked(zox, zoz);
+                haveZone = true;
+            }
+
+            float rw = 420f, rh = 102f, pad = 14f;
+            float rx = Screen.width - rw - 12f;          // bottom-right
+            float ry = Screen.height - rh - 90f;         // ~an inch up from the bottom
+            GUI.Box(new Rect(rx, ry, rw, rh), GUIContent.none, _boxStyle);
+            GUI.Label(new Rect(rx + pad, ry + 6f,  rw - pad, 20f), $"PT rolling bake  ·  {RollingBake.Workers} worker(s)", _hudStyle);
+            GUI.Label(new Rect(rx + pad, ry + 28f, rw - pad, 22f), $"queue {q}   carving {RollingBake.ActiveCount} (oldest {RollingBake.OldestActiveSec:F0}s)   {rate:F1} z/s", _hudStyle);
+            GUI.Label(new Rect(rx + pad, ry + 50f, rw - pad, 22f), $"saved {totalBaked} zones   (~{pct:F2}% of world)", _hudStyle);
+            if (haveZone)
+            {
+                var prev = GUI.color;
+                GUI.color = zoneBaked ? new Color(0.45f, 0.95f, 0.45f) : new Color(0.98f, 0.70f, 0.30f);
+                GUI.Label(new Rect(rx + pad, ry + 73f, rw - pad, 22f),
+                    zoneBaked ? "current zone: FULL-RES (baked)" : "current zone: coarse (live)", _hudStyle);
+                GUI.color = prev;
+            }
         }
-
-        float w = 420f, h = 90f;
-        float x = (Screen.width - w) * 0.5f;
-        float y = 20f;
-
-        GUI.Box(new Rect(x, y, w, h), GUIContent.none, _boxStyle);
-        GUI.Label(new Rect(x, y + 6f,  w, 18f), "ProceduralTerrain", _captionStyle);
-        GUI.Label(new Rect(x, y + 24f, w, 26f), label,    _textStyle);
-        GUI.Label(new Rect(x, y + 50f, w, 22f), sublabel, _textStyle);
-
-        float barX = x + 16f, barW = w - 32f, barY = y + 76f, barH = 8f;
-        GUI.DrawTexture(new Rect(barX, barY, barW, barH), _barBgTex);
-        if (pct > 0f)
-            GUI.DrawTexture(new Rect(barX, barY, barW * pct, barH), _barFillTex);
     }
 }
 

@@ -73,23 +73,42 @@ namespace ProceduralTerrain
         // writes are equivalent to Field.Set. Falls back to Field.Set if the _bricks field can't be reflected.
         internal sealed class BrickWriter
         {
-            static FieldInfo _bricksFI;
+            static FieldInfo _bricksFI, _brickDataFI, _brickFillFI;
             static bool _resolved;
             readonly Voxheim.Core.VoxelField _field;
             readonly Dictionary<Voxheim.Core.Int3, Voxheim.Core.Brick> _bricks;
             Voxheim.Core.Brick _cur;
             int _kx, _ky, _kz;
             bool _have;
+            internal bool CanFill => _bricks != null && _brickDataFI != null && _brickFillFI != null;
             internal BrickWriter(Voxheim.Core.VoxelField field)
             {
                 _field = field;
                 if (!_resolved)
                 {
                     _bricksFI = typeof(Voxheim.Core.VoxelField).GetField("_bricks", BindingFlags.NonPublic | BindingFlags.Instance);
+                    _brickDataFI = typeof(Voxheim.Core.Brick).GetField("_data", BindingFlags.NonPublic | BindingFlags.Instance);
+                    _brickFillFI = typeof(Voxheim.Core.Brick).GetField("_fill", BindingFlags.NonPublic | BindingFlags.Instance);
                     _resolved = true;
                     if (_bricksFI == null) Log.LogWarning("[ProceduralTerrain] VoxelField._bricks not found — brick-blit disabled, using per-voxel Set.");
+                    if (_brickDataFI == null || _brickFillFI == null) Log.LogWarning("[ProceduralTerrain] Brick._data/_fill not found — homogeneous solid-brick fill disabled.");
                 }
                 _bricks = _bricksFI?.GetValue(field) as Dictionary<Voxheim.Core.Int3, Voxheim.Core.Brick>;
+            }
+
+            // Create a fully-SOLID (-127) brick as HOMOGENEOUS (no 4096-voxel array): let Field.Set create+wire the
+            // brick (one voxel, correct bookkeeping/dirty-tracking), then collapse it to _data=null/_fill=-127.
+            // Caller guarantees every voxel in this brick is solid. Returns false (→ fall back to per-voxel) on any issue.
+            internal bool FillSolidBrick(int bx, int by, int bz)
+            {
+                if (!CanFill) return false;
+                var key = new Voxheim.Core.Int3(bx, by, bz);
+                _field.Set(new Voxheim.Core.Int3(bx << 4, by << 4, bz << 4), (sbyte)-127);   // create + wire
+                if (!_bricks.TryGetValue(key, out var brick) || brick == null) return false;
+                try { _brickDataFI.SetValue(brick, null); _brickFillFI.SetValue(brick, (sbyte)-127); }
+                catch { return false; }
+                if (_have && _kx == bx && _ky == by && _kz == bz) _have = false;   // our cache may point at this brick
+                return true;
             }
             public void Set(int wx, int wy, int wz, sbyte v)
             {
@@ -259,6 +278,60 @@ namespace ProceduralTerrain
             // Brick-blit writer: caches the current 16³ brick so a column's contiguous Y-run writes go straight
             // to the brick array, skipping the per-voxel dictionary lookup that dominated Field.Set at full res.
             var bw = new Plugin.BrickWriter(builder.Field);
+            int filledBricks = 0;
+
+            // ── Homogeneous solid-brick fast path ──────────────────────────────────────────────────────────────
+            // The band is dominated by constant -127 (the deep solid interior PT must write because Voxheim's floor
+            // sits far below the surface). Writing that per-voxel is the ~20ms hitch. Instead: find 16³ bricks that
+            // are ENTIRELY solid across all their columns and create them HOMOGENEOUS (one object, no 4096-voxel
+            // array). Only when there's no groundwork overlay and the reflection is available; else the loop below
+            // handles everything as before. The per-voxel loop then skips whole brick-Y segments that we filled.
+            HashSet<(int, int, int)> filled = (gw == null && bw.CanFill && Plugin._brickFill) ? new HashSet<(int, int, int)>() : null;
+            if (filled != null)
+            {
+                int W = c.width;
+                var sBot = new int[W * W];   // world Y where each column's strict-solid span starts
+                var sTop = new int[W * W];   // ...and ends (sTop < sBot ⇒ no fillable solid at the bottom)
+                for (int ci = 0; ci < W; ci++)
+                for (int ri = 0; ri < W; ri++)
+                {
+                    int col = ci * W + ri, idx = ci * W + ri;
+                    int len = c.colLen[col];
+                    if (len == 0) { sBot[idx] = int.MaxValue; sTop[idx] = int.MinValue; continue; }
+                    int start = c.colStart[col], off = c.colOff[col];
+                    if (c.band[off] != -127) { sBot[idx] = int.MaxValue; sTop[idx] = int.MinValue; continue; }
+                    int lead = 0; while (lead < len && c.band[off + lead] == -127) lead++;   // strict -127 run from the bottom (stops at surface transition / cave)
+                    sBot[idx] = c.extLo + start;
+                    sTop[idx] = c.extLo + start + lead - 1;
+                }
+                int byLo = c.extLo >> 4, byHi = (c.extLo + c.bh - 1) >> 4;
+                int bx0 = ox >> 4, bx1 = (ox + width - 1) >> 4, bz0 = oz >> 4, bz1 = (oz + width - 1) >> 4;
+                for (int bx = bx0; bx <= bx1; bx++)
+                {
+                    int xLo = bx << 4; if (xLo < ox || xLo + 15 > ox + width - 1) continue;   // brick fully inside zone X
+                    int ciBase = xLo - ox;
+                    for (int bz = bz0; bz <= bz1; bz++)
+                    {
+                        int zLo = bz << 4; if (zLo < oz || zLo + 15 > oz + width - 1) continue;
+                        int riBase = zLo - oz;
+                        int maxBot = int.MinValue, minTop = int.MaxValue;   // over the 16×16 columns of this brick cell
+                        for (int lx = 0; lx < 16; lx++)
+                        for (int lz = 0; lz < 16; lz++)
+                        {
+                            int idx = (ciBase + lx) * W + (riBase + lz);
+                            if (sBot[idx] > maxBot) maxBot = sBot[idx];
+                            if (sTop[idx] < minTop) minTop = sTop[idx];
+                        }
+                        for (int by = byLo; by <= byHi; by++)
+                        {
+                            int yLo = by << 4;
+                            if (yLo >= maxBot && yLo + 15 <= minTop && bw.FillSolidBrick(bx, by, bz))
+                            { filled.Add((bx, by, bz)); filledBricks++; }
+                        }
+                    }
+                }
+            }
+
             for (int ci = 0; ci < width; ci++)
             for (int ri = 0; ri < width; ri++)
             {
@@ -280,11 +353,15 @@ namespace ProceduralTerrain
                 int len = c.colLen[col];
                 if (len == 0) continue;
                 int start = c.colStart[col], off = c.colOff[col];
-                for (int k = 0; k < len; k++)
+                int bxC = wx >> 4, bzC = wz >> 4;
+                int vyEnd = c.extLo + start + len;
+                int vy = c.extLo + start;
+                while (vy < vyEnd)
                 {
-                    int   wy = c.extLo + start + k;
-                    bw.Set(wx, wy, wz, c.band[off + k]);
-                    setCount++;
+                    int by = vy >> 4;
+                    int segEnd = System.Math.Min(vyEnd, (by + 1) << 4);
+                    if (filled != null && filled.Contains((bxC, by, bzC))) { vy = segEnd; continue; }   // whole brick already solid-filled
+                    for (; vy < segEnd; vy++) { bw.Set(wx, vy, wz, c.band[off + (vy - (c.extLo + start))]); setCount++; }
                 }
             }
             double setMs = (System.Diagnostics.Stopwatch.GetTimestamp() - _tSet0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
@@ -316,7 +393,7 @@ namespace ProceduralTerrain
             // and whether the zone was live-carved (bake miss) vs served from the bake.
             double serveMs = carveMs + gwMs + setMs;
             if (serveMs > 6.0)
-                Plugin.Log.LogInfo($"[PT-serve] zone ({ox},{oz}) = {serveMs:F1}ms  carve={carveMs:F1} gw={gwMs:F1} set={setMs:F1}  live={_genThisZone} gc2+{d2}");
+                Plugin.Log.LogInfo($"[PT-serve] zone ({ox},{oz}) = {serveMs:F1}ms  carve={carveMs:F1} gw={gwMs:F1} set={setMs:F1}  band={setCount} solidBricks={filledBricks} floor={floorY} y=[{c.extLo}..{c.extLo + c.bh}]  live={_genThisZone} gc2+{d2}");
         }
 
         // Write PT's top surface into the zone's vanilla Heightmap.m_heights so 2D consumers inherit it.

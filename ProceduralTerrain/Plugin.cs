@@ -315,7 +315,7 @@ namespace ProceduralTerrain
             // basebuffer (m): weld the formation SOLID for this depth just BELOW its anchor so it locks into the
             // vanilla surface instead of floating a hair above it (the warp shifts addh above local ground → a
             // "pinch gap" seam at the base). 0 = off. Appended last → existing param indices unchanged.
-            ("basebuffer", 0f),
+            ("basebuffer", 6f),   // TEST: global default 6m to verify the pinch-gap weld works everywhere (was 0)
         };
         protected override (string name, float def)[] ParamSpec => _spec;
 
@@ -825,13 +825,20 @@ namespace ProceduralTerrain
         internal static int   _coarseY             = 1;      // Path B running-field cell size in voxels, Y (1=full-res Y; higher=cheaper/less vertical detail).
         internal static int   _bakeCoarseXZ        = 1;      // carve res used DURING a pt_bake, XZ (decoupled from live coarseXZ). 1 = full-res bake quality.
         internal static int   _bakeCoarseY         = 1;      // carve res used DURING a pt_bake, Y. Live play uses coarseXZ/coarseY; the bake carves at these.
-        internal static int   CellVox  { get { return _coarseXZ < 1 ? 1 : _coarseXZ; } }  // XZ coarse cell size (voxels)
-        internal static int   CellVoxY { get { return _coarseY  < 1 ? 1 : _coarseY;  } }  // Path B field Y coarse cell size (voxels)
+        // Per-thread carve-resolution override (0 = none). The rolling bake sets this to _bakeCoarseXZ/_bakeCoarseY
+        // on ITS thread so it carves at full BAKE resolution — without flipping the global (which would corrupt the
+        // main thread's concurrent live carves at coarse res). All carve-path resolution reads go through these two.
+        [ThreadStatic] internal static int _coarseOverrideXZ;
+        [ThreadStatic] internal static int _coarseOverrideY;
+        internal static int   CellVox  { get { int c = _coarseOverrideXZ > 0 ? _coarseOverrideXZ : _coarseXZ; return c < 1 ? 1 : c; } }  // XZ coarse cell size (voxels)
+        internal static int   CellVoxY { get { int c = _coarseOverrideY  > 0 ? _coarseOverrideY  : _coarseY;  return c < 1 ? 1 : c; } }  // Path B field Y coarse cell size (voxels)
         internal static bool  _surfaceFullRes       = true;   // surface-anchored modes: replace coarse-interp baseline with full-res addh (kills coarse faceting cliffs)
         internal static bool  _vanillaHeight        = true;   // sample ground via vanilla HeightmapBuilder (biome-blended, matches rendered terrain) instead of single-biome GetHeight
 
         // ── Bake download (client receiving from server) ──────────────────────────
         internal static bool   _bakeDownloadActive;
+        internal static bool   _bakeAutoDownload;   // [Debug] bakeautodownload: auto-pull the server bake on connect. Default OFF — rolling bake fills locally; download is opt-in via pt_download (the RPC transfer is slow/throttled for big bakes).
+        internal static bool   _brickFill = true;    // [Debug] brickfill: fill fully-solid 16³ bricks as homogeneous (no per-voxel write) on serve → cuts the deep-interior blit hitch. On by default.
         internal static int    _bakeChunksExpected;
         internal static int    _bakeChunksReceived;
         internal static System.IO.MemoryStream? _bakeDownloadBuffer;
@@ -840,6 +847,7 @@ namespace ProceduralTerrain
 
         // ── Bake progress (client watching server bake) ───────────────────────────
         internal static bool _bakeInProgress;
+        internal static System.Threading.CancellationTokenSource _bakeCts;   // pt_cancel cancels the running bake; the ForEach throws OCE → partial bake is finalized (valid, loadable)
         internal static int  _bakeProgressDone;
         internal static int  _bakeProgressTotal;
         internal static System.Diagnostics.Stopwatch? _bakeProgressTimer;
@@ -1005,6 +1013,7 @@ namespace ProceduralTerrain
             public int[]   colLen   = System.Array.Empty<int>();   // run length (voxels)
             public int[]   colOff   = System.Array.Empty<int>();   // offset into band[]
             public sbyte[] band     = System.Array.Empty<sbyte>(); // packed run densities
+            public int     floorY   = int.MinValue;                // SolidFloorRule Y the band was computed against; the serve MUST SetFloor to this (else holes). int.MinValue = passthrough (use context floor).
         }
         internal static readonly System.Collections.Concurrent.ConcurrentDictionary<string, ZoneField> _sdfCache = new();
 
@@ -1757,18 +1766,30 @@ namespace ProceduralTerrain
                 }
                 catch (Exception e) { Log.LogError($"[PT] bakereload: {e}"); }
             });
-            new Terminal.ConsoleCommand("pt_bake", "pt_bake [radius] — bake terrain SDF for a radius in meters; runs on server (admin only)", args =>
+            new Terminal.ConsoleCommand("pt_bake", "pt_bake [radius] [player] — bake terrain SDF for a radius in meters; runs on server (admin only). add 'player' to centre the disc on your position instead of world origin.", args =>
             {
                 float radius = _bakeRadius;
                 if (args.Length >= 2 && float.TryParse(args[1], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float r))
                     radius = r;
+                // Optional centre arg: "player"/"here" → bake around the local player; otherwise (default/"origin") world origin.
+                float centerX = 0f, centerZ = 0f;
+                bool centerOnPlayer = args.Length >= 3 && (args[2].Equals("player", StringComparison.OrdinalIgnoreCase) || args[2].Equals("here", StringComparison.OrdinalIgnoreCase));
+                if (centerOnPlayer)
+                {
+                    var p = Player.m_localPlayer;
+                    if (p != null) { var pos = p.transform.position; centerX = pos.x; centerZ = pos.z; }
+                    else { Log.LogWarning("[ProceduralTerrain] pt_bake player: no local player — falling back to world origin."); centerOnPlayer = false; }
+                }
                 if (ZNet.instance != null && !ZNet.instance.IsServer())
                 {
-                    // Client: request server to run the bake.
+                    // Client: request server to run the bake (send centre too — resolved on the client since the
+                    // server has no player position for us).
                     var pkg = new ZPackage();
                     pkg.Write(radius);
+                    pkg.Write(centerX);
+                    pkg.Write(centerZ);
                     ZRoutedRpc.instance.InvokeRoutedRPC(ZRoutedRpc.Everybody, "PTBakeExecute", pkg);
-                    Log.LogInfo("[ProceduralTerrain] Bake request sent to server.");
+                    Log.LogInfo($"[ProceduralTerrain] Bake request sent to server (radius={radius}, centre={(centerOnPlayer ? $"{centerX:F0},{centerZ:F0}" : "origin")}).");
                 }
                 else
                 {
@@ -1776,10 +1797,186 @@ namespace ProceduralTerrain
                     _bakeProgressDone  = 0;
                     _bakeProgressTotal = 0;
                     _bakeProgressTimer = System.Diagnostics.Stopwatch.StartNew();
+                    _bakeCts?.Dispose();
+                    _bakeCts = new System.Threading.CancellationTokenSource();
                     BakeProgressUI.Show();
-                    System.Threading.Tasks.Task.Run(() => WriteBakeFile(radius))
+                    System.Threading.Tasks.Task.Run(() => WriteBakeFile(radius, centerX, centerZ))
                         .ContinueWith(_ => { _bakeInProgress = false; });
                 }
+            });
+            new Terminal.ConsoleCommand("pt_cancel", "pt_cancel — stop a running pt_bake (runs on the server if you're a client, admin only); the zones carved so far are finalized into a valid, loadable partial bake", args =>
+            {
+                if (ZNet.instance != null && !ZNet.instance.IsServer())
+                {
+                    // Client: the bake runs on the server, so route the cancel there (mirror pt_bake).
+                    ZRoutedRpc.instance.InvokeRoutedRPC(ZRoutedRpc.Everybody, "PTBakeCancel", new ZPackage());
+                    Log.LogInfo("[ProceduralTerrain] pt_cancel: cancel request sent to server.");
+                    args.Context?.AddString("[ProceduralTerrain] bake cancel request sent to server.");
+                    return;
+                }
+                if (!_bakeInProgress || _bakeCts == null)
+                {
+                    args.Context?.AddString("[ProceduralTerrain] no bake in progress.");
+                    return;
+                }
+                _bakeCts.Cancel();
+                Log.LogInfo("[ProceduralTerrain] pt_cancel: cancelling bake — partial bake will be finalized.");
+                args.Context?.AddString("[ProceduralTerrain] bake cancelling; partial bake will be saved.");
+            });
+            new Terminal.ConsoleCommand("pt_bakeinfo", "pt_bakeinfo — current bake status: file, whether a bake is loaded/serving, rolling-bake state, download mode", args =>
+            {
+                int seed = WorldSeed();
+                uint cfgHash = ComputeCfgHash();
+                string seedName = WorldGenerator.instance?.m_world?.m_seedName;   // the human-typed seed string; m_seed = its GetStableHashCode
+                string path = BakeFilePath(seed, cfgHash);
+                string name = System.IO.Path.GetFileName(path);
+                bool exists = System.IO.File.Exists(path);
+                string size = exists ? $"{new System.IO.FileInfo(path).Length / (1024f * 1024f):F1} MB" : "—";
+                string seedLine = string.IsNullOrEmpty(seedName) ? $"seed={seed:X8} ({seed})" : $"seed=\"{seedName}\" → {seed:X8} ({seed})";
+
+                // Loaded/serving state: which store is live and how many zones it holds.
+                int loadedZones = (_bakeData?.Count ?? 0) + (_bakeIndex?.Count ?? 0);
+                string store = _bakeData != null ? "in-RAM" : (_bakeIndex != null ? $"streamed v{(_bakeFileV6 ? 6 : 5)}" : "none");
+                string serving = loadedZones > 0 ? $"YES ({loadedZones} zones, {store})" : "no — live-carving";
+
+                // Rolling bake state.
+                string rolling = !RollingBake.Enabled ? "disabled (cfg rollingbake=0)"
+                    : RollingBake.IsRunning ? $"ON, running (radius {RollingBake.RadiusMeters:F0}m, +{RollingBake.SessionPersisted} zones this session)"
+                    : (ZNet.instance != null && ZNet.instance.IsDedicated()) ? "enabled but off (dedicated server)"
+                    : _bakeDownloadActive ? "enabled, paused (download in progress)"
+                    : "enabled, arming…";
+
+                // Download / multiplayer context.
+                string net = ZNet.instance == null ? "not connected"
+                    : ZNet.instance.IsServer() ? "host/server (bake is local)"
+                    : $"client (serverCfgHash={(_serverCfgHash.HasValue ? _serverCfgHash.Value.ToString("X8") : "none")}, autoDownload={(_bakeAutoDownload ? "on" : "off")}{(_bakeDownloadActive ? ", DOWNLOADING" : "")})";
+
+                string msg = $"[ProceduralTerrain] {seedLine}  cfgHash={cfgHash:X8}\n"
+                           + $"  file: {name}  exists={exists} ({size})\n"
+                           + $"  serving from bake: {serving}\n"
+                           + $"  rolling: {rolling}\n"
+                           + $"  network: {net}";
+                Log.LogInfo(msg);
+                args.Context?.AddString(msg);
+            });
+            new Terminal.ConsoleCommand("pt_bakestats", "pt_bakestats — print the bake stats sidecar (timings, distribution, GC/CPU/RAM) for the current world/config; the raw per-zone array is in the .json file on disk", args =>
+            {
+                string jsonPath = System.IO.Path.ChangeExtension(BakeFilePath(WorldSeed(), ComputeCfgHash()), ".json");
+                if (!System.IO.File.Exists(jsonPath))
+                {
+                    args.Context?.AddString($"[ProceduralTerrain] no stats sidecar at {System.IO.Path.GetFileName(jsonPath)} (bake first).");
+                    return;
+                }
+                string json = System.IO.File.ReadAllText(jsonPath);
+                int zi = json.IndexOf("\"zones\"");   // trim the big raw array for the console; it stays in the file
+                string summary = zi > 0 ? json.Substring(0, zi).TrimEnd('\n', ' ', ',') + "\n}" : json;
+                Log.LogInfo($"[ProceduralTerrain] bake stats ({jsonPath}):\n{summary}");
+                args.Context?.AddString(summary);
+                args.Context?.AddString($"[ProceduralTerrain] full per-zone data: {jsonPath}");
+            });
+            new Terminal.ConsoleCommand("pt_carvezone", "pt_carvezone <ox> <oz> — carve one zone at full BAKE resolution on a background thread and time it (repro for a rolling-bake hang). Logs begin + elapsed; no completion line = it hung.", args =>
+            {
+                if (args.Length < 3 || !int.TryParse(args[1], out int ox) || !int.TryParse(args[2], out int oz))
+                { args.Context?.AddString("usage: pt_carvezone <ox> <oz>"); return; }
+                args.Context?.AddString($"[ProceduralTerrain] carving zone ({ox},{oz}) at full res on a bg thread — watch the log.");
+                Log.LogWarning($"[PT-carvezone] BEGIN zone ({ox},{oz}) full-res carve…");
+                System.Threading.Tasks.Task.Run(() =>
+                {
+                    var sw = System.Diagnostics.Stopwatch.StartNew();
+                    try { bool mod = RollingCarveBlock(ox, oz, out _); sw.Stop(); Log.LogWarning($"[PT-carvezone] DONE zone ({ox},{oz}) in {sw.ElapsedMilliseconds}ms (modified={mod})"); }
+                    catch (Exception e) { sw.Stop(); Log.LogError($"[PT-carvezone] zone ({ox},{oz}) threw after {sw.ElapsedMilliseconds}ms: {e.GetType().Name}: {e.Message}\n{e.StackTrace}"); }
+                });
+            });
+            new Terminal.ConsoleCommand("pt_download", "pt_download — pull the server's bake for this world and merge it into your local bake (opt-in; the transfer is slow for big bakes). No-op on the host/server. Rolling bake fills the rest as you roam.", args =>
+            {
+                if (ZNet.instance == null) { args.Context?.AddString("[ProceduralTerrain] not connected."); return; }
+                if (ZNet.instance.IsServer()) { args.Context?.AddString("[ProceduralTerrain] you're the host — the bake is already local."); return; }
+                if (_bakeDownloadActive) { args.Context?.AddString("[ProceduralTerrain] a bake download is already in progress."); return; }
+                Plugin.SendBakeQuery("pt_download");
+                args.Context?.AddString("[ProceduralTerrain] asked the server for its bake; downloading if available (watch the progress bar).");
+            });
+            new Terminal.ConsoleCommand("pt_bakemap", "pt_bakemap [radius] — render a PNG of which zones ARE/AREN'T baked for the current world, over a coastline map. auto-fits to the baked extent; pass a radius (m, centred on you) to override. -> BepInEx/config/ProceduralTerrain/pt_bakemap.png", args =>
+            {
+                try
+                {
+                    var wg = WorldGenerator.instance;
+                    if (wg == null) { Log.LogWarning("[PT] bakemap: no worldgen."); return; }
+                    // Gather baked zone origins (voxel coords) from whichever store is loaded.
+                    var keys = new List<(int ox, int oz)>();
+                    if (_bakeData  != null) keys.AddRange(_bakeData.Keys);
+                    if (_bakeIndex != null) foreach (var k in _bakeIndex.Keys) keys.Add(k);
+                    if (keys.Count == 0) { args.Context?.AddString("[ProceduralTerrain] no bake loaded — nothing to map (run pt_bakeinfo)."); return; }
+
+                    float s = (_scale.HasValue && _scale.Value > 0f) ? _scale.Value : 1f;
+                    float zoneWorld = 64f * s;   // one bake zone's world footprint
+
+                    // Window: default auto-fit to baked extent (+ player) with a margin; a radius arg centres on the player instead.
+                    var pp = Player.m_localPlayer != null ? Player.m_localPlayer.transform.position : Vector3.zero;
+                    float cx, cz, range;
+                    if (args.Length >= 2 && float.TryParse(args[1], out float rad))
+                    { cx = pp.x; cz = pp.z; range = rad; }
+                    else
+                    {
+                        float minX = float.MaxValue, maxX = float.MinValue, minZ = float.MaxValue, maxZ = float.MinValue;
+                        foreach (var (ox, oz) in keys)
+                        { float wx = ox * s, wz = oz * s; if (wx < minX) minX = wx; if (wx > maxX) maxX = wx; if (wz < minZ) minZ = wz; if (wz > maxZ) maxZ = wz; }
+                        cx = (minX + maxX) * 0.5f; cz = (minZ + maxZ) * 0.5f;
+                        range = Mathf.Max(maxX - minX, maxZ - minZ) * 0.5f + zoneWorld * 4f;   // margin
+                        range = Mathf.Max(range, 200f);
+                    }
+
+                    int res = 900; float step = range * 2f / res;
+                    int PX(float wx) => Mathf.RoundToInt((wx - (cx - range)) / step);
+                    int PZ(float wz) => Mathf.RoundToInt(((cz + range) - wz) / step);
+                    var px = new Color[res * res];
+
+                    // Background: ocean tint + coastline (same scheme as pt_voronoi).
+                    var ocean = new bool[res * res];
+                    for (int yy = 0; yy < res; yy++)
+                    for (int xx = 0; xx < res; xx++)
+                    {
+                        float wx = cx - range + xx * step, wz = (cz + range) - yy * step;
+                        bool o = wg.GetBiome(wx, wz) == Heightmap.Biome.Ocean;
+                        ocean[yy * res + xx] = o;
+                        px[yy * res + xx] = o ? new Color(0.82f, 0.90f, 0.95f) : new Color(0.20f, 0.19f, 0.16f);   // land = dark so baked green pops
+                    }
+                    var coastCol = new Color(0.1f, 0.5f, 0.55f);
+                    for (int yy = 0; yy < res; yy++)
+                    for (int xx = 0; xx < res; xx++)
+                    {
+                        bool o = ocean[yy * res + xx];
+                        bool edge = (xx + 1 < res && ocean[yy * res + xx + 1] != o) || (yy + 1 < res && ocean[(yy + 1) * res + xx] != o);
+                        if (edge) px[yy * res + xx] = coastCol;
+                    }
+
+                    // Baked zones: fill each as a green square (origin corner → +zoneWorld). Gaps show through as dark land.
+                    var bakedCol = new Color(0.25f, 0.85f, 0.30f);
+                    int shown = 0;
+                    foreach (var (ox, oz) in keys)
+                    {
+                        float wx0 = ox * s, wz0 = oz * s;
+                        int x0 = PX(wx0), x1 = PX(wx0 + zoneWorld);
+                        int y0 = PZ(wz0 + zoneWorld), y1 = PZ(wz0);   // PZ flips, so +Z maps to smaller y
+                        if (x1 < 0 || y1 < 0 || x0 >= res || y0 >= res) continue;
+                        shown++;
+                        for (int yy = Mathf.Max(0, y0); yy <= Mathf.Min(res - 1, y1); yy++)
+                        for (int xx = Mathf.Max(0, x0); xx <= Mathf.Min(res - 1, x1); xx++)
+                            px[yy * res + xx] = bakedCol;
+                    }
+
+                    // Markers: world origin (blue) and player (red).
+                    void Dot(float wx, float wz, Color c) { int x = PX(wx), y = PZ(wz), r = 4; for (int b = -r; b <= r; b++) for (int a = -r; a <= r; a++) if (a*a+b*b <= r*r) { int xx = x+a, yy = y+b; if (xx>=0&&yy>=0&&xx<res&&yy<res) px[yy*res+xx] = c; } }
+                    Dot(0f, 0f, new Color(0.1f, 0.3f, 0.95f));
+                    if (Player.m_localPlayer != null) Dot(pp.x, pp.z, new Color(0.95f, 0.15f, 0.1f));
+
+                    var tex = new Texture2D(res, res, TextureFormat.RGBA32, false); tex.SetPixels(px); tex.Apply();
+                    string dir = System.IO.Path.GetDirectoryName(ConfigPath)!;
+                    string outPath = System.IO.Path.Combine(dir, "pt_bakemap.png");
+                    System.IO.File.WriteAllBytes(outPath, tex.EncodeToPNG());
+                    var msg = $"[PT] bakemap: {shown}/{keys.Count} baked zones in window (centre {cx:F0},{cz:F0}, range {range:F0}m, zone {zoneWorld:F0}m) → {outPath}";
+                    Log.LogInfo(msg); args.Context?.AddString(msg);
+                }
+                catch (Exception e) { Log.LogWarning($"[PT] bakemap failed: {e.Message}"); }
             });
             new Terminal.ConsoleCommand("pt_clearbake",
                 "pt_clearbake [filename|server] — delete a local bake file (default: current world); 'server' deletes from server (admin only)",
@@ -2087,6 +2284,10 @@ namespace ProceduralTerrain
             // Demand-driven carve: the SpawnZone gate (SpawnZonePrefetchGate) requests carves as ZoneSystem
             // asks for zones and makes it retry until ready — no racing ring. Just keep workers alive.
             if (ZonePrefetcher.Active) ZonePrefetcher.Start();   // idempotent; skipped on dedicated servers
+
+            // Rolling bake: arm once a world/bake context is ready, then follow the player. Idempotent arm.
+            if (RollingBake.Active) { RollingBake.Arm(); RollingBake.Tick(); RollingBake.Watchdog(); }
+            if (RollingBake.ShowHud && RollingBake.IsRunning) BakeProgressUI.Show();   // ensure the HUD overlay exists (idempotent; covers hot-reload toggling it on)
 
             // Track underground state for the LOD-hide toggle: player Y well below the carved surface = in a cave.
             if (_lodUnderground)

@@ -333,6 +333,24 @@ namespace ProceduralTerrain
                             ZonePrefetcher.RadiusZones = Mathf.Clamp(prr, 1, 16);
                         if (k == "prefetchthreads" && int.TryParse(v, out int prt))
                             ZonePrefetcher.ThreadCount = Mathf.Clamp(prt, 0, 32);
+                        if (k == "rollingbake")
+                            RollingBake.Enabled = (v == "1" || v == "true");
+                        if (k == "rollinghud")
+                            RollingBake.ShowHud = (v == "1" || v == "true");
+                        if (k == "rollingthreads" && int.TryParse(v, out int rth))
+                            RollingBake.ThreadCount = Mathf.Clamp(rth, 1, 8);
+                        if (k == "rollingradius" && float.TryParse(v, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float rrm))
+                            RollingBake.RadiusMeters = Mathf.Clamp(rrm, 64f, 5000f);
+                        if (k == "rollingmovestep" && float.TryParse(v, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float rms))
+                            RollingBake.MoveStep = Mathf.Clamp(rms, 8f, 1000f);
+                        if (k == "rollingflushzones" && int.TryParse(v, out int rfz))
+                            RollingBake.FlushZones = Mathf.Clamp(rfz, 1, 1000);
+                        if (k == "rollingflushseconds" && float.TryParse(v, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float rfs))
+                            RollingBake.FlushSeconds = Mathf.Clamp(rfs, 1f, 120f);
+                        if (k == "bakeautodownload")
+                            Plugin._bakeAutoDownload = (v == "1" || v == "true");
+                        if (k == "brickfill")
+                            Plugin._brickFill = !(v == "0" || v == "false");
                         if (k == "protectlocations")
                             _protectLocations = !(v == "0" || v == "false");
                         if (k == "locdomeheight" && float.TryParse(v, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float ldh))

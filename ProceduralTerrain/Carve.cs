@@ -498,7 +498,7 @@ namespace ProceduralTerrain
 
             } // end if (!fromBake)
 
-            if (!fromBake && _bakeWriteStream != null && (_bakeVanilla || anyPipelineActive))   // stage only during an actual bake; by default skip unmodified zones (carve live, keep them out of the bake file)
+            if (!fromBake && (_bakeWriteStream != null || _rollCapturing) && (_bakeVanilla || anyPipelineActive))   // stage during an actual bake OR a rolling-bake capture; by default skip unmodified zones (carve live, keep them out of the bake file)
                 StageBakeEntry(ox, oz, bw, bh, extLo, s, buf);
             _phStage = System.Diagnostics.Stopwatch.GetTimestamp();
 
@@ -742,6 +742,7 @@ namespace ProceduralTerrain
             {
                 if (computed >= FixpointMaxZones)
                 {
+                    System.Threading.Interlocked.Increment(ref _fixpointHitCapCalls);
                     Log.LogWarning($"[ProceduralTerrain] EnsureFixpoint ({ox},{oz}): hit cap ({FixpointMaxZones}), {worklist.Count} zones skipped");
                     break;
                 }
@@ -769,7 +770,10 @@ namespace ProceduralTerrain
 
             _lastFixpointHops = computed;
             if (computed > 0)
+            {
+                System.Threading.Interlocked.Add(ref _fixpointNeighborsComputed, computed);
                 Log.LogInfo($"[ProceduralTerrain] EnsureFixpoint ({ox},{oz}): {computed} neighbor zone(s) computed");
+            }
         }
 
         static void ComputeZoneFaceCache(int ox, int oz, int w, int yLo, int yHi)
@@ -3090,6 +3094,7 @@ namespace ProceduralTerrain
         // one of these, so the destination always has a real dome. Deduped by quantized XZ across overlapping zones.
         // pocket-removal usefulness telemetry: how often / how much it actually fills across all zones+biomes
         internal static int _pocketZonesTotal, _pocketFillZones; internal static long _pocketVoxels;
+        internal static int _fixpointHitCapCalls, _fixpointNeighborsComputed;   // bake-stats: EnsureFixpoint hop-cap hits + total neighbor zones recomputed
         static readonly Dictionary<long, Vector3> _carvedAtriums = new();
         static readonly object _carvedAtriumLock = new();
         static void RecordCarvedAtrium(Vector3 c)

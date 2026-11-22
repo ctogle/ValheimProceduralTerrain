@@ -2,7 +2,7 @@
 
 > ⚠️ **Upgrading from 0.0.1 to 0.0.2 will destroy an existing world.** Core generation changed between these versions — please **start a new world**. Sorry!
 
-> **Work in progress — 0.0.2 preview.** Ships novel default terrain for the first four biomes only; the rest stay near-vanilla for now. Expect breaking config and bake-format changes between versions (retune and rebake). [Feedback welcome](https://discord.gg/vuHnDRqfjn).
+> **Work in progress — 0.0.2 preview.** Novel terrain for first six biomes by default. Expect breaking config and bake-format changes between versions (retune and rebake). [Feedback welcome](https://discord.gg/vuHnDRqfjn).
 
 Procedural terrain system for Valheim built on top of [Voxheim](https://thunderstore.io/c/valheim/p/Voxheim/Voxheim/). Carves caves, overhangs, arches, and raised stone formations into the voxel world using configurable noise-based profiles per biome.
 
@@ -21,7 +21,7 @@ Procedural terrain system for Valheim built on top of [Voxheim](https://thunders
 
 Two steps:
 
-1. **Configure the terrain** *(optional)*. The world's shape comes from `biomes.cfg` — noise modes combined into per-biome profiles. Tuning it well is the deep end and takes effort. **If you just want to play, skip this** — the mod writes tuned defaults on first launch (novel terrain for the first four biomes).
+1. **Configure the terrain** *(optional)*. The world's shape comes from `biomes.cfg` — noise modes combined into per-biome profiles. Tuning it well is the deep end and takes effort. **If you just want to play, skip this** — the mod writes tuned defaults on first launch (novel terrain for the first six biomes).
 2. **Bake it for a playthrough.** Once you've settled on a config, bake the terrain to disk. Generating it at full quality live is expensive, so the bake pre-computes it once and serves it back cheaply.
 
 ### Why bake, and how it's keyed
