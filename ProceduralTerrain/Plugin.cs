@@ -838,6 +838,8 @@ namespace ProceduralTerrain
         // ── Bake download (client receiving from server) ──────────────────────────
         internal static bool   _bakeDownloadActive;
         internal static bool   _bakeAutoDownload;   // [Debug] bakeautodownload: auto-pull the server bake on connect. Default OFF — rolling bake fills locally; download is opt-in via pt_download (the RPC transfer is slow/throttled for big bakes).
+        internal static readonly UnityEngine.KeyCode RollingHudKeyCode = UnityEngine.KeyCode.F8;   // toggle the rolling-bake HUD
+        internal static string RollingHudKey => "F8";
         internal static int    _bakeChunksExpected;
         internal static int    _bakeChunksReceived;
         internal static System.IO.MemoryStream? _bakeDownloadBuffer;
@@ -2285,6 +2287,7 @@ namespace ProceduralTerrain
 
             // Rolling bake: arm once a world/bake context is ready, then follow the player. Idempotent arm.
             if (RollingBake.Active) { RollingBake.Arm(); RollingBake.Tick(); RollingBake.Watchdog(); }
+            if (UnityEngine.Input.GetKeyDown(RollingHudKeyCode)) RollingBake.ShowHud = !RollingBake.ShowHud;   // hotkey toggle
             if (RollingBake.ShowHud && RollingBake.IsRunning) BakeProgressUI.Show();   // ensure the HUD overlay exists (idempotent; covers hot-reload toggling it on)
 
             // Track underground state for the LOD-hide toggle: player Y well below the carved surface = in a cave.

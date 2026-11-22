@@ -1309,6 +1309,13 @@ public class BakeProgressUI : MonoBehaviour
         _instance = null;
     }
 
+    static float _fps;
+    void Update()
+    {
+        float dt = Time.unscaledDeltaTime;
+        if (dt > 0f) _fps = Mathf.Lerp(_fps, 1f / dt, 0.1f);   // smoothed
+    }
+
     void OnGUI()
     {
         bool rollingHud = RollingBake.ShowHud && RollingBake.IsRunning;
@@ -1408,21 +1415,22 @@ public class BakeProgressUI : MonoBehaviour
                 haveZone = true;
             }
 
-            float rw = 420f, rh = 102f, pad = 14f;
+            float rw = 420f, rh = 124f, pad = 14f;
             float rx = Screen.width - rw - 12f;          // bottom-right
             float ry = Screen.height - rh - 90f;         // ~an inch up from the bottom
             GUI.Box(new Rect(rx, ry, rw, rh), GUIContent.none, _boxStyle);
-            GUI.Label(new Rect(rx + pad, ry + 6f,  rw - pad, 20f), $"PT rolling bake  ·  {RollingBake.Workers} worker(s)", _hudStyle);
+            GUI.Label(new Rect(rx + pad, ry + 6f,  rw - pad, 20f), $"PT rolling bake  ·  {RollingBake.Workers} worker(s)  ·  {_fps:F0} fps", _hudStyle);
             GUI.Label(new Rect(rx + pad, ry + 28f, rw - pad, 22f), $"queue {q}   carving {RollingBake.ActiveCount} (oldest {RollingBake.OldestActiveSec:F0}s)   {rate:F1} z/s", _hudStyle);
             GUI.Label(new Rect(rx + pad, ry + 50f, rw - pad, 22f), $"saved {totalBaked} zones   (~{pct:F2}% of world)", _hudStyle);
             if (haveZone)
             {
                 var prev = GUI.color;
                 GUI.color = zoneBaked ? new Color(0.45f, 0.95f, 0.45f) : new Color(0.98f, 0.70f, 0.30f);
-                GUI.Label(new Rect(rx + pad, ry + 73f, rw - pad, 22f),
+                GUI.Label(new Rect(rx + pad, ry + 72f, rw - pad, 22f),
                     zoneBaked ? "current zone: FULL-RES (baked)" : "current zone: coarse (live)", _hudStyle);
                 GUI.color = prev;
             }
+            GUI.Label(new Rect(rx + pad, ry + 96f, rw - pad, 20f), $"[{Plugin.RollingHudKey}] hide panel", _captionStyle);
         }
     }
 }
