@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.0.3
+
+- Introduced the rolling bake — the world bakes around you as you play, so pre-baking a world is rarely needed. On by default, tunable live, F8 for a status panel.
+- Overhauled config handling: terrain shape (biomes.cfg), world content (placements.cfg), and local settings (client.cfg) are now separate files, and a server imposes terrain and content on its clients. Cosmetic or unused-config edits no longer invalidate a baked world.
+- Partial FarLands integration: PT terrain now writes the vanilla heightmap, so distant land and other mods track the real surface.
+- Content and balance tweaks: disabled Fenring cave spawns; clustered swamp roots so monsters can path between them.
+- Lower serve-path hitching.
+
 ## 0.0.2
 
 - ⚠️ **Breaking: upgrading from 0.0.1 destroys existing worlds — please start a new world. Sorry!**
