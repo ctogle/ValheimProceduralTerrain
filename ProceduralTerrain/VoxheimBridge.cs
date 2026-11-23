@@ -340,6 +340,10 @@ namespace ProceduralTerrain
                     if (Plugin.TrySampleSurfaceY(wx, wz, out float sh))
                     { hm.SetHeight(xx, yy, sh - tp.y); wrote++; }   // raw m_heights value; worldY = this + tp.y
                 }
+                // Record this zone as "PT's lift is now in FarLands' captured base" — the RELIABLE gate the
+                // FarLands delta needs (vs FarLands' own PlayerEdited, which lied for captured wilderness).
+                int zx = Mathf.FloorToInt((tp.x + 32f) / 64f), zz = Mathf.FloorToInt((tp.z + 32f) / 64f);
+                Plugin._ptHeightmapWritten.TryAdd((zx, zz), 1);
                 if ((++_mhWriteN) % 25 == 1)
                     Plugin.Log.LogInfo($"[PT-mheights] wrote {wrote}/{num * num} verts into Heightmap at ({tp.x:F0},{tp.z:F0}) (base={tp.y:F1})");
             }

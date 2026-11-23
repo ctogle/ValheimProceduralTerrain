@@ -1220,6 +1220,7 @@ namespace ProceduralTerrain
             CloseBakeStream();
             _bakeLoadAttempted = false;
             _sdfCache.Clear();
+            _ptHeightmapWritten.Clear();   // FarLands gate — must not leak captured-zone state across worlds
             _heightCache.Clear();
             VanillaHeight.Clear();
             lock (_surfHCache) _surfHCache.Clear();

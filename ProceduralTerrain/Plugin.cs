@@ -1065,6 +1065,10 @@ namespace ProceduralTerrain
         [ThreadStatic] static sbyte[]? _rehydrateScratch;  // v3: sparse bake → dense coarse grid for reconstruction
 
         internal static int _gwCalls;                // times BuildGroundworkedFromContext was entered (for throttled logging)
+        // Zones where PT has written its surface into Heightmap.m_heights → FarLands captured the lift into its
+        // base, so the FarLands delta must return 0 there (else double-count). Written main-thread, read on
+        // FarLands builder threads → concurrent. Persists (FarLands keeps captures); cleared on world change.
+        internal static readonly System.Collections.Concurrent.ConcurrentDictionary<(int, int), byte> _ptHeightmapWritten = new();
 
         // Per-zone surface height cache: filled after Phase 2, queried by GetWorldHeight patch.
         // Layout: surfH[cx * bw + cz] = world-Y of topmost solid voxel (NaN = no solid in column).

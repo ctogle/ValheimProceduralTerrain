@@ -26,7 +26,6 @@ namespace ProceduralTerrain
         static bool _registered;
         static object _handle;
         static MethodInfo _removeMethod;
-        static Func<int, int, bool> _playerEdited;   // FarLandsLand.PlayerEdited — zones already carrying PT's lift
 
         internal static bool IsPresent => Chainloader.PluginInfos.ContainsKey(FarLandsGuid);
 
@@ -49,23 +48,15 @@ namespace ProceduralTerrain
                 _removeMethod = landType.GetMethod("Remove", BindingFlags.Public | BindingFlags.Static);
                 if (add == null) { Plugin.Log.LogWarning("[PT-FarLands] Add method not found; skipping."); return; }
 
-                // PlayerEdited(zoneX,zoneZ): true where FarLands already holds the zone's captured heights. Voxheim
-                // writes PT's surface into the loaded Heightmap.m_heights, which FarLands captures — so in those
-                // zones the PT lift is ALREADY in FarLands' base. Per the API ("return 0 from delta there, or it
-                // counts twice"), we must return 0 there to avoid double-applying PT (the 2×-above-sea rock dupes).
-                // Bind it as a fast delegate (delta is called ~20k×/tile — no per-call reflection).
-                var peMethod = landType.GetMethod("PlayerEdited", BindingFlags.Public | BindingFlags.Static);
-                if (peMethod != null)
-                    _playerEdited = (Func<int, int, bool>)Delegate.CreateDelegate(typeof(Func<int, int, bool>), peMethod);
-                else
-                    Plugin.Log.LogWarning("[PT-FarLands] PlayerEdited not found — can't guard against double-count in captured zones.");
-
-                // Delta NOT registered: PlayerEdited gate proved unreliable (captured wilderness zones return false
-                // → delta double-counts on top of the m_heights write → 2× rock dupes return). m_heights-write
-                // delivers PT to near/captured zones; far reverts to vanilla until we have a RELIABLE captured-zone
-                // gate (our own written-zone set) or extend voxel coverage instead. Bridge stays inert for now.
+                // Register the height delta (PT surface − vanilla, from the bake). The double-count gate — return 0
+                // in zones PT already wrote into m_heights (= captured into FarLands' base) — is PT's OWN
+                // written-zone set, checked inside Delta. Reliable, unlike FarLands' PlayerEdited (which lied for
+                // captured wilderness zones → the old 2×-above rock dupes). delta is called ~20k×/tile → fast delegate.
+                Func<float, float, float, float> delta = Delta;
+                Func<float, float, float, float, float, uint> print = Print;
+                _handle = add.Invoke(null, new object[] { "ProceduralTerrain", delta, null, print, null });
                 _registered = true;
-                Plugin.Log.LogInfo("[PT-FarLands] delta NOT registered (PlayerEdited gate unreliable → dupes); PT via m_heights only.");
+                Plugin.Log.LogInfo("[PT-FarLands] delta registered — far land follows PT terrain (gate: PT's m_heights-written zones).");
             }
             catch (Exception e)
             {
@@ -88,14 +79,12 @@ namespace ProceduralTerrain
         {
             try
             {
-                // Already-captured zones carry PT's lift in FarLands' own base (Voxheim wrote it into m_heights) →
-                // return 0 or it double-counts. Zone is 64m, centred at (zx*64, zz*64) per ZoneSystem.GetZone.
-                if (_playerEdited != null)
-                {
-                    int zx = Mathf.FloorToInt((x + 32f) / 64f);
-                    int zz = Mathf.FloorToInt((z + 32f) / 64f);
-                    if (_playerEdited(zx, zz)) return 0f;
-                }
+                // Zones where PT already wrote its surface into Heightmap.m_heights are captured into FarLands'
+                // base → return 0 or it double-counts (the 2×-above rock dupes). Use PT's OWN written-zone set
+                // (reliable), NOT FarLands' PlayerEdited (lied for captured wilderness zones). Zone = 64m.
+                int zx = Mathf.FloorToInt((x + 32f) / 64f);
+                int zz = Mathf.FloorToInt((z + 32f) / 64f);
+                if (Plugin._ptHeightmapWritten.ContainsKey((zx, zz))) return 0f;
                 if (!Plugin.TryGetBakeSurfaceY(x, z, out float ptY)) return 0f;
                 var wg = WorldGenerator.instance;
                 if (wg == null) return 0f;
