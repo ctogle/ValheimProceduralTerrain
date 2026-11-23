@@ -13,6 +13,8 @@ A procedural terrain generator for Valheim, built on [Voxheim](https://thunderst
 ![Plains](https://raw.githubusercontent.com/ctogle/ValheimProceduralTerrain/main/docs/img/07-plains-d.png)
 ![Mistlands](https://raw.githubusercontent.com/ctogle/ValheimProceduralTerrain/main/docs/img/08-mistlands.png)
 
+> **Upgrading to 0.0.3:** baking and the config files were overhauled. Delete your local `BepInEx/config/ProceduralTerrain/` configs so fresh copies regenerate, and start a new world. Rolling bake is on by default now — you can mostly ignore baking and just play.
+
 ## Configuration
 
 ProceduralTerrain uses three config files in `BepInEx/config/ProceduralTerrain/`, each a different scope:
@@ -36,6 +38,7 @@ Generating terrain at full quality is expensive, so it can be baked to disk once
 
 - **Carve live** — defer baking and hot-reload terrain changes while tuning a world before a playthrough. This is for world authors, not a truly playable mode.
 - **Rolling bake** — baking happens in the background as you move. It's resource-intensive and may not keep up with player movement, falling back to live carving as needed. The default, because it requires no preparation and works well most of the time. Press **F8** to toggle a panel showing its progress and framerate.
+  - The `rollingfill` setting (off by default) lets the rolling bake keep working while you're idle, filling the entire map in the background — so one long session can bake a whole world to hand off.
 - **Pre-bake** — bake the world, or a portion of it, ahead of time, for the best experience. A full world takes hours.
 
 ### Commands

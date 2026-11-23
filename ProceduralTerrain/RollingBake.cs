@@ -99,6 +99,7 @@ namespace ProceduralTerrain
                 foreach (var k in Plugin.RollingPersistedKeys()) _persisted.Add(k);
             }
             _lastX = float.NaN; _carved = 0; _flushedTotal = 0;
+            _fillAnchorOx = int.MinValue; _fillRing = 0;   // reset the idle-fill sweep for the new session
             lock (_writeLock) _carvedBlocks.Clear();
             _sessionSw = System.Diagnostics.Stopwatch.StartNew();
             _flushSw = System.Diagnostics.Stopwatch.StartNew(); _lastFlushMs = 0;
@@ -141,16 +142,63 @@ namespace ProceduralTerrain
         // rollingradius change applies immediately instead of waiting for movement.
         internal static void ForceRescan() { _lastX = float.NaN; }
 
-        // Main-thread: enqueue the ring around the player when they've moved enough.
+        // Idle-fill (rollingfill): when the pool is under-utilised, keep feeding the nearest UN-baked zones so the
+        // bake eventually fills the whole map in the background — one long session completes it for everyone to
+        // distribute. Off by default (most players just want the disc around them).
+        internal static bool  Fill = false;          // rollingfill
+        internal static float FillRadius = 10000f;   // rollingfillradius (m): how far the sweep goes (≈ default world radius)
+        static int _fillRing;                         // spiral cursor (Chebyshev ring, in zones) from the anchor
+        static int _fillAnchorOx = int.MinValue, _fillAnchorOz;
+
+        // Main-thread: enqueue the ring around the player when they've moved enough, then (if enabled) idle-fill.
         internal static void Tick()
         {
             if (!_running) return;
             var pl = Player.m_localPlayer;
             if (pl == null) return;
             var p = pl.transform.position;
-            if (!float.IsNaN(_lastX)) { float dx = p.x - _lastX, dz = p.z - _lastZ; if (dx * dx + dz * dz < MoveStep * MoveStep) return; }
-            _lastX = p.x; _lastZ = p.z;
-            EnqueueRing(p.x, p.z);
+            bool moved = float.IsNaN(_lastX) || (p.x - _lastX) * (p.x - _lastX) + (p.z - _lastZ) * (p.z - _lastZ) >= MoveStep * MoveStep;
+            if (moved) { _lastX = p.x; _lastZ = p.z; EnqueueRing(p.x, p.z); }
+            if (Fill) TickFill(p.x, p.z);
+        }
+
+        // When idle (queue drained AND ≤ half the workers in-flight), sweep the next ring(s) outward from the fill
+        // anchor and enqueue any un-baked zones. The cursor (_fillRing) persists so we don't re-scan the baked
+        // interior every tick; it re-anchors + resets only on a big jump (teleport). Bounded by FillRadius.
+        static void TickFill(float cx, float cz)
+        {
+            lock (_lock) { if (_pending.Count > 0) return; }                 // still work queued → not idle
+            int workers = Volatile.Read(ref _activeWorkers);
+            if (ActiveCount * 2 > workers) return;                           // more than half busy → not idle
+
+            float s = Plugin.ActiveScale();
+            var (cox, coz) = Plugin.ZoneOriginFromWorld(cx, cz, s);
+            if (_fillAnchorOx == int.MinValue || Math.Abs(cox - _fillAnchorOx) > 128 * 64 || Math.Abs(coz - _fillAnchorOz) > 128 * 64)
+            { _fillAnchorOx = cox; _fillAnchorOz = coz; _fillRing = 0; }      // re-anchor on teleport-scale moves
+
+            int maxRing = Mathf.CeilToInt(FillRadius / (64f * s));
+            int enq = 0;
+            while (_fillRing < maxRing && enq == 0)                          // advance until a ring yields un-baked zones
+            {
+                _fillRing++;
+                int r = _fillRing;
+                lock (_lock)
+                {
+                    for (int dx = -r; dx <= r; dx++) { enq += TryFill(_fillAnchorOx + dx * 64, _fillAnchorOz - r * 64); enq += TryFill(_fillAnchorOx + dx * 64, _fillAnchorOz + r * 64); }
+                    for (int dz = -r + 1; dz <= r - 1; dz++) { enq += TryFill(_fillAnchorOx - r * 64, _fillAnchorOz + dz * 64); enq += TryFill(_fillAnchorOx + r * 64, _fillAnchorOz + dz * 64); }
+                    if (enq > 0) Monitor.PulseAll(_lock);
+                }
+            }
+            if (enq > 0) Plugin.Log.LogDebug($"[PT-rolling] fill: +{enq} zones at ring {_fillRing}");
+        }
+
+        // Caller holds _lock. Enqueue one zone if not already baked/queued/far. Returns 1 if added.
+        static int TryFill(int ox, int oz)
+        {
+            var key = (ox, oz);
+            if (_persisted.Contains(key) || _pending.Contains(key) || ZonePrefetcher.IsFarZone(ox, oz)) return 0;
+            _pending.Add(key);
+            return 1;
         }
 
         static void EnqueueRing(float cx, float cz)

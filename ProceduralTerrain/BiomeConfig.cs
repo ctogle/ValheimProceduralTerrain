@@ -46,7 +46,7 @@ namespace ProceduralTerrain
         internal static readonly HashSet<string> _clientKeys = new(StringComparer.OrdinalIgnoreCase)
         {
             "rollingbake", "rollinghud", "rollingthreads", "rollingradius", "rollingmovestep", "rollingflushzones",
-            "rollingflushseconds", "bakeautodownload", "prefetch", "prefetchradius", "prefetchthreads",
+            "rollingflushseconds", "rollingfill", "rollingfillradius", "bakeautodownload", "prefetch", "prefetchradius", "prefetchthreads",
             "coarsexz", "coarsey", "debugviz", "debugvizocclude", "vegviz", "vegvizradius", "vizmode",
             "hidelodmeshes", "hidemist", "lodunderground", "bakeradius", "compressbake", "bakevanilla", "bakeformat",
             "seed",   // local world-creation override — moot on a server (world already exists), never inherited → client-local
@@ -448,6 +448,10 @@ namespace ProceduralTerrain
                             RollingBake.FlushZones = Mathf.Clamp(rfz, 1, 1000);
                         if (k == "rollingflushseconds" && float.TryParse(v, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float rfs))
                             RollingBake.FlushSeconds = Mathf.Clamp(rfs, 1f, 120f);
+                        if (k == "rollingfill")
+                            RollingBake.Fill = (v == "1" || v == "true");
+                        if (k == "rollingfillradius" && float.TryParse(v, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float rfr))
+                            RollingBake.FillRadius = Mathf.Max(64f, rfr);
                         if (k == "bakeautodownload")
                             Plugin._bakeAutoDownload = (v == "1" || v == "true");
                         // Location-protection keys (protectlocations/applygroundwork/flatplanelocations/
