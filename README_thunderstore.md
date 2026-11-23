@@ -1,8 +1,6 @@
 # ProceduralTerrain
 
-> ⚠️ **Upgrading from 0.0.1 to 0.0.2 will destroy an existing world.** Core generation changed between these versions — please **start a new world**. Sorry!
-
-> **Work in progress — 0.0.2 preview.** Novel terrain for first six biomes by default. Expect breaking config and bake-format changes between versions (retune and rebake). [Feedback welcome](https://discord.gg/vuHnDRqfjn).
+> **Work in progress — 0.0.3 preview.** Novel terrain for the first six biomes by default. Generation, config, and bake format can still change between versions, so expect to start a new world and rebake when you upgrade. [Feedback welcome](https://discord.gg/vuHnDRqfjn).
 
 A procedural terrain generator for Valheim, built on [Voxheim](https://thunderstore.io/c/valheim/p/Voxheim/Voxheim/). It replaces the vanilla heightmap with deterministic, fully three-dimensional voxel terrain — e.g. caves, overhangs, arches, canyons, canals — authored per biome through configurable noise profiles.
 
@@ -25,7 +23,7 @@ ProceduralTerrain uses three config files in `BepInEx/config/ProceduralTerrain/`
 - `[Pipeline]` — the global order the modes run in
 - `[Bake]` / `[Debug]` — parameters that affect the baked file (resolution, blending), and toggles for tuning terrain generation
 
-**`placements.cfg` — what populates the world.** Vegetation, cave content, and location protection. **Server-authoritative but not hashed**: clients inherit the server's copy, but these apply live and never touch the baked `.bin`, so editing them never forces a rebake.
+**`placements.cfg` — what populates the world.** Additional placements layered on top of vanilla — ore, scenery, creatures, vegetation — leaving vanilla's own spawns in place; plus location protection. These take effect only as zones load for the first time, so edits apply to newly-entered areas, not ground you've already visited. **Server-authoritative but not hashed**: clients inherit the server's copy, applied live, never baked into the `.bin`.
 - `[Vegetation]` — tree/bush placement and how it conforms to carved ground
 - `[Location]` — keeps world locations at their vanilla positions and reachable
 - `[CaveContent]` + `[Placement:*]` — rules for additional ore, scenery, and creature spawns
