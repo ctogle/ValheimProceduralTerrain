@@ -4,67 +4,63 @@
 
 > **Work in progress — 0.0.2 preview.** Novel terrain for first six biomes by default. Expect breaking config and bake-format changes between versions (retune and rebake). [Feedback welcome](https://discord.gg/vuHnDRqfjn).
 
-Procedural terrain system for Valheim built on top of [Voxheim](https://thunderstore.io/c/valheim/p/Voxheim/Voxheim/). Carves caves, overhangs, arches, and raised stone formations into the voxel world using configurable noise-based profiles per biome.
+A procedural terrain generator for Valheim, built on [Voxheim](https://thunderstore.io/c/valheim/p/Voxheim/Voxheim/). It replaces the vanilla heightmap with deterministic, fully three-dimensional voxel terrain — e.g. caves, overhangs, arches, canyons, canals — authored per biome through configurable noise profiles.
 
-## Features
+![Black Forest](https://raw.githubusercontent.com/ctogle/ValheimProceduralTerrain/main/docs/img/01-blackforest.png)
+![Swamp](https://raw.githubusercontent.com/ctogle/ValheimProceduralTerrain/main/docs/img/02-swamp-a.png)
+![Swamp](https://raw.githubusercontent.com/ctogle/ValheimProceduralTerrain/main/docs/img/03-swamp-b.png)
+![Plains](https://raw.githubusercontent.com/ctogle/ValheimProceduralTerrain/main/docs/img/04-plains-a.png)
+![Plains](https://raw.githubusercontent.com/ctogle/ValheimProceduralTerrain/main/docs/img/05-plains-b.png)
+![Plains](https://raw.githubusercontent.com/ctogle/ValheimProceduralTerrain/main/docs/img/06-plains-c.png)
+![Plains](https://raw.githubusercontent.com/ctogle/ValheimProceduralTerrain/main/docs/img/07-plains-d.png)
+![Mistlands](https://raw.githubusercontent.com/ctogle/ValheimProceduralTerrain/main/docs/img/08-mistlands.png)
 
-- **Hot-reload config** — edit and save the config files while in-game; terrain remeshes live without restarting
-- **Per-biome noise profiles** — combine named terrain modes into profiles and map each biome to one; biome boundaries blend smoothly
-- **Cave content** — ore, scenery, and creature spawners placed inside carved caverns (on top of vanilla), configurable per prefab and biome
-- **Locations preserved** — world locations (dungeons, bosses, villages, etc.) sit at their exact vanilla positions, and the terrain around them is protected during generation so they stay accessible
-- **SDF bake system** — pre-compute terrain for a radius and save to disk, so baked areas load cheaply instead of carving live
-- **Multiplayer bake distribution** — clients auto-download a server's bake on join; playable (with stutter) while the bake generates and downloads, hitch-free once it's in place
+## Configuration
 
-## How it works
+ProceduralTerrain uses three config files in `BepInEx/config/ProceduralTerrain/`, each a different scope:
 
-Two steps:
+**`biomes.cfg` — the terrain shape.** The only config that changes the terrain itself, so it's **server-authoritative and bake-relevant**: a server imposes it on every client (everyone generates the same world), and the bake is keyed to a hash of it — edit the shape and you rebake.
+- `[Mode:*]` — the terrain primitives (noise-based shaping operations)
+- `[Profile:*]` + `[BiomeName]` — primitives combined into named profiles, one per biome
+- `[Pipeline]` — the global order the modes run in
+- `[Bake]` / `[Debug]` — parameters that affect the baked file (resolution, blending), and toggles for tuning terrain generation
 
-1. **Configure the terrain** *(optional)*. The world's shape comes from `biomes.cfg` — noise modes combined into per-biome profiles. Tuning it well is the deep end and takes effort. **If you just want to play, skip this** — the mod writes tuned defaults on first launch (novel terrain for the first six biomes).
-2. **Bake it for a playthrough.** Once you've settled on a config, bake the terrain to disk. Generating it at full quality live is expensive, so the bake pre-computes it once and serves it back cheaply.
+**`placements.cfg` — what populates the world.** Vegetation, cave content, and location protection. **Server-authoritative but not hashed**: clients inherit the server's copy, but these apply live and never touch the baked `.bin`, so editing them never forces a rebake.
+- `[Vegetation]` — tree/bush placement and how it conforms to carved ground
+- `[Location]` — keeps world locations at their vanilla positions and reachable
+- `[CaveContent]` + `[Placement:*]` — rules for additional ore, scenery, and creature spawns
 
-### Why bake, and how it's keyed
+**`client.cfg` — local settings.** Runtime and display settings that don't affect the generated world. Not synced from a server and not part of the bake hash; parsed last, so local values take precedence.
 
-A bake is tied to **(world seed + config)** — the same seed string and the same cfg always produce the same terrain, so a bake made for them is valid on any world that matches. Change either and it no longer matches, and you'll rebake.
+## Baking
 
-### Skip the bake — grab the prebaked world
+Generating terrain at full quality is expensive, so it can be baked to disk once and served back cheaply. Three ways to play:
 
-Don't want to wait on a bake? Create a world with the seed **`Vaaltorin`**, download the `.bin` from the [latest release](https://github.com/ctogle/ValheimProceduralTerrain/releases/latest), and drop it into `BepInEx/config/ProceduralTerrain/`. It loads instantly — no baking. (Matches only the shipped default config on that seed; edit the terrain config or pick another seed and the mod just bakes its own.)
+- **Carve live** — defer baking and hot-reload terrain changes while tuning a world before a playthrough. This is for world authors, not a truly playable mode.
+- **Rolling bake** — baking happens in the background as you move. It's resource-intensive and may not keep up with player movement, falling back to live carving as needed. The default, because it requires no preparation and works well most of the time. Press **F8** to toggle a panel showing its progress and framerate.
+- **Pre-bake** — bake the world, or a portion of it, ahead of time, for the best experience. A full world takes hours.
 
-### Dedicated servers
+### Commands
 
-Bake on the server once (`pt_bake`, admin-only). It runs in the background. When a client connects, if it doesn't already have the matching bake it **downloads it from the server** on join (with a progress bar); clients that already have an identical copy skip the download.
-
-**During baking and downloading the world is fully playable** — terrain carves live as a fallback — but it **will stutter** until the bake is in place. Once it is, zone loading is cheap.
+```
+pt_bake [radius] [player]  — bake terrain for a radius in metres; on a server, admin only.
+                             'player' centres the disc on you instead of world origin.
+pt_cancel                  — stop a running bake; zones finished so far are saved as a
+                             valid partial bake.
+pt_bakeinfo                — bake status: file, whether it's loaded/serving, rolling state.
+pt_bakestats               — timing and resource stats from the last bake.
+pt_bakemap [radius]        — render a PNG map of which zones are and aren't baked.
+pt_listbakes [server]      — list local bake files and sizes; 'server' queries the server.
+pt_bakereload              — reload the bake file without restarting (after uploading a
+                             .bin to a running server).
+pt_download                — download the server's bake for this world into your local one.
+pt_clearbake [file|server] — delete a bake file (default: this world).
+```
 
 ## Requirements
 
 - [BepInExPack Valheim](https://thunderstore.io/c/valheim/p/denikson/BepInExPack_Valheim/)
 - [Voxheim](https://thunderstore.io/c/valheim/p/Voxheim/Voxheim/)
-
-## Configuration
-
-Config lives in `BepInEx/config/ProceduralTerrain/` as two files, both fully commented and both hot-reloading on save. The mod writes them with tuned defaults on first launch; edits are never overwritten on update.
-
-**`biomes.cfg`** — the terrain *shape*:
-- `[Bake]` — bake resolution, format, and compression
-- `[Debug]` — global terrain toggles, blend radius, live carve resolution, and the optional forced seed
-- `[Profile:name]` / `[BiomeName]` — named noise profiles and the biome→profile assignments
-- `[Mode:name]` / `[Pipeline]` — the terrain primitives and the order they run in
-
-**`placements.cfg`** — *what* gets placed in the world:
-- `[Vegetation]` — whether trees/bushes place at all, and how they conform to carved ground
-- `[CaveContent]` — master toggle plus the shared ore/spawner pool densities and per-zone caps
-- `[Placement:name]` — one rule per thing spawned in caves (ore, scenery, or creature spawner): its prefab/chassis, biome, weight, and depth/placement options
-
-## Baking
-
-Bake the terrain to disk once your config is set. Commands:
-
-```
-pt_bake [radius_in_meters]   — bake terrain on the current machine (admin only on servers)
-pt_clearbake                 — delete the local bake file
-pt_clearbake server          — delete the bake file on the server (admin only)
-```
 
 ## Thunderstore
 
