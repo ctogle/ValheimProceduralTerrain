@@ -1328,11 +1328,22 @@ public class BakeProgressUI : MonoBehaviour
         _instance = null;
     }
 
-    static float _fps;
+    static float _fps;            // displayed value — refreshed once per sample window
+    static float _fpsAccumTime;   // summed unscaled dt over the current window
+    static int   _fpsFrames;      // frames counted in the current window
+    const  float _fpsWindow = 1f; // seconds per sample (interval-averaged, not per-frame — steady readout)
     void Update()
     {
         float dt = Time.unscaledDeltaTime;
-        if (dt > 0f) _fps = Mathf.Lerp(_fps, 1f / dt, 0.1f);   // smoothed
+        if (dt <= 0f) return;
+        _fpsAccumTime += dt;
+        _fpsFrames++;
+        if (_fpsAccumTime >= _fpsWindow)
+        {
+            _fps = _fpsFrames / _fpsAccumTime;   // average fps across the window
+            _fpsAccumTime = 0f;
+            _fpsFrames = 0;
+        }
     }
 
     void OnGUI()

@@ -19,12 +19,15 @@ namespace ProceduralTerrain
         {
             string path = ConfigPath;
             string cfgText = File.Exists(path) ? File.ReadAllText(path) : "";
+            string placementPath = PlacementConfigPath;
+            string placementText = File.Exists(placementPath) ? File.ReadAllText(placementPath) : "";
             uint hash = ComputeCfgHash();
             var pkg = new ZPackage();
             pkg.Write(cfgText);
             pkg.Write(hash);
+            pkg.Write(placementText);   // placements are server-authoritative too (not hashed — applied live, not baked)
             ZRoutedRpc.instance.InvokeRoutedRPC(peerID, "PTCfgSync", pkg);
-            Log.LogInfo($"[ProceduralTerrain] Sent cfg to peer {peerID} (hash={hash:X8}, {cfgText.Length} chars).");
+            Log.LogInfo($"[ProceduralTerrain] Sent cfg to peer {peerID} (hash={hash:X8}, {cfgText.Length} biome + {placementText.Length} placement chars).");
         }
 
         internal static void RPC_ReceiveCfgSync(long sender, ZPackage pkg)
@@ -33,6 +36,14 @@ namespace ProceduralTerrain
             uint hash      = pkg.ReadUInt();
             _serverCfgLines = cfgText.Split('\n');
             _serverCfgHash  = hash;
+            // Placements ride in the same packet (appended after the hash). Guard the read so a mismatched
+            // (older) server that didn't send them doesn't throw — just keep local placements in that case.
+            if (pkg.GetPos() < pkg.Size())
+            {
+                string placementText = pkg.ReadString();
+                _serverPlacementLines = placementText.Split('\n');
+                LoadPlacementConfig();
+            }
             LoadBiomeConfig();
             _hotReloadPending = true;
             Log.LogInfo($"[ProceduralTerrain] Applied server cfg (hash={hash:X8}) — scheduling recarve.");
@@ -531,6 +542,12 @@ namespace ProceduralTerrain
                 Plugin._serverCfgHash  = null;
                 Plugin.LoadBiomeConfig();
                 Plugin.Log.LogInfo("[ProceduralTerrain] Server cfg cleared — reverted to local config.");
+            }
+            if (Plugin._serverPlacementLines != null)
+            {
+                Plugin._serverPlacementLines = null;
+                Plugin.LoadPlacementConfig();
+                Plugin.Log.LogInfo("[ProceduralTerrain] Server placements cleared — reverted to local config.");
             }
         }
     }

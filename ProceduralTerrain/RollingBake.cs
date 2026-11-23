@@ -23,7 +23,7 @@ namespace ProceduralTerrain
         internal static float MoveStep     = 64f;    // re-scan after moving this far (one zone)
         internal static int   FlushZones   = 40;     // flush to disk after this many carved zones…
         internal static float FlushSeconds = 5f;     // …or this long since the last flush
-        internal static int   Workers => _workers?.Length ?? 0;
+        internal static int   Workers => System.Threading.Volatile.Read(ref _activeWorkers);
 
         // Dedicated servers run their own bake path and must not drive a player-follow rolling bake (no player).
         // Off while a server-bake download is in flight: the download targets the SAME seed+cfgHash file, so a
@@ -64,7 +64,12 @@ namespace ProceduralTerrain
                     Plugin.Log.LogWarning($"[PT-rolling] zone ({kv.Value.ox},{kv.Value.oz}) has been carving {(now - kv.Value.startMs) / 1000}s — likely the hang. Reproduce with: pt_carvezone {kv.Value.ox} {kv.Value.oz}");
             }
         }
-        static Thread[] _workers;
+        // Worker pool is resizable LIVE (rollingthreads hot-reload): _desiredWorkers is the target, _activeWorkers
+        // the current live count. Grow = spawn more; shrink = excess workers self-retire (see WorkerLoop top).
+        static readonly List<Thread> _workers = new();
+        static readonly object _workersLock = new();
+        static volatile int _desiredWorkers;
+        static int _activeWorkers;   // live worker threads (Interlocked)
         // Shared write buffer: workers carve in parallel and drop finished blocks here; flushed as a batch
         // (RollingBakeFlush is itself locked, so appends serialize). Guarded by _writeLock.
         static readonly object _writeLock = new();
@@ -99,15 +104,42 @@ namespace ProceduralTerrain
             _flushSw = System.Diagnostics.Stopwatch.StartNew(); _lastFlushMs = 0;
             _running = true;
             int n = Mathf.Clamp(ThreadCount, 1, 8);
-            _workers = new Thread[n];
-            for (int i = 0; i < n; i++)
-            {
-                _workers[i] = new Thread(WorkerLoop) { IsBackground = true, Name = $"PTRollingBake{i}", Priority = System.Threading.ThreadPriority.BelowNormal };
-                _workers[i].Start();
-            }
+            _desiredWorkers = n;
+            Interlocked.Exchange(ref _activeWorkers, 0);
+            lock (_workersLock) _workers.Clear();
+            for (int i = 0; i < n; i++) SpawnWorker();
             if (ShowHud) BakeProgressUI.Show();   // overlay renders rolling status while running
             Plugin.Log.LogInfo($"[PT-rolling] armed: radius={RadiusMeters}m, {n} worker(s), flush@{FlushZones}z/{FlushSeconds}s, {_persisted.Count} zones already baked.");
         }
+
+        // Spawn one background carve worker and track it. Increments _activeWorkers before the thread starts so the
+        // live count is accurate the instant Arm/ApplyThreadCount returns.
+        static void SpawnWorker()
+        {
+            Interlocked.Increment(ref _activeWorkers);
+            var t = new Thread(WorkerLoop) { IsBackground = true, Name = "PTRollingBake", Priority = System.Threading.ThreadPriority.BelowNormal };
+            lock (_workersLock) _workers.Add(t);
+            t.Start();
+        }
+
+        // Hot-reload rollingthreads: resize the live pool without tearing down the queue/stream. Grow by spawning;
+        // shrink by lowering the target so excess workers retire themselves on their next loop. No-op if not running
+        // (Arm reads ThreadCount directly) or unchanged. Called on the main thread from the cfg parse.
+        internal static void ApplyThreadCount()
+        {
+            if (!_running) return;
+            int n = Mathf.Clamp(ThreadCount, 1, 8);
+            if (n == _desiredWorkers) return;
+            int old = _desiredWorkers;
+            _desiredWorkers = n;
+            while (Volatile.Read(ref _activeWorkers) < n) SpawnWorker();   // grow now
+            lock (_lock) Monitor.PulseAll(_lock);                          // wake idle workers so excess can retire
+            Plugin.Log.LogInfo($"[PT-rolling] workers {old} → {n} (live resize).");
+        }
+
+        // Force the next Tick to re-enqueue the ring even if the player hasn't moved MoveStep — so a live
+        // rollingradius change applies immediately instead of waiting for movement.
+        internal static void ForceRescan() { _lastX = float.NaN; }
 
         // Main-thread: enqueue the ring around the player when they've moved enough.
         internal static void Tick()
@@ -151,6 +183,18 @@ namespace ProceduralTerrain
         {
             while (_running)
             {
+                // Pool downsized live (rollingthreads lowered) → shed excess workers. CAS so exactly the right
+                // number retire even if several wake at once.
+                if (Volatile.Read(ref _activeWorkers) > _desiredWorkers)
+                {
+                    int cur = Volatile.Read(ref _activeWorkers);
+                    if (cur > _desiredWorkers && Interlocked.CompareExchange(ref _activeWorkers, cur - 1, cur) == cur)
+                    {
+                        lock (_workersLock) _workers.Remove(Thread.CurrentThread);
+                        FlushCarved(force: true);
+                        return;
+                    }
+                }
                 (int ox, int oz) z = default; bool have = false;
                 lock (_lock)
                 {
@@ -217,11 +261,12 @@ namespace ProceduralTerrain
             if (!_running) return;
             _running = false;
             lock (_lock) Monitor.PulseAll(_lock);
-            if (_workers != null) foreach (var w in _workers) { try { w?.Join(4000); } catch { } }
+            List<Thread> snapshot; lock (_workersLock) { snapshot = new List<Thread>(_workers); _workers.Clear(); }
+            foreach (var w in snapshot) { try { w?.Join(4000); } catch { } }
+            Interlocked.Exchange(ref _activeWorkers, 0); _desiredWorkers = 0;
             FlushCarved(force: true);   // persist anything the workers finished but hadn't flushed
             Plugin.RollingBakeClose();
             lock (_lock) { _pending.Clear(); _persisted.Clear(); }
-            _workers = null;
             Plugin.Log.LogInfo($"[PT-rolling] stopped (persisted {_flushedTotal} zones this session).");
         }
     }

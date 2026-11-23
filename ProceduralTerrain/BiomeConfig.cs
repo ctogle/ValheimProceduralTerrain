@@ -439,9 +439,9 @@ namespace ProceduralTerrain
                         if (k == "rollinghud")
                             RollingBake.ShowHud = (v == "1" || v == "true");
                         if (k == "rollingthreads" && int.TryParse(v, out int rth))
-                            RollingBake.ThreadCount = Mathf.Clamp(rth, 1, 8);
+                            { RollingBake.ThreadCount = Mathf.Clamp(rth, 1, 8); RollingBake.ApplyThreadCount(); }
                         if (k == "rollingradius" && float.TryParse(v, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float rrm))
-                            RollingBake.RadiusMeters = Mathf.Clamp(rrm, 64f, 5000f);
+                            { RollingBake.RadiusMeters = Mathf.Clamp(rrm, 64f, 5000f); RollingBake.ForceRescan(); }
                         if (k == "rollingmovestep" && float.TryParse(v, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float rms))
                             RollingBake.MoveStep = Mathf.Clamp(rms, 8f, 1000f);
                         if (k == "rollingflushzones" && int.TryParse(v, out int rfz))
@@ -450,22 +450,15 @@ namespace ProceduralTerrain
                             RollingBake.FlushSeconds = Mathf.Clamp(rfs, 1f, 120f);
                         if (k == "bakeautodownload")
                             Plugin._bakeAutoDownload = (v == "1" || v == "true");
-                        if (k == "protectlocations")
-                            _protectLocations = !(v == "0" || v == "false");
-                        if (k == "locdomeheight" && float.TryParse(v, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float ldh))
-                            _locDomeHeight = Mathf.Max(0f, ldh);
-                        if (k == "locbandfade" && float.TryParse(v, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float lbf))
-                            _locBandFade = Mathf.Max(0.001f, lbf);
-                        if (k == "applygroundwork")
-                            _applyGroundwork = !(v == "0" || v == "false");
+                        // Location-protection keys (protectlocations/applygroundwork/flatplanelocations/
+                        // locdomeheight/locbandfade) moved to placements.cfg [Location] — server-authoritative but
+                        // not hashed (live overlay, not baked). See PlacementConfig.LoadPlacementConfig.
                         if (k == "corridorgraph")
                             { _corridorGraph = (v == "1" || v == "true"); LocationVoronoi.Invalidate(); }
                         if (k == "corridorsteiner" && float.TryParse(v, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float cgs))
                             { _corridorSteiner = Mathf.Max(0f, cgs); LocationVoronoi.Invalidate(); }
                         if (k == "corridorclearance" && float.TryParse(v, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float cgc))
                             { _corridorClearance = Mathf.Max(0f, cgc); LocationVoronoi.Invalidate(); }
-                        if (k == "flatplanelocations")
-                            _flatPlaneLocations = !(v == "0" || v == "false");
                         if (k == "islandremoval")
                             _islandRemoval = !(v == "0" || v == "false");
                         if (k == "pocketremoval")

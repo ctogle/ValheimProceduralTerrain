@@ -23,10 +23,14 @@ namespace ProceduralTerrain
                 WriteDefaultPlacementConfig(path);
             }
 
+            // When connected to a server, the server's placements override the local file (applied in-memory,
+            // local file untouched) — same pattern as biomes.cfg. Placements are server-authoritative.
+            string[] lines = _serverPlacementLines ?? File.ReadAllLines(path);
+
             // Read sections (same shape as the terrain cfg: [Section] then key = value, # comments).
             var sections = new List<(string name, List<(string key, string val)> kvs)>();
             List<(string, string)>? cur = null;
-            foreach (string raw in File.ReadAllLines(path))
+            foreach (string raw in lines)
             {
                 string line = raw.Trim();
                 if (line.Length == 0 || line[0] == '#') continue;
@@ -77,6 +81,21 @@ namespace ProceduralTerrain
                             _vegMaxTilt = Mathf.Clamp(vmt, 0f, 90f);
                         else if (k == "supportradius" && float.TryParse(v, System.Globalization.NumberStyles.Float, inv, out float vsr))
                             _vegSupportRadius = Mathf.Clamp(vsr, 0.5f, 8f);
+                    }
+                }
+                else if (secName.Equals("Location", StringComparison.OrdinalIgnoreCase))
+                {
+                    // Location protection: keeps world locations (dungeons/bosses/villages) reachable. Server-authoritative
+                    // (so clients inherit it) but NOT hashed — applied live as an overlay, doesn't change the baked .bin.
+                    foreach (var (k, v) in kvs)
+                    {
+                        if (k == "protectlocations") _protectLocations = !(v == "0" || v == "false");
+                        else if (k == "applygroundwork") _applyGroundwork = !(v == "0" || v == "false");
+                        else if (k == "flatplanelocations") _flatPlaneLocations = !(v == "0" || v == "false");
+                        else if (k == "locdomeheight" && float.TryParse(v, System.Globalization.NumberStyles.Float, inv, out float ldh))
+                            _locDomeHeight = Mathf.Max(0f, ldh);
+                        else if (k == "locbandfade" && float.TryParse(v, System.Globalization.NumberStyles.Float, inv, out float lbf))
+                            _locBandFade = Mathf.Max(0.001f, lbf);
                     }
                 }
             }

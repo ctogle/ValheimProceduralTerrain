@@ -2288,6 +2288,7 @@ namespace ProceduralTerrain
 
             // Rolling bake: arm once a world/bake context is ready, then follow the player. Idempotent arm.
             if (RollingBake.Active) { RollingBake.Arm(); RollingBake.Tick(); RollingBake.Watchdog(); }
+            else if (RollingBake.IsRunning) RollingBake.Stop();   // rollingbake toggled off (or download/dedicated) → stop the live session
             if (UnityEngine.Input.GetKeyDown(RollingHudKeyCode)) RollingBake.ShowHud = !RollingBake.ShowHud;   // hotkey toggle
             if (RollingBake.ShowHud && RollingBake.IsRunning) BakeProgressUI.Show();   // ensure the HUD overlay exists (idempotent; covers hot-reload toggling it on)
 
@@ -2348,6 +2349,9 @@ namespace ProceduralTerrain
         internal static string[]? _serverCfgLines;
         // When connected to a server, holds the server's cfg hash (used for bake file lookup).
         internal static uint? _serverCfgHash;
+        // When connected to a server, holds the server's placement cfg lines (applied in-memory; local file untouched).
+        // Placements are server-authoritative but NOT hashed (they don't change the baked .bin — veg/content placed live).
+        internal static string[]? _serverPlacementLines;
 
         // ── Helpers ───────────────────────────────────────────────────────────────
 
