@@ -230,14 +230,14 @@ namespace ProceduralTerrain
                 if (!Plugin._sdfCache.TryGetValue(zoneKey, out c)) return;
             }
 
-            // Groundwork overlay (distinct LIVE step): groundworked surface heights for this zone (cache-backed
-            // for revisit determinism). Footprint = where groundwork changed PURE vanilla (context.Heights
-            // already has groundwork, so it can't be the reference). Patched columns emit the groundworked surface.
+            // Groundwork overlay (distinct LIVE step): the groundworked surface = context.Heights (vanilla's complete
+            // mod-applied heightmap); vanGrid = the pre-modifier base. Patched columns (where they differ = the
+            // location pads) emit the groundworked surface instead of PT's procedural terrain.
             Voxheim.Core.HeightGrid gwGrid = null, vanGrid = null;
             if (Plugin._applyGroundwork)
             {
                 long _tgw0 = System.Diagnostics.Stopwatch.GetTimestamp();
-                gwGrid = BuildGroundworkedHeights(context, out int nmods, out vanGrid);  // cache-backed; van = PURE vanilla
+                gwGrid = BuildGroundworkedHeights(context, out int nmods, out vanGrid);
                 if (gwGrid == null || nmods == 0) { gwGrid = null; }
                 gwMs = (System.Diagnostics.Stopwatch.GetTimestamp() - _tgw0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
             }
@@ -347,192 +347,55 @@ namespace ProceduralTerrain
         }
         static int _mhWriteN;
 
-        // Build a per-zone height grid with overlapping LOCATION terrain ops baked in, using vanilla
-        // HMBuildData (base heights + corner biomes) + Voxheim's ApplyGroundworkInPlace. Returns null
-        // (nmods=0) when there are no location modifiers or worldgen isn't ready. Callable by zone
-        // coords so both the live generator and the bake pre-gather share this exact path.
+        // Groundworked surface = context.Heights = hmap.m_heights = vanilla's COMPLETE ApplyModifiers result (every
+        // location mod, incl. dungeon-generated, guaranteed present by Voxheim's POI departure barrier). A base
+        // reference (the heightmap's pre-modifier heights) tells us which columns a location changed (the pads).
+        // No gather, no templates, no rotation, no re-carve, no race — we read vanilla's own answer.
         internal static Voxheim.Core.HeightGrid BuildGroundworkedHeights(Voxheim.Core.VoxelBaselineContext context, out int nmods, out Voxheim.Core.HeightGrid vanillaGrid)
-            => BuildGroundworkedHeights(context.CenterX, context.CenterY, context.CenterZ, context.Width, context.Scale, out nmods, out vanillaGrid);
+            => BuildGroundworkedFromContext(context, out nmods, out vanillaGrid);
 
-        internal static Voxheim.Core.HeightGrid BuildGroundworkedHeights(
-            float centerX, float centerY, float centerZ, int width, float scale, out int nmods, out Voxheim.Core.HeightGrid vanillaGrid)
+        static System.Reflection.FieldInfo _hmBuildDataField;   // Heightmap.m_buildData (private) → base heights, free
+        internal static Voxheim.Core.HeightGrid BuildGroundworkedFromContext(
+            Voxheim.Core.VoxelBaselineContext context, out int nmods, out Voxheim.Core.HeightGrid vanillaGrid)
         {
-            nmods = 0;
-            vanillaGrid = null;
-            var wg = WorldGenerator.instance;
-            if (wg == null) return null;
+            nmods = 0; vanillaGrid = null;
+            int width = context.Width; float scale = context.Scale;
+            var center = new Vector3(context.CenterX, context.CenterY, context.CenterZ);
+            // Base reference = the SAME Heightmap's pre-modifier heights (m_buildData.m_baseHeights). Voxheim already
+            // built it; PT's m_heights surface-write never touches m_buildData, so it stays pure vanilla base. Free —
+            // no RequestTerrainSync. Fall back to a sync build only if the heightmap/build-data isn't ready yet.
+            List<float> baseHeights = null;
+            var hmap = Heightmap.FindHeightmap(center);
+            if (hmap != null && hmap.m_width == width)
+            {
+                _hmBuildDataField ??= typeof(Heightmap).GetField("m_buildData", BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+                if (_hmBuildDataField?.GetValue(hmap) is HeightmapBuilder.HMBuildData bdLocal && bdLocal.m_baseHeights != null)
+                    baseHeights = bdLocal.m_baseHeights;
+            }
+            if (baseHeights == null)
+            {
+                var hmb = HeightmapBuilder.instance; var wg = WorldGenerator.instance;
+                if (hmb == null || wg == null) return null;
+                HeightmapBuilder.HMBuildData bd;
+                try { bd = hmb.RequestTerrainSync(center, width, scale, false, wg); }
+                catch (Exception e) { Plugin.Log.LogError($"[PT] gwFromCtx base: {e.Message}"); return null; }
+                if (bd == null || bd.m_baseHeights == null) return null;
+                baseHeights = bd.m_baseHeights;
+            }
+            var van = new Voxheim.Core.HeightGrid(width, scale, baseHeights.ToArray());   // pure vanilla base
+            var gw  = context.Heights;                                                         // mod-applied surface
+            int diffs = 0;
+            for (int ci = 0; ci < width; ci++)
+            for (int ri = 0; ri < width; ri++)
+                if (Math.Abs(gw[ci, ri] - van[ci, ri]) > 0.05f) diffs++;
+            nmods = diffs;
+            vanillaGrid = van;
+            if (diffs == 0) return null;   // no location changed this zone
             if ((++Plugin._gwCalls) % 50 == 1)
-                Plugin.Log.LogInfo($"[PT-gw] BuildGroundworkedHeights calls={Plugin._gwCalls} | extractorOk={Plugin._gwExtractorOk} extractorEmpty(changed=0)={Plugin._gwExtractorEmpty} transientFallback={Plugin._gwTransientFallbacks}");
-
-            // Revisit determinism: the gather below reads live TerrainModifier GameObjects, which are present
-            // on first load but NOT on revisit (location already m_placed; objects respawn async after our
-            // Generate). So we cache the groundworked heights from the first successful gather and reuse them
-            // on later regenerations — keeping the baseline identical so Voxheim's authority doesn't rebase
-            // to vanilla. Keyed by Valheim zone index; survives zone unload (only location zones cached).
-            var zoneIdx = ZoneSystem.GetZone(new Vector3(centerX, 0f, centerZ));
-            string gwKey = $"{zoneIdx.x},{zoneIdx.y}";
-            if (Plugin._groundworkCache.TryGetValue(gwKey, out var cached))
-            {
-                nmods = cached.nmods;
-                vanillaGrid = cached.vanilla;
-                return cached.grid;
-            }
-
-            // PREFERENCE: deterministic groundwork from Voxheim's AuthorityHeadlessExtractor — but ONLY when it
-            // actually finds modifiers (changed>0). It's authority-only and returns empty on a client, so an empty
-            // result must NOT short-circuit: we fall through to the LIVE transient gather below, which reads the
-            // real placed TerrainModifier objects (rotation-correct, and the path that works local/server-live).
-            // The AuthorityHeadlessExtractor is authority-only — on a CLIENT (connected to a dedicated server)
-            // it does ~full-zone work and then returns empty, so we always fall through to the live gather below
-            // anyway. That pre-compute measured up to 180ms/zone of PURE WASTE on the client (the dominant
-            // location-zone serve hitch). Only the authority (host / listen-server) can get a non-empty result,
-            // so skip the extractor entirely when we're not it — behaviour-neutral (the live path is unchanged).
-            // DEDICATED-only: the AuthorityHeadlessExtractor needs the headless ZDO/registry state and returns
-            // EMPTY on a listen/local game (measured: extractorOk=0 over hundreds of calls) — where it then costs
-            // 7-15ms of pure waste before we fall through to the live gather below (which works there). Only a
-            // dedicated server actually benefits (its live GetAllInstances gather is unreliable). Behaviour-neutral
-            // off-dedicated: the live path was already doing all the real work.
-            bool isAuthority = ZNet.instance != null && ZNet.instance.IsDedicated();
-            long _tExt = System.Diagnostics.Stopwatch.GetTimestamp();
-            if (isAuthority
-                && TryVoxheimGroundwork(centerX, centerZ, width, scale, out var effDet, out var baseDet, out int changedDet)
-                && effDet != null && baseDet != null && changedDet > 0)
-            {
-                if ((++Plugin._gwExtractorOk) % 25 == 1)
-                    Plugin.Log.LogInfo($"[PT-gw] extractor OK changed={changedDet} at {gwKey} (total ok={Plugin._gwExtractorOk}).");
-                nmods = changedDet;
-                var gGrid = new Voxheim.Core.HeightGrid(width, scale, effDet);
-                var vGrid = new Voxheim.Core.HeightGrid(width, scale, baseDet);
-                vanillaGrid = vGrid;
-                Plugin._groundworkCache[gwKey] = (gGrid, vGrid, nmods);
-                return gGrid;
-            }
-            double extMs = (System.Diagnostics.Stopwatch.GetTimestamp() - _tExt) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
-
-            // LIVE transient gather — the workhorse (restored). Reads spawned TerrainModifier objects for this zone.
-            var center  = new Vector3(centerX, centerY, centerZ);
-            float half  = width * scale * 0.5f;
-
-            // Fallback gather of LOCATION terrain modifiers overlapping this zone. Player edits (m_playerModifiction)
-            // are deliberately excluded: Voxheim replays them as an overlay on top of our baseline, so
-            // baking them here would double-apply them and make the baseline non-deterministic.
-            var mods = new List<Voxheim.Core.ModifierDescriptor>();
-            var all  = TerrainModifier.GetAllInstances();
-            int gwLvl = 0, gwSm = 0; float gwTgtMin = 9999f, gwTgtMax = -9999f, gwMaxR = 0f;
-            for (int i = 0; i < all.Count; i++)
-            {
-                var tm = all[i];
-                if (tm == null || tm.m_playerModifiction) continue;
-                var p = tm.transform.position;
-                float r = tm.GetRadius();
-                if (Math.Abs(p.x - center.x) > half + r + 4f) continue;
-                if (Math.Abs(p.z - center.z) > half + r + 4f) continue;
-                mods.Add(new Voxheim.Core.ModifierDescriptor(
-                    p.x, p.y, p.z, tm.m_playerModifiction, tm.m_sortOrder, 0L,
-                    tm.m_levelOffset, tm.m_level, tm.m_levelRadius,
-                    tm.m_smooth, tm.m_smoothRadius, tm.m_smoothPower,
-                    tm.m_square, tm.m_paintCleared, tm.m_paintRadius));
-                if (tm.m_level)  { gwLvl++; float ty = p.y + tm.m_levelOffset; if (ty < gwTgtMin) gwTgtMin = ty; if (ty > gwTgtMax) gwTgtMax = ty; }
-                if (tm.m_smooth) gwSm++;
-                float rr = Mathf.Max(tm.m_levelRadius, tm.m_smoothRadius); if (rr > gwMaxR) gwMaxR = rr;
-            }
-            nmods = mods.Count;
-            if (mods.Count == 0) return null;
-            // Guard: a vanilla modifier with an inconsistent/NaN key makes List.Sort throw "Failed to compare two
-            // elements", which otherwise aborts the ENTIRE zone carve (no terrain, no canals, no viz). Fall back to
-            // unsorted rather than lose the zone.
-            try { mods.Sort(Voxheim.Core.ModifierDescriptor.CompareVanilla); }
-            catch (InvalidOperationException e) { Plugin.Log.LogWarning($"[PT] groundwork modifier sort failed ({e.Message}) — proceeding unsorted for this zone."); }
-
-            // Vanilla base heights + corner biomes for this zone (same inputs Voxheim's authority uses).
-            var hmb = HeightmapBuilder.instance;
-            if (hmb == null) return null;
-            HeightmapBuilder.HMBuildData bd;
-            long _tReq = System.Diagnostics.Stopwatch.GetTimestamp();
-            try { bd = hmb.RequestTerrainSync(center, width, scale, false, wg); }
-            catch (Exception e) { Plugin.Log.LogError($"[PT] HMBuildData: {e.Message}"); return null; }
-            double reqMs = (System.Diagnostics.Stopwatch.GetTimestamp() - _tReq) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
-            if (bd == null || bd.m_baseHeights == null || bd.m_cornerBiomes == null || bd.m_cornerBiomes.Length != 4) return null;
-
-            var hArr = bd.m_baseHeights.ToArray();
-            var vanillaHArr = (float[])hArr.Clone();   // pure vanilla (before groundwork) — the footprint reference
-            int seed = (wg.m_world != null) ? wg.m_world.m_seed : 0;
-            try
-            {
-                var input = new Voxheim.Core.HeadlessZoneInput(
-                    center.x, center.y, center.z, width, scale,
-                    (Voxheim.Core.HeadlessBiome)(int)bd.m_cornerBiomes[0].Biome,
-                    (Voxheim.Core.HeadlessBiome)(int)bd.m_cornerBiomes[1].Biome,
-                    (Voxheim.Core.HeadlessBiome)(int)bd.m_cornerBiomes[2].Biome,
-                    (Voxheim.Core.HeadlessBiome)(int)bd.m_cornerBiomes[3].Biome,
-                    hArr, mods, null, null, 8f, seed);
-                long _tApply = System.Diagnostics.Stopwatch.GetTimestamp();
-                Voxheim.Core.HeadlessBaselineBuilder.ApplyGroundworkInPlace(hArr, mods, input);
-                double applyMs = (System.Diagnostics.Stopwatch.GetTimestamp() - _tApply) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
-                // [0.0.3 diag] split the gw cost: RequestTerrainSync (vanilla base heights, ~constant/zone) vs
-                // ApplyGroundworkInPlace (modifier application, scales with nmods). Logged when either is non-trivial.
-                if (extMs + reqMs + applyMs > 5.0)
-                    Plugin.Log.LogInfo($"[PT-gwsplit] zone {gwKey} mods={mods.Count}/{all.Count} | extractor={extMs:F1}ms requestTerrain={reqMs:F1}ms applyGroundwork={applyMs:F1}ms");
-            }
-            catch (Exception e) { Plugin.Log.LogError($"[PT] groundwork build: {e.Message}"); return null; }
-
-            var resultGrid = new Voxheim.Core.HeightGrid(width, scale, hArr);
-            var vanGrid    = new Voxheim.Core.HeightGrid(width, scale, vanillaHArr);
-            vanillaGrid = vanGrid;
-            Plugin._groundworkCache[gwKey] = (resultGrid, vanGrid, nmods);   // remember for deterministic revisit
-            return resultGrid;
+                Plugin.Log.LogInfo($"[PT-gwctx] zone@({context.CenterX:F0},{context.CenterZ:F0}) padCols={diffs} (groundwork straight from the heightmap)");
+            return gw;
         }
 
-        static Type? _extractorType;
-        static MethodInfo? _tryBuildMethod;
-        static bool _extractorResolved;
-
-        // Calls Voxheim.Unity.AuthorityHeadlessExtractor.TryBuild (internal static) via reflection to obtain
-        // the deterministic groundworked baseline: vanilla heights + location modifiers (registry/prefab +
-        // ZDOs, correct rotation), built the same way every load. Null carrier ⇒ groundwork only (no player
-        // edits). Out: EffectiveHeights, and the count of columns that differ from BaseHeights (footprint).
-        static bool TryVoxheimGroundwork(float centerX, float centerZ, int width, float scale,
-            out float[]? effective, out float[]? baseHeights, out int changed)
-        {
-            effective = null; baseHeights = null; changed = 0;
-            if (!_extractorResolved)
-            {
-                _extractorResolved = true;
-                _extractorType = Plugin.FindType("Voxheim.Unity.AuthorityHeadlessExtractor", "Voxheim");
-                _tryBuildMethod = _extractorType?.GetMethod("TryBuild", BindingFlags.NonPublic | BindingFlags.Static);
-                if (_tryBuildMethod == null)
-                    Plugin.Log.LogWarning("[ProceduralTerrain] AuthorityHeadlessExtractor.TryBuild not found — using fallback groundwork gather.");
-            }
-            if (_tryBuildMethod == null) return false;
-
-            if (ZoneSystem.instance == null) return false;
-            var zoneIdx = ZoneSystem.GetZone(new Vector3(centerX, 0f, centerZ));
-            var zoneKey = new Voxheim.Core.ZoneKey(zoneIdx.x, zoneIdx.y);
-
-            var args = new object?[] { zoneKey, null, width, scale, null, null };  // out baseline=[4], failure=[5]
-            bool ok;
-            try { ok = (bool)_tryBuildMethod.Invoke(null, args)!; }
-            catch (Exception e) { Plugin.Log.LogWarning($"[ProceduralTerrain] TryBuild threw: {e.InnerException?.Message ?? e.Message}"); return false; }
-            if (!ok || args[4] is not Voxheim.Core.HeadlessBaselineResult baseline)
-            {
-                Plugin.Log.LogWarning($"[PT-gw] TryBuild({zoneKey}) failed: {(args[5] as string) ?? "no baseline"}");
-                return false;
-            }
-
-            var eff = baseline.EffectiveHeights;
-            var baseH = baseline.BaseHeights;
-            int n = eff.Count;
-            effective = new float[n];
-            baseHeights = new float[n];
-            for (int i = 0; i < n; i++)
-            {
-                effective[i] = eff[i];
-                baseHeights[i] = (i < baseH.Count) ? baseH[i] : eff[i];
-                if (i < baseH.Count && Math.Abs(eff[i] - baseH[i]) > 0.01f) changed++;
-            }
-            Plugin.Log.LogDebug($"[PT-gw] zone {zoneKey} extractor ok: changed={changed}/{n} (0 ⇒ extractor found no location modifiers here)");
-            return true;
-        }
     }
 
 } // namespace ProceduralTerrain

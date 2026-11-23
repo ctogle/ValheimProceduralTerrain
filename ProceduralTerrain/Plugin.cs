@@ -1064,17 +1064,7 @@ namespace ProceduralTerrain
         [ThreadStatic] static float[]? _colFloatScratch;   // Piece 2: per-column reconstruct (no dense buf)
         [ThreadStatic] static sbyte[]? _rehydrateScratch;  // v3: sparse bake → dense coarse grid for reconstruction
 
-        // Zones whose SDF has already been carved with location groundwork baked in. Used to drop a
-        // stale (mod-less/early) cache entry once, so the zone re-carves with the edits applied.
-        internal static readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> _groundworkedZones = new();
-        // Groundworked heights cached from the first successful gather (modifiers loaded), reused on revisit
-        // when the transient TerrainModifier objects aren't loaded — keeps the baseline deterministic so
-        // Voxheim's authority doesn't rebase to vanilla. Keyed by Valheim zone index "x,z"; survives unload.
-        internal static readonly Dictionary<string, (Voxheim.Core.HeightGrid grid, Voxheim.Core.HeightGrid vanilla, int nmods)> _groundworkCache = new();
-        internal static int _gwTransientFallbacks;   // count of zones that fell back to the spawn-dependent TerrainModifier gather (deterministic extractor unavailable/failed)
-        internal static int _gwExtractorOk;          // deterministic extractor succeeded with modifiers (changed>0)
-        internal static int _gwExtractorEmpty;       // deterministic extractor succeeded but found NO modifiers (changed==0)
-        internal static int _gwCalls;                // times BuildGroundworkedHeights was entered at all
+        internal static int _gwCalls;                // times BuildGroundworkedFromContext was entered (for throttled logging)
 
         // Per-zone surface height cache: filled after Phase 2, queried by GetWorldHeight patch.
         // Layout: surfH[cx * bw + cz] = world-Y of topmost solid voxel (NaN = no solid in column).
@@ -1640,6 +1630,46 @@ namespace ProceduralTerrain
                 }
                 catch (Exception e) { Log.LogError($"[PT] gotoatrium: {e}"); }
             });
+            new Terminal.ConsoleCommand("pt_gotoloc", "pt_gotoloc <name> [n] — teleport to the Nth-nearest location whose prefab name contains <name> (case-insensitive), e.g. pt_gotoloc WoodFarm. Reads the location registry.", args =>
+            {
+                try
+                {
+                    var player = Player.m_localPlayer; var wg = WorldGenerator.instance;
+                    if (player == null || wg == null) { Log.LogWarning("[PT] gotoloc: no player/worldgen."); return; }
+                    if (args.Length < 2) { Console.instance?.Print("[PT] usage: pt_gotoloc <name> [n]"); return; }
+                    string needle = args[1].ToLowerInvariant();
+                    int n = 1; if (args.Length >= 3 && int.TryParse(args[2], out int ni)) n = Math.Max(1, ni);
+                    var zs = ZoneSystem.instance;
+                    _locationInstancesField ??= typeof(ZoneSystem).GetField("m_locationInstances", BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+                    var dict = _locationInstancesField?.GetValue(zs);
+                    if (dict == null) { Log.LogWarning("[PT] gotoloc: no location registry."); return; }
+                    if (dict.GetType().GetProperty("Values")?.GetValue(dict) is not System.Collections.IEnumerable vals) return;
+                    var pp = player.transform.position; var pp2 = new Vector2(pp.x, pp.z);
+                    System.Reflection.FieldInfo mPos = null, mLoc = null;
+                    var matches = new List<(Vector3 pos, string name)>();
+                    foreach (var inst in vals)
+                    {
+                        if (inst == null) continue;
+                        mPos ??= inst.GetType().GetField("m_position");
+                        mLoc ??= inst.GetType().GetField("m_location");
+                        if (mPos?.GetValue(inst) is not Vector3 p) continue;
+                        var zloc = mLoc?.GetValue(inst) as ZoneSystem.ZoneLocation;
+                        if (zloc == null || string.IsNullOrEmpty(zloc.m_prefabName)) continue;
+                        if (!zloc.m_prefabName.ToLowerInvariant().Contains(needle)) continue;
+                        matches.Add((p, zloc.m_prefabName));
+                    }
+                    if (matches.Count == 0) { Console.instance?.Print($"[PT] gotoloc: no location matching '{needle}'."); return; }
+                    matches.Sort((a, b) => (new Vector2(a.pos.x, a.pos.z) - pp2).sqrMagnitude.CompareTo((new Vector2(b.pos.x, b.pos.z) - pp2).sqrMagnitude));
+                    var pick = matches[Math.Min(n - 1, matches.Count - 1)];
+                    float sh = ComposedSurfaceSample(pick.pos.x, pick.pos.z, wg);   // land on the PT-raised surface, not under it
+                    var dest = new Vector3(pick.pos.x, Math.Max(pick.pos.y, sh) + 3f, pick.pos.z);
+                    player.TeleportTo(dest, player.transform.rotation, true);
+                    var msg = $"[PT] teleporting to {pick.name} #{n}/{matches.Count} at ({pick.pos.x:F0},{pick.pos.z:F0}), dist={Vector2.Distance(new Vector2(pick.pos.x, pick.pos.z), pp2):F0}m.";
+                    Log.LogInfo(msg); Console.instance?.Print(msg);
+                }
+                catch (Exception e) { Log.LogError($"[PT] gotoloc: {e}"); }
+            });
+
             new Terminal.ConsoleCommand("pt_dumplocs", "pt_dumplocs [radius] — write location sites (worldX,worldZ,protectRadius CSV) around the player to BepInEx/config/ProceduralTerrain/pt_locs.csv (for offline canal-path prototyping)", args =>
             {
                 try
@@ -2281,6 +2311,7 @@ namespace ProceduralTerrain
                 _hotReloadPending = false;
                 RecarveAll();
             }
+
 
             // Demand-driven carve: the SpawnZone gate (SpawnZonePrefetchGate) requests carves as ZoneSystem
             // asks for zones and makes it retry until ready — no racing ring. Just keep workers alive.

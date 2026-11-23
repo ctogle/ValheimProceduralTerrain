@@ -1220,8 +1220,6 @@ namespace ProceduralTerrain
             CloseBakeStream();
             _bakeLoadAttempted = false;
             _sdfCache.Clear();
-            _groundworkedZones.Clear();   // keyed by zone index — must not leak across worlds
-            _groundworkCache.Clear();     // ditto: a prior world's groundworked heights would be served for the same index
             _heightCache.Clear();
             VanillaHeight.Clear();
             lock (_surfHCache) _surfHCache.Clear();
