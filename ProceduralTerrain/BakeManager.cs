@@ -94,6 +94,9 @@ namespace ProceduralTerrain
         static string BakeFilePath(int seed, uint cfgHash) =>
             Path.Combine(PTConfigDir, $"procedural_terrain_bake_{seed:X8}_{cfgHash:X8}.bin");
 
+        // The bake file keyed to the CURRENT seed + cfg hash (just the name, for the F8 panel).
+        internal static string CurrentBakeFileName() => Path.GetFileName(BakeFilePath(WorldSeed(), ComputeCfgHash()));
+
         static readonly object _bakeStreamLock = new();
         static byte[] _bakeBlkScratch;   // reused compressed-block buffer (guarded by _bakeStreamLock)
 
@@ -1292,6 +1295,7 @@ public class BakeProgressUI : MonoBehaviour
     static GUIStyle? _textStyle;
     static GUIStyle? _captionStyle;
     static GUIStyle? _hudStyle;
+    static GUIStyle? _fileStyle;
     static bool _stylesInit;
     static Texture2D? _bgTex;
     static Texture2D? _barBgTex;
@@ -1376,6 +1380,13 @@ public class BakeProgressUI : MonoBehaviour
                 fontSize  = 11,
                 alignment = TextAnchor.MiddleCenter
             };
+            _fileStyle = new GUIStyle   // [F8] marker, upper-right — same font as the rest of the panel, right-justified
+            {
+                normal    = { textColor = new Color(0.98f, 0.86f, 0.55f) },
+                fontStyle = FontStyle.Bold,
+                fontSize  = 15,
+                alignment = TextAnchor.MiddleRight
+            };
             _hudStyle = new GUIStyle
             {
                 normal    = { textColor = new Color(0.98f, 0.86f, 0.55f) },
@@ -1449,6 +1460,7 @@ public class BakeProgressUI : MonoBehaviour
             float ry = Screen.height - rh - 90f;         // ~an inch up from the bottom
             GUI.Box(new Rect(rx, ry, rw, rh), GUIContent.none, _boxStyle);
             GUI.Label(new Rect(rx + pad, ry + 6f,  rw - pad, 20f), $"PT rolling bake  ·  {RollingBake.Workers} worker(s)  ·  {_fps:F0} fps", _hudStyle);
+            GUI.Label(new Rect(rx, ry + 6f, rw - pad, 20f), $"[{Plugin.RollingHudKey}]", _fileStyle);   // toggle hint, upper-right with a pad right-margin
             GUI.Label(new Rect(rx + pad, ry + 28f, rw - pad, 22f), $"queue {q}   carving {RollingBake.ActiveCount} (oldest {RollingBake.OldestActiveSec:F0}s)   {rate:F1} z/s", _hudStyle);
             GUI.Label(new Rect(rx + pad, ry + 50f, rw - pad, 22f), $"saved {totalBaked} zones   (~{pct:F2}% of world)", _hudStyle);
             if (haveZone)
@@ -1459,7 +1471,7 @@ public class BakeProgressUI : MonoBehaviour
                     zoneBaked ? "current zone: FULL-RES (baked)" : "current zone: coarse (live)", _hudStyle);
                 GUI.color = prev;
             }
-            GUI.Label(new Rect(rx + pad, ry + 96f, rw - pad, 20f), $"[{Plugin.RollingHudKey}] hide panel", _captionStyle);
+            GUI.Label(new Rect(rx + pad, ry + 96f, rw - pad, 20f), Plugin.CurrentBakeFileName(), _hudStyle);   // filename, aligned like the other lines
         }
     }
 }

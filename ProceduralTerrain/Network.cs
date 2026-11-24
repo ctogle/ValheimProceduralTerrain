@@ -30,6 +30,24 @@ namespace ProceduralTerrain
             Log.LogInfo($"[ProceduralTerrain] Sent cfg to peer {peerID} (hash={hash:X8}, {cfgText.Length} biome + {placementText.Length} placement chars).");
         }
 
+        // Re-send the (just-reloaded) cfg to every connected client so a server-side hot-reload
+        // imposes the new terrain without anyone relogging. Server-only; no-op elsewhere.
+        internal static void BroadcastCfgSyncToPeers()
+        {
+            var znet = ZNet.instance;
+            if (znet == null || !znet.IsServer()) return;
+            var peers = znet.GetConnectedPeers();
+            if (peers == null) return;
+            int n = 0;
+            foreach (var p in peers)
+            {
+                if (p == null || p.m_uid == 0) continue;
+                SendCfgSyncToPeer(p.m_uid);
+                n++;
+            }
+            if (n > 0) Log.LogInfo($"[ProceduralTerrain] Broadcast reloaded cfg to {n} peer(s).");
+        }
+
         internal static void RPC_ReceiveCfgSync(long sender, ZPackage pkg)
         {
             string cfgText = pkg.ReadString();
@@ -192,8 +210,10 @@ namespace ProceduralTerrain
                 isAdmin = userId != null && (ZNet.instance?.GetAdminList()?.Contains(userId) ?? false);
             }
             if (!isAdmin) { Log.LogWarning($"[ProceduralTerrain] ClearBake from non-admin peer {sender} rejected."); return; }
+            // 'all' flag (if present) → every world's bake; otherwise just this world's seed (all cfgHash variants).
+            bool all = _pkg != null && _pkg.GetPos() < _pkg.Size() && _pkg.ReadBool();
             int seed = Plugin.WorldSeed();
-            string pattern = $"procedural_terrain_bake_{seed:X8}_*.bin";
+            string pattern = all ? "procedural_terrain_bake_*.bin" : $"procedural_terrain_bake_{seed:X8}_*.bin";
             var matches = System.IO.Directory.GetFiles(PTConfigDir, pattern);
             string msg;
             if (matches.Length > 0)
@@ -201,6 +221,8 @@ namespace ProceduralTerrain
                 CloseBakeStream();   // release the open read handle so the file isn't locked on delete
                 foreach (var f in matches) File.Delete(f);
                 _bakeData = null; _bakeLoadAttempted = false;
+                RollingBake.RestartForDeletedBake();   // host/listen-server: resume carving+saving fresh (no-op on dedicated)
+                RecarveAll();                          // re-serve loaded zones live
                 msg = $"Deleted {matches.Length} server bake file(s).";
                 Log.LogInfo($"[ProceduralTerrain] {msg}");
             }

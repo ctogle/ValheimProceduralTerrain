@@ -632,6 +632,17 @@ namespace ProceduralTerrain
                     if (mp[mi] != null && mp[mi].Length > 0 && mp[mi][0] > 0f) { modified.Add(b2); break; }
             Plugin._modifiedBiomes = modified;
 
+            // DIAGNOSTIC: dump each biome's RESOLVED pipeline-mode list with amplitudes, so we can confirm from the
+            // log (server or client) exactly which modes actually run per biome and with what gate value.
+            foreach (var (b2, mp) in newBiomeParams)
+            {
+                var parts = new List<string>();
+                for (int mi = 0; mi < mp.Length && mi < _pipeline.Length; mi++)
+                    if (mp[mi] != null && mp[mi].Length > 0)
+                        parts.Add($"{_pipeline[mi].Name}={mp[mi][0]:0.##}");
+                Log.LogInfo($"[PT-modes] {b2}: {(parts.Count > 0 ? string.Join(", ", parts) : "(none)")}");
+            }
+
             WarnNyquistFrequencies();
 
             // Persist per-biome veg density for the PlaceVegetation patch (non-terrain, live interpretation).

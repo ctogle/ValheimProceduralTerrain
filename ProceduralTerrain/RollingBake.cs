@@ -17,7 +17,7 @@ namespace ProceduralTerrain
     internal static class RollingBake
     {
         internal static bool  Enabled      = false;
-        internal static bool  ShowHud      = false;  // [Debug] rollinghud: on-screen status overlay to watch rolling keep up
+        internal static bool  ShowHud      = true;   // [Debug] rollinghud: on-screen status overlay — default ON so rolling is obvious at login
         internal static int   ThreadCount  = 1;      // background carve workers (BelowNormal). More = faster roll, more CPU contention with live play.
         internal static float RadiusMeters = 500f;   // disc carved around the player
         internal static float MoveStep     = 64f;    // re-scan after moving this far (one zone)
@@ -84,15 +84,25 @@ namespace ProceduralTerrain
         static readonly HashSet<(int, int)> _persisted = new();   // in the file OR already carved-and-skipped (unmodified)
         static float _lastX = float.NaN, _lastZ;
         static long _carved, _flushedTotal;
+        static uint _openHash;   // cfg hash the current bake file is keyed to; re-key when it changes
 
         internal static void Arm()
         {
-            if (_running) return;
+            if (_running)
+            {
+                // Config hot-reloaded to terrain that changes the hash → the open bake file is keyed to the OLD
+                // hash but we're now carving the NEW config. Finalize the old-hash file and re-open the new one so
+                // the bake always matches the live config (no stale geometry served, no mislabeled file).
+                if (Plugin.ComputeCfgHash() == _openHash) return;
+                Plugin.Log.LogInfo($"[PT-rolling] cfg hash {_openHash:X8}→{Plugin.ComputeCfgHash():X8} — re-keying bake to the new config.");
+                Stop();   // flush+close the old-hash file, clear persisted; falls through to re-open below
+            }
             // Wait for the world to be fully loaded before capturing the seed: early in load WorldGenerator.m_world
             // exists but m_seed is still 0, which would open a junk seed-0 bake file. The player spawning is a
             // robust "world ready, seed valid" signal (and Tick needs the player anyway).
             if (Player.m_localPlayer == null) return;
             if (!Plugin.RollingBakeOpen()) return;   // world not ready yet; retry next tick
+            _openHash = Plugin.ComputeCfgHash();     // remember what this bake file is keyed to (re-key on change)
             lock (_lock)
             {
                 _pending.Clear(); _persisted.Clear();
@@ -302,6 +312,18 @@ namespace ProceduralTerrain
                 long total = Interlocked.Add(ref _flushedTotal, n);
                 Plugin.Log.LogInfo($"[PT-rolling] flushed {n} zones (carved={Interlocked.Read(ref _carved)}, persisted this session={total}).");
             }
+        }
+
+        // The active bake file was deleted out from under the rolling bake (pt_clearbake). The shared stream was
+        // closed and _persisted still lists the now-gone zones, so carving would continue but save nothing and
+        // never re-enqueue. Tear the stale state down and re-arm on a fresh file so carving resumes AND persists.
+        // No-op when rolling wasn't running (live-carve mode — the caller still recarves).
+        internal static void RestartForDeletedBake()
+        {
+            if (!_running) return;
+            Stop();   // safe with a null stream: flush/close are guarded, _pending/_persisted cleared
+            Arm();    // reopens a fresh file (FileMode.Create), rescans the ring, persisted starts empty
+            Plugin.Log.LogInfo("[PT-rolling] re-armed after bake deletion — resuming fresh.");
         }
 
         internal static void Stop()

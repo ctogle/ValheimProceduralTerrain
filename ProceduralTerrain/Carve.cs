@@ -135,7 +135,7 @@ namespace ProceduralTerrain
             foreach (var loc in _locationPositions)
             {
                 float dx = loc.pos.x - zoneX, dz = loc.pos.y - zoneZ;
-                float locSearchR = Mathf.Max(loc.extR, LocProtectR) + LocFadeR;
+                float locSearchR = Mathf.Max(loc.extR, LocProtectR) + LocFade(loc.extR);
                 if (dx * dx + dz * dz < (searchR + locSearchR) * (searchR + locSearchR))
                     nearbyLocs.Add((loc.pos, LocProtectRadius(loc.pos, loc.extR)));
             }
@@ -818,7 +818,7 @@ namespace ProceduralTerrain
             foreach (var loc in _locationPositions)
             {
                 float dx = loc.pos.x - zoneX, dz = loc.pos.y - zoneZ;
-                float locSearchR = Mathf.Max(loc.extR, LocProtectR) + LocFadeR;
+                float locSearchR = Mathf.Max(loc.extR, LocProtectR) + LocFade(loc.extR);
                 if (dx * dx + dz * dz < (searchR + locSearchR) * (searchR + locSearchR)) nearby.Add((loc.pos, LocProtectRadius(loc.pos, loc.extR)));
             }
 

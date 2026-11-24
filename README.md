@@ -2,6 +2,8 @@
 
 > **Work in progress — 0.0.3 preview.** Novel terrain for the first six biomes by default. Generation, config, and bake format can still change between versions, so expect to start a new world and rebake when you upgrade. [Feedback welcome](https://discord.gg/vuHnDRqfjn).
 
+> **Upgrading to 0.0.3:** baking and the config files were overhauled. Delete your local `BepInEx/config/ProceduralTerrain/` configs so fresh copies regenerate, and start a new world. Rolling bake is on by default now — you can mostly ignore baking and just play.
+
 A procedural terrain generator for Valheim, built on [Voxheim](https://thunderstore.io/c/valheim/p/Voxheim/Voxheim/). It replaces the vanilla heightmap with deterministic, fully three-dimensional voxel terrain — e.g. caves, overhangs, arches, canyons, canals — authored per biome through configurable noise profiles.
 
 ![Black Forest](https://raw.githubusercontent.com/ctogle/ValheimProceduralTerrain/main/docs/img/01-blackforest.png)
@@ -12,8 +14,6 @@ A procedural terrain generator for Valheim, built on [Voxheim](https://thunderst
 ![Plains](https://raw.githubusercontent.com/ctogle/ValheimProceduralTerrain/main/docs/img/06-plains-c.png)
 ![Plains](https://raw.githubusercontent.com/ctogle/ValheimProceduralTerrain/main/docs/img/07-plains-d.png)
 ![Mistlands](https://raw.githubusercontent.com/ctogle/ValheimProceduralTerrain/main/docs/img/08-mistlands.png)
-
-> **Upgrading to 0.0.3:** baking and the config files were overhauled. Delete your local `BepInEx/config/ProceduralTerrain/` configs so fresh copies regenerate, and start a new world. Rolling bake is on by default now — you can mostly ignore baking and just play.
 
 ## Configuration
 

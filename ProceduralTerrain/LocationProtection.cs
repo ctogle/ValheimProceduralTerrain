@@ -14,7 +14,7 @@ namespace ProceduralTerrain
 {
     public partial class Plugin
     {
-        const float LocFadeR = 10f; // fade band outside the exterior radius
+        internal static float LocFadeR = 20f; // MIN fade band (m) outside the exterior radius — vanilla→PT blend; actual = max(this, extR*2) via LocFade ([Location] locFadeDist)
 
         // ── Location cache ────────────────────────────────────────────────────────
         static List<(Vector3 pos, float extR, int hash)> ReadLocationInstances()
@@ -89,12 +89,17 @@ namespace ProceduralTerrain
             return r;
         }
 
+        // Vanilla→PT blend distance OUTSIDE a location's protected radius. At least LocFadeR (the config
+        // default), but scales with the location's size so big locations get a proportionally wider, gentler
+        // apron that opens the terrain up around them rather than a hard LocFadeR-wide ring.
+        internal static float LocFade(float extR) => Mathf.Max(LocFadeR, extR * 2f);
+
         static float LocFactor((Vector2 pos, float extR) loc, float worldX, float worldZ)
         {
             float dx = worldX - loc.pos.x, dz = worldZ - loc.pos.y;
             float d  = Mathf.Sqrt(dx * dx + dz * dz);
             float r  = Mathf.Max(loc.extR, LocProtectR);
-            return Mathf.Clamp01((d - r) / LocFadeR);
+            return Mathf.Clamp01((d - r) / LocFade(loc.extR));
         }
 
         static float LocDist((Vector2 pos, float extR) loc, float worldX, float worldZ)

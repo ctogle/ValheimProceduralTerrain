@@ -96,6 +96,10 @@ namespace ProceduralTerrain
                             _locDomeHeight = Mathf.Max(0f, ldh);
                         else if (k == "locbandfade" && float.TryParse(v, System.Globalization.NumberStyles.Float, inv, out float lbf))
                             _locBandFade = Mathf.Max(0.001f, lbf);
+                        else if (k == "locfadedist" && float.TryParse(v, System.Globalization.NumberStyles.Float, inv, out float lfd))
+                            LocFadeR = Mathf.Max(0.001f, lfd);
+                        else if (k == "locminradius" && float.TryParse(v, System.Globalization.NumberStyles.Float, inv, out float lmr))
+                            LocProtectR = Mathf.Max(0f, lmr);
                     }
                 }
             }
@@ -105,17 +109,21 @@ namespace ProceduralTerrain
                         : (_caveContent ? BuildBuiltinPlacements() : new List<Placement>());
             InvalidatePlacementResolution();
             _placementCfgLastWrite = File.GetLastWriteTimeUtc(path);
-            Log.LogInfo($"[ProceduralTerrain] Placement config loaded: {_placements.Count} placements, cavecontent={_caveContent}, veg(conform={_vegetationConform},maxTilt={_vegMaxTilt:F0},disable={_disableVegetation}).");
+            Log.LogInfo($"[ProceduralTerrain] Placement config loaded: {_placements.Count} placements, cavecontent={_caveContent}, veg(conform={_vegetationConform},maxTilt={_vegMaxTilt:F0},disable={_disableVegetation}), loc(protect={_protectLocations},fadeDist={LocFadeR:F0},minRadius={LocProtectR:F0},domeH={_locDomeHeight:F0}).");
         }
 
         // Hot-reload: reload the placement cfg when its file changes. Placements only affect spawns at
         // zone-generation time, so no recarve is needed — newly generated zones pick up the new rules.
-        internal static void WatchPlacementConfigReload()
+        // Returns true if the file changed and was reloaded (so the caller can recarve — the [Location]
+        // keys are terrain-affecting; veg/cavecontent keys only matter for newly-loaded zones, but a recarve
+        // covers both and keeps live tuning honest).
+        internal static bool WatchPlacementConfigReload()
         {
             var t = File.GetLastWriteTimeUtc(PlacementConfigPath);
-            if (t == _placementCfgLastWrite) return;
+            if (t == _placementCfgLastWrite) return false;
             _placementCfgLastWrite = t;
             LoadPlacementConfig();
+            return true;
         }
 
         // Write the shipped placement config (embedded at build from configs/placements.cfg) to disk on first

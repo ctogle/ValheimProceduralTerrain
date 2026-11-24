@@ -898,7 +898,7 @@ namespace ProceduralTerrain
         internal static bool _bakeFileV6 = false;   // loaded bake file uses the v6 crossings layout
         static bool _bakeLoadAttempted = false;
 
-        internal const float LocProtectR = 10f; // minimum protection radius when exteriorRadius is unavailable
+        internal static float LocProtectR = 10f; // minimum protection radius when exteriorRadius is unavailable ([Location] locMinRadius)
 
         // ── Zone tracking for hot-reload ──────────────────────────────────────────
         internal static MethodInfo? _skinMethod;          // 0.1.7: static Skin(Heightmap) — re-adds VoxelZone + queues worker
@@ -2014,21 +2014,49 @@ namespace ProceduralTerrain
                 catch (Exception e) { Log.LogWarning($"[PT] bakemap failed: {e.Message}"); }
             });
             new Terminal.ConsoleCommand("pt_clearbake",
-                "pt_clearbake [filename|server] — delete a local bake file (default: current world); 'server' deletes from server (admin only)",
+                "pt_clearbake [filename|all|server] — delete a local bake file (default: current world); 'all' deletes every local bake; 'server' deletes this world from the server; 'all server' deletes every world from the server (admin only)",
                 args =>
                 {
-                    string arg = args.Length >= 2 ? args[1].ToLower() : "";
-                    if (arg == "server")
+                    // 'all' and 'server' compose: `pt_clearbake server` clears this world on the server,
+                    // `pt_clearbake all server` clears EVERY world's bake on the server.
+                    bool wantServer = false, wantAll = false;
+                    for (int i = 1; i < args.Length; i++)
                     {
+                        string a = args[i].ToLower();
+                        if (a == "server") wantServer = true;
+                        else if (a == "all") wantAll = true;
+                    }
+                    string arg = (!wantServer && !wantAll && args.Length >= 2) ? args[1].ToLower() : "";
+
+                    if (wantServer)
+                    {
+                        var pkg = new ZPackage(); pkg.Write(wantAll);   // all-seeds flag rides along
                         if (ZNet.instance != null && !ZNet.instance.IsServer())
                         {
-                            ZRoutedRpc.instance.InvokeRoutedRPC(ZRoutedRpc.Everybody, "PTClearBake", new ZPackage());
-                            Log.LogInfo("[ProceduralTerrain] Clear bake request sent to server.");
+                            ZRoutedRpc.instance.InvokeRoutedRPC(ZRoutedRpc.Everybody, "PTClearBake", pkg);
+                            Log.LogInfo($"[ProceduralTerrain] Clear bake request sent to server (all={wantAll}).");
                         }
                         else
                         {
-                            RPC_ClearBake(0L, new ZPackage());
+                            RPC_ClearBake(0L, pkg);
                         }
+                        return;
+                    }
+                    if (wantAll)
+                    {
+                        CloseBakeStream();   // release any open read handle first
+                        var all = System.IO.Directory.GetFiles(PTConfigDir, "procedural_terrain_bake_*.bin");
+                        int n = 0;
+                        foreach (var f in all)
+                        {
+                            try { File.Delete(f); n++; }
+                            catch (Exception e) { Log.LogWarning($"[ProceduralTerrain] Could not delete {System.IO.Path.GetFileName(f)}: {e.Message}"); }
+                        }
+                        _bakeData = null; _bakeLoadAttempted = false;   // active file may have been among them
+                        RollingBake.RestartForDeletedBake();            // resume carving+saving on a fresh file
+                        RecarveAll();                                   // re-serve loaded zones live (no stale served terrain)
+                        Console.instance?.Print($"[ProceduralTerrain] Deleted {n} local bake file(s).");
+                        Log.LogInfo($"[ProceduralTerrain] Deleted {n} local bake file(s) via 'all'.");
                         return;
                     }
                     string path;
@@ -2049,9 +2077,13 @@ namespace ProceduralTerrain
                     {
                         CloseBakeStream();   // release any open read handle so delete can't be blocked
                         File.Delete(path);
-                        // Reset in-memory cache if we just deleted the active file.
+                        // Reset in-memory cache + re-arm rolling and recarve if we just deleted the ACTIVE file.
                         if (System.IO.Path.GetFullPath(path) == System.IO.Path.GetFullPath(BakeFilePath(WorldSeed(), ComputeCfgHash())))
-                            { _bakeData = null; _bakeLoadAttempted = false; }
+                        {
+                            _bakeData = null; _bakeLoadAttempted = false;
+                            RollingBake.RestartForDeletedBake();   // resume carving+saving on a fresh file
+                            RecarveAll();                          // re-serve loaded zones live
+                        }
                         Console.instance?.Print($"[ProceduralTerrain] Deleted: {System.IO.Path.GetFileName(path)}");
                         Log.LogInfo($"[ProceduralTerrain] Deleted local bake file: {path}");
                     }
@@ -2062,7 +2094,7 @@ namespace ProceduralTerrain
                 },
                 optionsFetcher: () =>
                 {
-                    var opts = new List<string> { "server" };
+                    var opts = new List<string> { "all", "server" };
                     opts.AddRange(System.IO.Directory.GetFiles(PTConfigDir, "procedural_terrain_bake_*.bin")
                         .Select(System.IO.Path.GetFileName));
                     return opts;
@@ -2150,7 +2182,7 @@ namespace ProceduralTerrain
                     float f = LocFactor(loc, wx, wz);
                     float d = LocDist(loc, wx, wz);
                     float r = Mathf.Max(loc.extR, LocProtectR);
-                    if (d < r + LocFadeR + 10f)
+                    if (d < r + LocFade(loc.extR) + 10f)
                     {
                         string line = $"  loc ({loc.pos.x:F0},{loc.pos.y:F0}) extR={loc.extR:F1} dist={d:F1} factor={f:F3}";
                         Console.instance?.Print(line); Log.LogInfo(line);
@@ -2275,7 +2307,7 @@ namespace ProceduralTerrain
         static float _mistSweepT;
         static bool _mistWasHidden;
         static int _perfGc0, _perfGc2;
-        const double PerfHitchMs = 33.0;   // flag frames slower than ~30fps
+        const double PerfHitchMs = 100.0;  // flag only real stalls (>100ms / <10fps); 33ms tripped every frame on a ~30fps dedicated server and flooded the log
 
         void Update()
         {
@@ -2370,13 +2402,23 @@ namespace ProceduralTerrain
             if (!_locationsCached)
                 BuildLocationCache(); // caches once LocationsGenerated; sets _hotReloadPending → RecarveAll
 
-            WatchPlacementConfigReload();   // independent file; no recarve needed
+            // placements.cfg is a separate file; its [Location] keys are terrain-affecting, so a reload recarves
+            // (and, server-side, re-imposes on clients) just like biomes.cfg.
+            if (WatchPlacementConfigReload())
+            {
+                BroadcastCfgSyncToPeers();
+                RecarveAll();
+                return;
+            }
 
             var t  = File.GetLastWriteTimeUtc(ConfigPath);
             var ct = File.Exists(ClientConfigPath) ? File.GetLastWriteTimeUtc(ClientConfigPath) : DateTime.MinValue;
             if (t == _configLastWrite && ct == _clientConfigLastWrite) return;   // watch client.cfg too
+            bool biomesChanged = t != _configLastWrite;
             _configLastWrite = t; _clientConfigLastWrite = ct;
             LoadBiomeConfig();
+            // A server-side edit of biomes.cfg imposes on connected clients without a relog.
+            if (biomesChanged) BroadcastCfgSyncToPeers();
             RecarveAll();
         }
 

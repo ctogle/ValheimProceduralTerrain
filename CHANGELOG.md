@@ -4,6 +4,7 @@
 
 - Introduced the rolling bake — the world bakes around you as you play, so pre-baking a world is rarely needed. On by default, tunable live, F8 for a status panel.
 - Overhauled config handling: terrain shape (biomes.cfg), world content (placements.cfg), and local settings (client.cfg) are now separate files, and a server imposes terrain and content on its clients. Cosmetic or unused-config edits no longer invalidate a baked world.
+- A server now imposes live edits to its terrain config on connected clients without a relog.
 - FarLands integration: the distant far-land follows PT's terrain.
 - Content and balance tweaks: disabled Fenring cave spawns; clustered swamp roots so monsters can path between them.
 - Location groundwork (village & dungeon pads, entrances) now levels correctly on first visit, for all location types, and is cheaper to serve.
