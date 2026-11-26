@@ -73,7 +73,7 @@ namespace ProceduralTerrain
         // Shared write buffer: workers carve in parallel and drop finished blocks here; flushed as a batch
         // (RollingBakeFlush is itself locked, so appends serialize). Guarded by _writeLock.
         static readonly object _writeLock = new();
-        static List<(int ox, int oz, byte[] blk)> _carvedBlocks = new();
+        static List<(int ox, int oz, byte[] blk, int len)> _carvedBlocks = new();   // blk is a pooled buffer (len ≤ blk.Length); flush returns it
         static System.Diagnostics.Stopwatch _flushSw;
         static long _lastFlushMs;
         static readonly object _lock = new();
@@ -280,9 +280,9 @@ namespace ProceduralTerrain
                 _active[tid] = (z.ox, z.oz, _sessionSw?.ElapsedMilliseconds ?? 0);
                 try
                 {
-                    if (Plugin.RollingCarveBlock(z.ox, z.oz, out var blk))
+                    if (Plugin.RollingCarveBlock(z.ox, z.oz, out var blk, out var len))
                     {
-                        lock (_writeLock) _carvedBlocks.Add((z.ox, z.oz, blk));
+                        lock (_writeLock) _carvedBlocks.Add((z.ox, z.oz, blk, len));
                         Interlocked.Increment(ref _carved);
                     }
                     lock (_lock) _persisted.Add(z);   // mark done even if unmodified → don't re-enqueue
@@ -298,12 +298,12 @@ namespace ProceduralTerrain
         // swaps the buffer under _writeLock, then appends outside it (RollingBakeFlush serializes on _bakeStreamLock).
         static void FlushCarved(bool force)
         {
-            List<(int ox, int oz, byte[] blk)> batch = null;
+            List<(int ox, int oz, byte[] blk, int len)> batch = null;
             lock (_writeLock)
             {
                 bool due = _carvedBlocks.Count > 0 &&
                            (force || _carvedBlocks.Count >= FlushZones || _flushSw.ElapsedMilliseconds - _lastFlushMs > FlushSeconds * 1000);
-                if (due) { batch = _carvedBlocks; _carvedBlocks = new List<(int, int, byte[])>(); _lastFlushMs = _flushSw.ElapsedMilliseconds; }
+                if (due) { batch = _carvedBlocks; _carvedBlocks = new List<(int, int, byte[], int)>(); _lastFlushMs = _flushSw.ElapsedMilliseconds; }
             }
             if (batch == null) return;
             int n = Plugin.RollingBakeFlush(batch);

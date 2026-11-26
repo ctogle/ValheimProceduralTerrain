@@ -117,14 +117,39 @@ namespace ProceduralTerrain
         static List<(int ox, int oz, long off, int len)> _rollIndex;
         static long _rollZoneDataEnd;
 
-        // Serialize + gzip one zone into a self-contained block (same layout as the inline v4 writer).
-        static byte[] SerializeZoneBlock(int ox, int oz, BakeZone z)
+        // Reused per-thread scratch stream — the rolling bake serializes many zones/sec on background workers;
+        // a fresh MemoryStream per zone reallocates its buffer as it grows (MB of gen-2 garbage → stop-the-world
+        // GC pauses that stall the main thread). Reuse one per worker (ThreadStatic = no cross-thread sharing).
+        [ThreadStatic] static MemoryStream _serMs;
+
+        // Compress one zone into the reused per-thread stream; returns the compressed byte length.
+        static int FillSerMs(int ox, int oz, BakeZone z)
         {
-            using var ms = new MemoryStream();
+            var ms = _serMs ??= new MemoryStream(1 << 16);
+            ms.SetLength(0); ms.Position = 0;
             using (var gz = new GZipStream(ms, System.IO.Compression.CompressionLevel.Optimal, leaveOpen: true))
             using (var zbw = new BinaryWriter(gz))
                 WriteZoneBody(zbw, ox, oz, z);
-            return ms.ToArray();
+            return (int)ms.Length;
+        }
+
+        // One-shot paths (full bake / download merge): a right-sized owned byte[].
+        static byte[] SerializeZoneBlock(int ox, int oz, BakeZone z)
+        {
+            int len = FillSerMs(ox, oz, z);
+            var buf = new byte[len];
+            _serMs!.Position = 0; _serMs.Read(buf, 0, len);
+            return buf;
+        }
+
+        // Rolling path (hot, many zones/sec): serialize into a POOLED buffer (buf.Length may exceed `len`). The
+        // caller writes buf[0..len] then returns it to the pool after flush → no per-zone byte[] garbage.
+        static byte[] SerializeZoneBlockPooled(int ox, int oz, BakeZone z, out int len)
+        {
+            len = FillSerMs(ox, oz, z);
+            var buf = System.Buffers.ArrayPool<byte>.Shared.Rent(len);
+            _serMs!.Position = 0; _serMs.Read(buf, 0, len);
+            return buf;
         }
 
         static void LoadBakeFile()
@@ -830,9 +855,9 @@ namespace ProceduralTerrain
 
         // Carve one zone for persistence; returns its serialized block, or false if the zone is unmodified (nothing
         // to bake — it live-carves cheaply). Runs on a rolling worker thread (ThreadStatic capture is thread-local).
-        internal static bool RollingCarveBlock(int ox, int oz, out byte[] blk)
+        internal static bool RollingCarveBlock(int ox, int oz, out byte[] blk, out int len)
         {
-            blk = null;
+            blk = null; len = 0;
             var wg = WorldGenerator.instance;
             if (wg == null) return false;
             float s = ActiveScale();
@@ -848,31 +873,38 @@ namespace ProceduralTerrain
             finally { _rollCapturing = false; _coarseOverrideXZ = 0; _coarseOverrideY = 0; }
             var z = _rollCaptured; _rollCaptured = null;
             if (z == null) return false;
-            blk = SerializeZoneBlock(ox, oz, z);
+            blk = SerializeZoneBlockPooled(ox, oz, z, out len);   // pooled buffer; flush returns it to the pool
             return true;
         }
 
         // Atomically append a batch of carved blocks, rewrite the (small) index + footer, and update the serve index.
         // The file is a complete valid bake after every call; a crash between calls only loses the un-flushed RAM batch.
-        internal static int RollingBakeFlush(List<(int ox, int oz, byte[] blk)> blocks)
+        internal static int RollingBakeFlush(List<(int ox, int oz, byte[] blk, int len)> blocks)
         {
             if (blocks == null || blocks.Count == 0) return 0;
-            lock (_bakeStreamLock)
+            try
             {
-                if (_bakeStream == null || _rollIndex == null) return 0;
-                _bakeStream.Seek(_rollZoneDataEnd, SeekOrigin.Begin);   // overwrite the old trailing index with new blocks
-                var bw = new BinaryWriter(_bakeStream, System.Text.Encoding.UTF8, true);
-                var added = new List<(int ox, int oz, long off, int len)>(blocks.Count);
-                foreach (var (ox, oz, blk) in blocks)
+                lock (_bakeStreamLock)
                 {
-                    long off = _bakeStream.Position;
-                    bw.Write(blk, 0, blk.Length);
-                    added.Add((ox, oz, off, blk.Length));
-                    _rollIndex.Add((ox, oz, off, blk.Length));
+                    if (_bakeStream == null || _rollIndex == null) return 0;
+                    _bakeStream.Seek(_rollZoneDataEnd, SeekOrigin.Begin);   // overwrite the old trailing index with new blocks
+                    var bw = new BinaryWriter(_bakeStream, System.Text.Encoding.UTF8, true);
+                    var added = new List<(int ox, int oz, long off, int len)>(blocks.Count);
+                    foreach (var (ox, oz, blk, len) in blocks)
+                    {
+                        long off = _bakeStream.Position;
+                        bw.Write(blk, 0, len);
+                        added.Add((ox, oz, off, len));
+                        _rollIndex.Add((ox, oz, off, len));
+                    }
+                    _rollZoneDataEnd = _bakeStream.Position;
+                    RollingWriteIndexFooterLocked();
+                    if (_bakeIndex != null) foreach (var e in added) _bakeIndex[(e.ox, e.oz)] = (e.off, e.len);
                 }
-                _rollZoneDataEnd = _bakeStream.Position;
-                RollingWriteIndexFooterLocked();
-                if (_bakeIndex != null) foreach (var e in added) _bakeIndex[(e.ox, e.oz)] = (e.off, e.len);
+            }
+            finally   // return every pooled buffer, even on the early-out above → no pool leak
+            {
+                foreach (var b in blocks) System.Buffers.ArrayPool<byte>.Shared.Return(b.blk);
             }
             return blocks.Count;
         }

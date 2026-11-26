@@ -1918,7 +1918,7 @@ namespace ProceduralTerrain
                 System.Threading.Tasks.Task.Run(() =>
                 {
                     var sw = System.Diagnostics.Stopwatch.StartNew();
-                    try { bool mod = RollingCarveBlock(ox, oz, out _); sw.Stop(); Log.LogWarning($"[PT-carvezone] DONE zone ({ox},{oz}) in {sw.ElapsedMilliseconds}ms (modified={mod})"); }
+                    try { bool mod = RollingCarveBlock(ox, oz, out var blk, out _); if (blk != null) System.Buffers.ArrayPool<byte>.Shared.Return(blk); sw.Stop(); Log.LogWarning($"[PT-carvezone] DONE zone ({ox},{oz}) in {sw.ElapsedMilliseconds}ms (modified={mod})"); }
                     catch (Exception e) { sw.Stop(); Log.LogError($"[PT-carvezone] zone ({ox},{oz}) threw after {sw.ElapsedMilliseconds}ms: {e.GetType().Name}: {e.Message}\n{e.StackTrace}"); }
                 });
             });
