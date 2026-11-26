@@ -7,13 +7,16 @@
 A procedural terrain generator for Valheim, built on [Voxheim](https://thunderstore.io/c/valheim/p/Voxheim/Voxheim/). It replaces the vanilla heightmap with deterministic, fully three-dimensional voxel terrain — e.g. caves, overhangs, arches, canyons, canals — authored per biome through configurable noise profiles.
 
 ![Black Forest](https://raw.githubusercontent.com/ctogle/ValheimProceduralTerrain/main/docs/img/01-blackforest.png)
-![Swamp](https://raw.githubusercontent.com/ctogle/ValheimProceduralTerrain/main/docs/img/02-swamp-a.png)
-![Swamp](https://raw.githubusercontent.com/ctogle/ValheimProceduralTerrain/main/docs/img/03-swamp-b.png)
-![Plains](https://raw.githubusercontent.com/ctogle/ValheimProceduralTerrain/main/docs/img/04-plains-a.png)
-![Plains](https://raw.githubusercontent.com/ctogle/ValheimProceduralTerrain/main/docs/img/05-plains-b.png)
-![Plains](https://raw.githubusercontent.com/ctogle/ValheimProceduralTerrain/main/docs/img/06-plains-c.png)
-![Plains](https://raw.githubusercontent.com/ctogle/ValheimProceduralTerrain/main/docs/img/07-plains-d.png)
-![Mistlands](https://raw.githubusercontent.com/ctogle/ValheimProceduralTerrain/main/docs/img/08-mistlands.png)
+![Black Forest](https://raw.githubusercontent.com/ctogle/ValheimProceduralTerrain/main/docs/img/02-blackforest-b.png)
+![Swamp](https://raw.githubusercontent.com/ctogle/ValheimProceduralTerrain/main/docs/img/03-swamp-a.png)
+![Swamp](https://raw.githubusercontent.com/ctogle/ValheimProceduralTerrain/main/docs/img/04-swamp-b.png)
+![Swamp](https://raw.githubusercontent.com/ctogle/ValheimProceduralTerrain/main/docs/img/05-swamp-c.png)
+![Mountain](https://raw.githubusercontent.com/ctogle/ValheimProceduralTerrain/main/docs/img/06-mountain.png)
+![Plains](https://raw.githubusercontent.com/ctogle/ValheimProceduralTerrain/main/docs/img/07-plains-a.png)
+![Plains](https://raw.githubusercontent.com/ctogle/ValheimProceduralTerrain/main/docs/img/08-plains-b.png)
+![Plains](https://raw.githubusercontent.com/ctogle/ValheimProceduralTerrain/main/docs/img/09-plains-c.png)
+![Plains](https://raw.githubusercontent.com/ctogle/ValheimProceduralTerrain/main/docs/img/10-plains-d.png)
+![Mistlands](https://raw.githubusercontent.com/ctogle/ValheimProceduralTerrain/main/docs/img/11-mistlands.png)
 
 ## Configuration
 
